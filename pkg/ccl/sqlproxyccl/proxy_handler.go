@@ -11,6 +11,7 @@ package sqlproxyccl
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"regexp"
@@ -197,10 +198,44 @@ func newProxyHandler(
 	return &handler, nil
 }
 
+type proxyEvent struct {
+	Time        time.Time `json:"time"`
+	Description string    `json:"description"`
+}
+
+type proxyTrace struct {
+	Start  time.Time    `json:"start"`
+	Events []proxyEvent `json:"events"`
+}
+
+func startTrace() proxyTrace {
+	return proxyTrace{Start: time.Now()}
+}
+
+func (t *proxyTrace) event(event string) {
+	t.Events = append(t.Events, proxyEvent{
+		Time:        time.Now(),
+		Description: event,
+	})
+}
+
+func (t *proxyTrace) log(ctx context.Context) {
+	bytes, err := json.Marshal(*t)
+	if err != nil {
+		panic(err)
+	}
+	log.Infof(ctx, "connection trace %s: ", bytes)
+}
+
 // handle is called by the proxy server to handle a single incoming client
 // connection.
 func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn) error {
+
+	trace := startTrace()
+	defer trace.log(ctx)
+
 	conn, msg, err := FrontendAdmit(incomingConn, handler.incomingTLSConfig())
+	trace.event("Admission")
 	defer func() { _ = conn.Close() }()
 	if err != nil {
 		SendErrToClient(conn, err)
@@ -260,6 +295,7 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 		updateMetricsAndSendErrToClient(err, conn, handler.metrics)
 		return err
 	}
+	trace.event("Throttled")
 
 	var TLSConf *tls.Config
 	if !handler.Insecure {
@@ -288,6 +324,7 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 		// Get the DNS/IP address of the backend server to dial.
 		outgoingAddress, err = handler.outgoingAddress(ctx, clusterName, tenID)
+		trace.event("Tenant Resolved")
 		if err != nil {
 			// Failure is assumed to be transient (and should be retried) except
 			// in case where the server was not found.
@@ -347,7 +384,6 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 		}
 		break
 	}
-
 	if err != nil {
 		updateMetricsAndSendErrToClient(err, conn, handler.metrics)
 		return err
@@ -363,6 +399,7 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 			}
 		})
 	}
+	trace.event("Connected To Backend")
 
 	defer func() { _ = crdbConn.Close() }()
 
@@ -372,9 +409,11 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 		log.Ops.Errorf(ctx, "authenticate: %s", err)
 		return err
 	}
+	trace.event("Authenticated With Backend")
 
 	handler.metrics.SuccessfulConnCount.Inc(1)
 
+	// TODO(jeffswenson) What is this connection cache here for?
 	handler.connCache.Insert(
 		&cache.ConnKey{IPAddress: ipAddr, TenantID: tenID},
 	)
@@ -397,7 +436,9 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 		default: /* the channel already contains an error */
 		}
 	}()
+	trace.event("Connection Spliced")
 
+	defer trace.event("Transmission")
 	select {
 	case err := <-errConnection:
 		handler.metrics.updateForError(err)
