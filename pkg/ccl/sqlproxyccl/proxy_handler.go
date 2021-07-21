@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/certmgr"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -269,23 +268,12 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 	var crdbConn net.Conn
 	var outgoingAddress string
 
-	// Repeatedly try to make a connection. Any failures are assumed to be
-	// transient unless the tenant cannot be found (e.g. because it was
-	// deleted). We will simply loop forever, or until the context is canceled
-	// (e.g. by client disconnect). This is preferable to terminating client
-	// connections, because in most cases those connections will simply be
-	// retried, further increasing load on the system.
-	retryOpts := retry.Options{
-		InitialBackoff: 10 * time.Millisecond,
-		MaxBackoff:     5 * time.Second,
-	}
-
 	outgoingAddressErr := log.Every(time.Minute)
 	backendDialErr := log.Every(time.Minute)
 	reportFailureErr := log.Every(time.Minute)
 	var outgoingAddressErrs, codeBackendDownErrs, reportFailureErrs int
 
-	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
+	for {
 		// Get the DNS/IP address of the backend server to dial.
 		outgoingAddress, err = handler.outgoingAddress(ctx, clusterName, tenID)
 		if err != nil {
