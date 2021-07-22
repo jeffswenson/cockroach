@@ -354,6 +354,8 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 		// If we get a backend down error, retry the connection.
 		var codeErr *codeError
 		if err != nil && errors.As(err, &codeErr) && codeErr.code == codeBackendDown {
+			trace.event("Failed Backend Connection")
+
 			codeBackendDownErrs++
 			if backendDialErr.ShouldLog() {
 				log.Ops.Errorf(ctx,
