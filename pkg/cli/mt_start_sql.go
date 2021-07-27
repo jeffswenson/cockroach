@@ -103,7 +103,7 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 	}
 	defer stopper.Stop(ctx)
 
-	tenant := getTenantBinding()
+	tenant := getTenantBinding(ctx)
 	serverCfg.SQLConfig.TenantID = roachpb.MakeTenantID(tenant.tenantID)
 	serverCfg.SSLCertsDir = tenantDataDir
 
@@ -200,17 +200,17 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 // 3. sqlstarter calls execve(2) through unix.Exec to replace its own process
 //    with the SQL server. Note that Kubernetes logs will still be displayed
 //    properly since sqlstarter is the main entrypoint.
-func getTenantBinding() *Tenant {
+func getTenantBinding(ctx context.Context) *Tenant {
 	options.listenAddress = "0.0.0.0:8081"
 	options.cert = "/cockroach/sqlstarter-certs/sqlstarter.crt"
 	options.key = "/cockroach/sqlstarter-certs/sqlstarter.key"
 	options.insecure = false
 
-	return runBindingServer()
+	return runBindingServer(ctx)
 }
 
 // TODO(jay): Tests for this function are nice to have, but not necessary.
-func runBindingServer() *Tenant {
+func runBindingServer(ctx context.Context) *Tenant {
 	tenant := tryGetTenant()
 	if tenant != nil {
 		return tenant
@@ -218,7 +218,7 @@ func runBindingServer() *Tenant {
 
 	h := handler{tenant: make(chan *Tenant)}
 
-	log.Warningf(context.Background(), "listening on %s", options.listenAddress)
+	log.Warningf(ctx, "listening on %s", options.listenAddress)
 
 	// TODO(jay): Handle liveness probe and configure tenantpool to use it.
 	// The liveness endpoint should be hosted on the same address and port as
