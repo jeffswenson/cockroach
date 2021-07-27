@@ -169,7 +169,7 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 		sqlServer.StartDiagnostics(ctx)
 	}
 
-	log.Warningf(ctx, "SQL server for tenant %s listening at %s, http at %s", serverCfg.SQLConfig.TenantID, addr, httpAddr)
+	log.Ops.Warningf(ctx, "SQL server for tenant %s listening at %s, http at %s", serverCfg.SQLConfig.TenantID, addr, httpAddr)
 
 	// TODO(tbg): make the other goodies in `./cockroach start` reusable, such as
 	// logging to files, periodic memory output, heap and goroutine dumps, debug
