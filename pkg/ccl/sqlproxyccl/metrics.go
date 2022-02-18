@@ -9,6 +9,8 @@
 package sqlproxyccl
 
 import (
+	"time"
+
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/errors"
 )
@@ -25,6 +27,8 @@ type metrics struct {
 	SuccessfulConnCount    *metric.Counter
 	AuthFailedCount        *metric.Counter
 	ExpiredClientConnCount *metric.Counter
+	ConnectionLatency      *metric.Histogram
+	DialTenantLatency      *metric.Histogram
 }
 
 // MetricStruct implements the metrics.Struct interface.
@@ -93,11 +97,23 @@ var (
 		Measurement: "Expired Client Connections",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaConnectionLatency = metric.Metadata{
+		Name:        "proxy.sql.connection_latency",
+		Help:        "Time between receiving the tcp connection and completing authentication.",
+		Measurement: "Connection Latency",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaDialTenantLatency = metric.Metadata{
+		Name:        "proxy.sql.dial_tenant_latency",
+		Help:        "How long it takes to establish a connection with a tenant sql server.",
+		Measurement: "Sql Server Binding Latency",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
 )
 
 // makeProxyMetrics instantiates the metrics holder for proxy monitoring.
-func makeProxyMetrics() metrics {
-	return metrics{
+func makeProxyMetrics() *metrics {
+	return &metrics{
 		BackendDisconnectCount: metric.NewCounter(metaBackendDisconnectCount),
 		IdleDisconnectCount:    metric.NewCounter(metaIdleDisconnectCount),
 		BackendDownCount:       metric.NewCounter(metaBackendDownCount),
@@ -108,6 +124,8 @@ func makeProxyMetrics() metrics {
 		SuccessfulConnCount:    metric.NewCounter(metaSuccessfulConnCount),
 		AuthFailedCount:        metric.NewCounter(metaAuthFailedCount),
 		ExpiredClientConnCount: metric.NewCounter(metaExpiredClientConnCount),
+		ConnectionLatency:      metric.NewLatency(metaConnectionLatency, time.Minute),
+		DialTenantLatency:      metric.NewLatency(metaDialTenantLatency, time.Minute),
 	}
 }
 

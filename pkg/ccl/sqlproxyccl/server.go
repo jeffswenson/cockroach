@@ -48,7 +48,7 @@ type Server struct {
 // checks as well.
 func NewServer(ctx context.Context, stopper *stop.Stopper, options ProxyOptions) (*Server, error) {
 	proxyMetrics := makeProxyMetrics()
-	handler, err := newProxyHandler(ctx, stopper, &proxyMetrics, options)
+	handler, err := newProxyHandler(ctx, stopper, proxyMetrics, options)
 	if err != nil {
 		return nil, err
 	}
@@ -57,13 +57,13 @@ func NewServer(ctx context.Context, stopper *stop.Stopper, options ProxyOptions)
 
 	registry := metric.NewRegistry()
 
-	registry.AddMetricStruct(&proxyMetrics)
+	registry.AddMetricStruct(proxyMetrics)
 
 	s := &Server{
 		Stopper:            stopper,
 		connHandler:        handler.handle,
 		mux:                mux,
-		metrics:            &proxyMetrics,
+		metrics:            proxyMetrics,
 		metricsRegistry:    registry,
 		prometheusExporter: metric.MakePrometheusExporter(),
 	}

@@ -113,6 +113,11 @@ type connector struct {
 	// NOTE: This field is optional.
 	TLSConfig *tls.Config
 
+	// Metrics is used to emit connection latency metrics.
+	//
+	// NOTE: This field is optional.
+	Metrics *metrics
+
 	// IdleMonitorWrapperFn is used to wrap the connection to the SQL pod with
 	// an idle monitor. If not specified, the raw connection to the SQL pod
 	// will be returned.
@@ -215,6 +220,13 @@ func (c *connector) dialTenantCluster(ctx context.Context) (net.Conn, error) {
 	var crdbConn net.Conn
 	var serverAddr string
 	var err error
+
+	start := time.Now()
+	defer func() {
+		if err == nil && c.Metrics != nil {
+			c.Metrics.DialTenantLatency.RecordValue(time.Now().Sub(start).Nanoseconds())
+		}
+	}()
 
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 		// Retrieve a SQL pod address to connect to.

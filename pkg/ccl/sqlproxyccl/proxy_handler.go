@@ -127,6 +127,9 @@ type proxyHandler struct {
 
 	// CertManger keeps up to date the certificates used.
 	certManager *certmgr.CertManager
+
+	// startTime tracks the start of the connection.
+	startTime time.Time
 }
 
 const throttledErrorHint string = `Connection throttling is triggered by repeated authentication failure. Make
@@ -147,6 +150,7 @@ func newProxyHandler(
 		metrics:      proxyMetrics,
 		ProxyOptions: options,
 		certManager:  certmgr.NewCertManager(ctx),
+		startTime:    time.Now(),
 	}
 
 	err := handler.setupIncomingCert()
@@ -274,6 +278,7 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 		TenantID:    tenID,
 		RoutingRule: handler.RoutingRule,
 		StartupMsg:  backendStartupMsg,
+		Metrics:     handler.metrics,
 	}
 	if handler.directory != nil {
 		connector.Directory = handler.directory
@@ -334,6 +339,7 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 	}()
 
 	handler.metrics.SuccessfulConnCount.Inc(1)
+	handler.metrics.ConnectionLatency.RecordValue(handler.startTime.Sub(time.Now()).Nanoseconds())
 
 	log.Infof(ctx, "new connection")
 	connBegin := timeutil.Now()

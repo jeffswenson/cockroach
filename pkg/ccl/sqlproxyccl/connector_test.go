@@ -369,6 +369,7 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 		var reportFailureFnCount int
 		c := &connector{
 			TenantID: roachpb.MakeTenantID(42),
+			Metrics:  makeProxyMetrics(),
 		}
 		c.Directory = &testTenantResolver{
 			reportFailureFn: func(fnCtx context.Context, tenantID roachpb.TenantID, addr string) error {
@@ -407,6 +408,7 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 		require.Equal(t, 3, addrLookupFnCount)
 		require.Equal(t, 2, dialSQLServerCount)
 		require.Equal(t, 1, reportFailureFnCount)
+		require.Equal(t, int64(1), c.Metrics.DialTenantLatency.TotalCount())
 	})
 }
 
