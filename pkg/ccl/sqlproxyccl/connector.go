@@ -10,21 +10,16 @@ package sqlproxyccl
 
 import (
 	"context"
-	"crypto/tls"
 	"net"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/balancer"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/throttler"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 	pgproto3 "github.com/jackc/pgproto3/v2"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // sessionRevivalTokenStartupParam indicates the name of the parameter that
@@ -39,24 +34,6 @@ const remoteAddrStartupParam = "crdb:remote_addr"
 // authentication phase. All connections returned by the connector should
 // already be ready to accept regular pgwire messages (e.g. SQL queries).
 type connector struct {
-	// ClusterName and TenantID corresponds to the tenant identifiers associated
-	// with this connector.
-	//
-	// NOTE: These fields are required.
-	ClusterName string
-	TenantID    roachpb.TenantID
-
-	// DirectoryCache corresponds to the tenant directory cache, which will be
-	// used to resolve tenants to their corresponding IP addresses.
-	//
-	// NOTE: This field is required.
-	DirectoryCache tenant.DirectoryCache
-
-	// Balancer represents the load balancer component that will be used to
-	// choose which SQL pod to route the connection to.
-	//
-	// NOTE: This field is required.
-	Balancer *balancer.Balancer
 
 	// StartupMsg represents the startup message associated with the client.
 	// This will be used when establishing a pgwire connection with the SQL pod.
@@ -64,13 +41,7 @@ type connector struct {
 	// NOTE: This field is required.
 	StartupMsg *pgproto3.StartupMessage
 
-	// TLSConfig represents the client TLS config used by the connector when
-	// connecting with the SQL pod. If the ServerName field is set, this will
-	// be overridden during connection establishment. Set to nil if we are
-	// connecting to an insecure cluster.
-	//
-	// NOTE: This field is optional.
-	TLSConfig *tls.Config
+	TenantDialer *tenantDialer
 
 	// IdleMonitorWrapperFn is used to wrap the connection to the SQL pod with
 	// an idle monitor. If not specified, the raw connection to the SQL pod
@@ -190,15 +161,35 @@ func (c *connector) dialTenantCluster(ctx context.Context) (net.Conn, error) {
 
 	lookupAddrErr := log.Every(time.Minute)
 	dialSQLServerErr := log.Every(time.Minute)
-	reportFailureErr := log.Every(time.Minute)
-	var lookupAddrErrs, dialSQLServerErrs, reportFailureErrs int
+	var lookupAddrErrs, dialSQLServerErrs int
 	var crdbConn net.Conn
-	var serverAddr string
-	var err error
 
-	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
+	r := retry.StartWithCtx(ctx, retryOpts)
+	for {
+		if !r.Next() {
+			return nil, ctx.Err()
+		}
+
 		// Retrieve a SQL pod address to connect to.
-		serverAddr, err = c.lookupAddr(ctx)
+		serverConn, err := c.TenantDialer.DialTenant(ctx)
+
+		// Report the failure to the directory cache so that it can
+		// refresh any stale information that may have caused the
+		// problem.
+		// TODO(jeffswenson): integrate this with tenant dialer
+		// if err = reportFailureToDirectoryCache(
+		// 	ctx, c.TenantID, serverAddr, c.DirectoryCache,
+		// ); err != nil {
+		// 	reportFailureErrs++
+		// 	if reportFailureErr.ShouldLog() {
+		// 		log.Ops.Errorf(ctx,
+		// 			"report failure (%d errors skipped): %v",
+		// 			reportFailureErrs,
+		// 			err,
+		// 		)
+		// 		reportFailureErrs = 0
+		// 	}
+		// }
 		if err != nil {
 			if isRetriableConnectorError(err) {
 				lookupAddrErrs++
@@ -211,8 +202,10 @@ func (c *connector) dialTenantCluster(ctx context.Context) (net.Conn, error) {
 			}
 			return nil, err
 		}
+
+		// Forward the startup message to the backend.
 		// Make a connection to the SQL pod.
-		crdbConn, err = c.dialSQLServer(serverAddr)
+		err = relayStartupMsg(serverConn, c.StartupMsg)
 		if err != nil {
 			if isRetriableConnectorError(err) {
 				dialSQLServerErrs++
@@ -222,125 +215,12 @@ func (c *connector) dialTenantCluster(ctx context.Context) (net.Conn, error) {
 					dialSQLServerErrs = 0
 				}
 
-				// Report the failure to the directory cache so that it can
-				// refresh any stale information that may have caused the
-				// problem.
-				if err = reportFailureToDirectoryCache(
-					ctx, c.TenantID, serverAddr, c.DirectoryCache,
-				); err != nil {
-					reportFailureErrs++
-					if reportFailureErr.ShouldLog() {
-						log.Ops.Errorf(ctx,
-							"report failure (%d errors skipped): %v",
-							reportFailureErrs,
-							err,
-						)
-						reportFailureErrs = 0
-					}
-				}
 				continue
 			}
 			return nil, err
 		}
 		return crdbConn, nil
 	}
-
-	// err will never be nil here regardless of whether we retry infinitely or
-	// a bounded number of times. In our case, since we retry infinitely, the
-	// only possibility is when ctx's Done channel is closed (which implies that
-	// ctx.Err() != nil.
-	//
-	// If the error is already marked, just return that.
-	if errors.IsAny(err, context.Canceled, context.DeadlineExceeded) {
-		return nil, err
-	}
-	// Otherwise, mark the error, and return that.
-	return nil, errors.Mark(err, ctx.Err())
-}
-
-// lookupAddr returns an address (that must include both host and port)
-// pointing to one of the SQL pods for the tenant associated with this
-// connector.
-//
-// This will be called within an infinite backoff loop. If an error is
-// transient, this will return an error that has been marked with
-// errRetryConnectorSentinel (i.e. markAsRetriableConnectorError).
-func (c *connector) lookupAddr(ctx context.Context) (string, error) {
-	if c.testingKnobs.lookupAddr != nil {
-		return c.testingKnobs.lookupAddr(ctx)
-	}
-
-	// Lookup tenant in the directory cache. Once we have retrieve the list of
-	// pods, use the Balancer for load balancing.
-	pods, err := c.DirectoryCache.LookupTenantPods(ctx, c.TenantID, c.ClusterName)
-	switch {
-	case err == nil:
-		runningPods := make([]*tenant.Pod, 0, len(pods))
-		for _, pod := range pods {
-			if pod.State == tenant.RUNNING {
-				runningPods = append(runningPods, pod)
-			}
-		}
-		pod, err := c.Balancer.SelectTenantPod(runningPods)
-		if err != nil {
-			// This should never happen because LookupTenantPods ensured that
-			// there should be at least one RUNNING pod. Mark it as a retriable
-			// connection anyway.
-			return "", markAsRetriableConnectorError(err)
-		}
-		return pod.Addr, nil
-
-	case status.Code(err) == codes.FailedPrecondition:
-		if st, ok := status.FromError(err); ok {
-			return "", newErrorf(codeUnavailable, "%v", st.Message())
-		}
-		return "", newErrorf(codeUnavailable, "unavailable")
-
-	case status.Code(err) == codes.NotFound:
-		return "", newErrorf(codeParamsRoutingFailed,
-			"cluster %s-%d not found", c.ClusterName, c.TenantID.ToUint64())
-
-	default:
-		return "", markAsRetriableConnectorError(err)
-	}
-}
-
-// dialSQLServer dials the given address for the SQL pod, and forwards the
-// startup message to it. If the connector specifies a TLS connection, it will
-// also attempt to upgrade the PG connection to use TLS.
-//
-// This will be called within an infinite backoff loop. If an error is
-// transient, this will return an error that has been marked with
-// errRetryConnectorSentinel (i.e. markAsRetriableConnectorError).
-func (c *connector) dialSQLServer(serverAddr string) (net.Conn, error) {
-	if c.testingKnobs.dialSQLServer != nil {
-		return c.testingKnobs.dialSQLServer(serverAddr)
-	}
-
-	// Use a TLS config if one was provided. If TLSConfig is nil, Clone will
-	// return nil.
-	tlsConf := c.TLSConfig.Clone()
-	if tlsConf != nil {
-		// serverAddr will always have a port. We use an empty string as the
-		// default port as we only care about extracting the host.
-		outgoingHost, _, err := addr.SplitHostPort(serverAddr, "" /* defaultPort */)
-		if err != nil {
-			return nil, err
-		}
-		// Always set ServerName. If InsecureSkipVerify is true, this will
-		// be ignored.
-		tlsConf.ServerName = outgoingHost
-	}
-
-	conn, err := BackendDial(c.StartupMsg, serverAddr, tlsConf)
-	if err != nil {
-		var codeErr *codeError
-		if errors.As(err, &codeErr) && codeErr.code == codeBackendDown {
-			return nil, markAsRetriableConnectorError(err)
-		}
-		return nil, err
-	}
-	return conn, nil
 }
 
 // errRetryConnectorSentinel exists to allow more robust retection of retry

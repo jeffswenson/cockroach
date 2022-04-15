@@ -13,43 +13,9 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
-	"time"
 
 	"github.com/jackc/pgproto3/v2"
 )
-
-// BackendDial is an example backend dialer that does a TCP/IP connection
-// to a backend, SSL and forwards the start message. It is defined as a variable
-// so it can be redirected for testing.
-//
-// BackendDial uses a dial timeout of 5 seconds to mitigate network black
-// holes.
-//
-// TODO(jaylim-crl): Move dialer into connector in the future.
-var BackendDial = func(
-	msg *pgproto3.StartupMessage, serverAddress string, tlsConfig *tls.Config,
-) (net.Conn, error) {
-	// TODO this behavior may need to change once multi-region multi-tenant
-	// clusters are supported. The fixed timeout may need to be replaced by an
-	// adaptive timeout or the timeout could be replaced by speculative retries.
-	conn, err := net.DialTimeout("tcp", serverAddress, time.Second*5)
-	if err != nil {
-		return nil, newErrorf(
-			codeBackendDown, "unable to reach backend SQL server: %v", err,
-		)
-	}
-	conn, err = sslOverlay(conn, tlsConfig)
-	if err != nil {
-		return nil, err
-	}
-	err = relayStartupMsg(conn, msg)
-	if err != nil {
-		return nil, newErrorf(
-			codeBackendDown, "relaying StartupMessage to target server %v: %v",
-			serverAddress, err)
-	}
-	return conn, nil
-}
 
 // sslOverlay attempts to upgrade the PG connection to use SSL if a tls.Config
 // is specified.
@@ -83,7 +49,11 @@ func sslOverlay(conn net.Conn, tlsConfig *tls.Config) (net.Conn, error) {
 }
 
 // relayStartupMsg forwards the start message on the backend connection.
-func relayStartupMsg(conn net.Conn, msg *pgproto3.StartupMessage) (err error) {
-	_, err = conn.Write(msg.Encode(nil))
-	return
+func relayStartupMsg(conn net.Conn, msg *pgproto3.StartupMessage) error {
+	if _, err := conn.Write(msg.Encode(nil)); err != nil {
+		return newErrorf(
+			codeBackendDown, "relaying StartupMessage to target server %v: %v",
+			conn.RemoteAddr(), err)
+	}
+	return nil
 }

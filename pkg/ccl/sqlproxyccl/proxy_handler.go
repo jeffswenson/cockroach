@@ -151,6 +151,8 @@ type proxyHandler struct {
 
 	// certManager keeps up to date the certificates used.
 	certManager *certmgr.CertManager
+
+	dialers *tenantDialers
 }
 
 const throttledErrorHint string = `Connection throttling is triggered by repeated authentication failure. Make
@@ -261,6 +263,18 @@ func newProxyHandler(
 	handler.balancer, err = balancer.NewBalancer(
 		ctx, stopper, balancerMetrics, handler.directoryCache, handler.connTracker,
 	)
+
+	// TLS options for the proxy are split into Insecure and SkipVerify.
+	// In insecure mode, TLSConfig is expected to be nil. This will cause the
+	// connector's dialer to skip TLS entirely. If SkipVerify is true,
+	// TLSConfig will be set to a non-nil config with InsecureSkipVerify set
+	// to true. InsecureSkipVerify will provide an encrypted connection but
+	// not verify that the connection recipient is a trusted party.
+	tlsConfig := &tls.Config{InsecureSkipVerify: handler.SkipVerify}
+	if handler.Insecure {
+		tlsConfig = nil
+	}
+	handler.dialers = NewTenantDialers(handler.balancer, handler.directoryCache, tlsConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -338,21 +352,8 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 	}
 
 	connector := &connector{
-		ClusterName:    clusterName,
-		TenantID:       tenID,
-		DirectoryCache: handler.directoryCache,
-		Balancer:       handler.balancer,
-		StartupMsg:     backendStartupMsg,
-	}
-
-	// TLS options for the proxy are split into Insecure and SkipVerify.
-	// In insecure mode, TLSConfig is expected to be nil. This will cause the
-	// connector's dialer to skip TLS entirely. If SkipVerify is true,
-	// TLSConfig will be set to a non-nil config with InsecureSkipVerify set
-	// to true. InsecureSkipVerify will provide an encrypted connection but
-	// not verify that the connection recipient is a trusted party.
-	if !handler.Insecure {
-		connector.TLSConfig = &tls.Config{InsecureSkipVerify: handler.SkipVerify}
+		TenantDialer: handler.dialers.GetDialer(tenID, clusterName),
+		StartupMsg:   backendStartupMsg,
 	}
 
 	// Monitor for idle connection, if requested.

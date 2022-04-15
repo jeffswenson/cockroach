@@ -14,6 +14,7 @@ go_library(
         "metrics.go",
         "proxy.go",
         "proxy_handler.go",
+        "tenant_dialer.go",
         "server.go",
         ":gen-errorcode-stringer",  # keep
     ],
