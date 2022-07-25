@@ -127,7 +127,7 @@ var errTransferCannotStart = errors.New("transfer cannot be started")
 // error).
 //
 // TransferConnection implements the balancer.ConnectionHandle interface.
-func (f *forwarder) TransferConnection() (retErr error) {
+func (f *forwarder) TransferConnection() error {
 	// A previous non-recoverable transfer would have closed the forwarder, so
 	// return right away.
 	if f.ctx.Err() != nil {
@@ -148,7 +148,6 @@ func (f *forwarder) TransferConnection() (retErr error) {
 	// the connections. This then allow runTransfer to return and cleanup.
 	ctx, cancel := newTransferContext(f.ctx)
 	defer cancel()
-
 	// Use a separate handler for timeouts. This is the only way to handle
 	// blocked I/Os as described above.
 	go func() {
@@ -173,51 +172,58 @@ func (f *forwarder) TransferConnection() (retErr error) {
 	// should fork a new span, and avoid this issue.
 	tBegin := timeutil.Now()
 	logCtx := logtags.WithTags(context.Background(), logtags.FromContext(f.ctx))
-	defer func() {
-		latencyDur := timeutil.Since(tBegin)
-		f.metrics.ConnMigrationAttemptedLatency.RecordValue(latencyDur.Nanoseconds())
 
-		// When runTransfer returns, it's either the forwarder has been closed,
-		// or the procesors have been resumed.
-		if !ctx.isRecoverable() {
-			log.Infof(logCtx, "transfer failed: connection closed, latency=%v, err=%v", latencyDur, retErr)
-			f.metrics.ConnMigrationErrorFatalCount.Inc(1)
-			f.Close()
-		} else {
-			// Transfer was successful.
-			if retErr == nil {
-				log.Infof(logCtx, "transfer successful, latency=%v", latencyDur)
-				f.metrics.ConnMigrationSuccessCount.Inc(1)
-			} else {
-				log.Infof(logCtx, "transfer failed: connection recovered, latency=%v, err=%v", latencyDur, retErr)
-				f.metrics.ConnMigrationErrorRecoverableCount.Inc(1)
-			}
-			if err := f.resumeProcessors(); err != nil {
-				log.Infof(logCtx, "unable to resume processors: %v", err)
-				f.Close()
-			}
+	transferErr := func() error {
+		// Suspend both processors before starting the transfer.
+		request, response := f.getProcessors()
+		if err := request.suspend(ctx); err != nil {
+			return errors.Wrap(err, "suspending request processor")
 		}
+		if err := response.suspend(ctx); err != nil {
+			return errors.Wrap(err, "suspending response processor")
+		}
+
+		// Transfer the connection.
+		clientConn, serverConn := f.getConns()
+		newServerConn, err := transferConnection(ctx, f, f.connector, f.metrics, clientConn, serverConn)
+		if err != nil {
+			return errors.Wrap(err, "transferring connection")
+		}
+
+		// Transfer was successful.
+		f.replaceServerConn(newServerConn)
+
+		return nil
 	}()
 
-	// Suspend both processors before starting the transfer.
-	request, response := f.getProcessors()
-	if err := request.suspend(ctx); err != nil {
-		return errors.Wrap(err, "suspending request processor")
-	}
-	if err := response.suspend(ctx); err != nil {
-		return errors.Wrap(err, "suspending response processor")
+	latencyDur := timeutil.Since(tBegin)
+	f.metrics.ConnMigrationAttemptedLatency.RecordValue(latencyDur.Nanoseconds())
+
+	// Close the connection if there is a non-recoverable error.
+	if !ctx.isRecoverable() {
+		log.Infof(logCtx, "transfer failed: connection closed, latency=%v, err=%v", latencyDur, transferErr)
+		f.metrics.ConnMigrationErrorFatalCount.Inc(1)
+		f.Close()
+		return transferErr
 	}
 
-	// Transfer the connection.
-	clientConn, serverConn := f.getConns()
-	newServerConn, err := transferConnection(ctx, f, f.connector, f.metrics, clientConn, serverConn)
-	if err != nil {
-		return errors.Wrap(err, "transferring connection")
+	if transferErr != nil {
+		log.Infof(logCtx, "transfer failed: connection recovered, latency=%v, err=%v", latencyDur, transferErr)
+		f.metrics.ConnMigrationErrorRecoverableCount.Inc(1)
+	} else {
+		log.Infof(logCtx, "transfer successful, latency=%v", latencyDur)
+		f.metrics.ConnMigrationSuccessCount.Inc(1)
 	}
 
-	// Transfer was successful.
-	f.replaceServerConn(newServerConn)
-	return nil
+	// Resume forwarding to the server. If the migration failed, this may resume
+	// forwarding to the original server.
+	if err := f.resumeProcessors(); err != nil {
+		log.Infof(logCtx, "unable to resume processors: %v", err)
+		f.Close()
+		return err
+	}
+
+	return transferErr
 }
 
 // transferConnection performs the transfer operation for the current server
