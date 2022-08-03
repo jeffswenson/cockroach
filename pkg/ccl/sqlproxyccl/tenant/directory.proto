@@ -95,6 +95,10 @@ message EnsurePodRequest {
 // EnsurePodResponse is empty and indicates that the server processed the
 // request.
 message EnsurePodResponse {
+  // new_pods is the number of new pods bound to the. If new_pods > 0, that
+  // implies the request required cold starting the tenant. If a pod is moved
+  // from draining to running, it is not counted as a new pod.
+  int32 new_pods = 1;
 }
 
 // GetTenantRequest is used by a client to request from the sever metadata

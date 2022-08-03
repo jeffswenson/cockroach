@@ -58,11 +58,11 @@ func TestDirectoryErrors(t *testing.T) {
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 1002 not in directory cache")
 
 	// Fail to find tenant that does not exist.
-	_, err = dir.LookupTenantPods(ctx, roachpb.MakeTenantID(1000), "")
+	_, _, err = dir.LookupTenantPods(ctx, roachpb.MakeTenantID(1000), "")
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 1000 not found")
 
 	// Fail to find tenant when cluster name doesn't match.
-	_, err = dir.LookupTenantPods(ctx, roachpb.MakeTenantID(tenantID), "unknown")
+	_, _, err = dir.LookupTenantPods(ctx, roachpb.MakeTenantID(tenantID), "unknown")
 	require.EqualError(t, err, "rpc error: code = NotFound desc = cluster name unknown doesn't match expected tenant-cluster")
 
 	// No-op when reporting failure for tenant that doesn't exit.
@@ -170,7 +170,7 @@ func TestWatchPods(t *testing.T) {
 	// that we attempted to call EnsurePod in the test directory server because
 	// the cache has no running pods. In the actual directory server, this
 	// should put the draining pod back to running.
-	pods, err = dir.LookupTenantPods(ctx, tenantID, "my-tenant")
+	pods, _, err = dir.LookupTenantPods(ctx, tenantID, "my-tenant")
 	require.Regexp(t, "tenant has no pods", err)
 	require.Empty(t, pods)
 
@@ -217,7 +217,7 @@ func TestCancelLookups(t *testing.T) {
 	for i := 0; i < lookupCount; i++ {
 		wait.Add(1)
 		go func(i int) {
-			_, backgroundErrors[i] = dir.LookupTenantPods(ctx, tenantID, "")
+			_, _, backgroundErrors[i] = dir.LookupTenantPods(ctx, tenantID, "")
 			wait.Done()
 		}(i)
 	}
@@ -255,7 +255,7 @@ func TestResume(t *testing.T) {
 	for i := 0; i < lookupCount; i++ {
 		wait.Add(1)
 		go func(i int) {
-			pods, err := dir.LookupTenantPods(ctx, tenantID, "")
+			pods, _, err := dir.LookupTenantPods(ctx, tenantID, "")
 			require.NoError(t, err)
 			addrs[i] = pods[0].Addr
 			wait.Done()
@@ -294,14 +294,14 @@ func TestDeleteTenant(t *testing.T) {
 	require.NoError(t, createTenant(tc, tenantID))
 
 	// Perform lookup to create entry in cache.
-	pods, err := dir.LookupTenantPods(ctx, tenantID, "")
+	pods, _, err := dir.LookupTenantPods(ctx, tenantID, "")
 	require.NoError(t, err)
 	require.NotEmpty(t, pods)
 	addr := pods[0].Addr
 
 	// Report failure even though tenant is healthy - refresh should do nothing.
 	require.NoError(t, dir.ReportFailure(ctx, tenantID, addr))
-	pods, err = dir.LookupTenantPods(ctx, tenantID, "")
+	pods, _, err = dir.LookupTenantPods(ctx, tenantID, "")
 	require.NoError(t, err)
 	require.NotEmpty(t, pods)
 	addr = pods[0].Addr
@@ -327,7 +327,7 @@ func TestDeleteTenant(t *testing.T) {
 
 	// Now LookupTenantPods should return an error and the directory should no
 	// longer cache the tenant.
-	_, err = dir.LookupTenantPods(ctx, tenantID, "")
+	_, _, err = dir.LookupTenantPods(ctx, tenantID, "")
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 50 not found")
 	pods, err = dir.TryLookupTenantPods(ctx, tenantID)
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 50 not in directory cache")
@@ -351,7 +351,7 @@ func TestRefreshThrottling(t *testing.T) {
 	require.NoError(t, createTenant(tc, tenantID))
 
 	// Perform lookup to create entry in cache.
-	pods, err := dir.LookupTenantPods(ctx, tenantID, "")
+	pods, _, err := dir.LookupTenantPods(ctx, tenantID, "")
 	require.NoError(t, err)
 	require.NotEmpty(t, pods)
 	addr := pods[0].Addr

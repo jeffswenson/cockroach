@@ -296,13 +296,13 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 
 		c := &connector{}
 		var lookupAddrCount int
-		c.testingKnobs.lookupAddr = func(ctx context.Context) (string, error) {
+		c.testingKnobs.lookupAddr = func(ctx context.Context) (string, bool, error) {
 			lookupAddrCount++
 			if lookupAddrCount >= 2 {
 				// Cancel context to trigger loop exit on next retry.
 				cancel()
 			}
-			return "", markAsRetriableConnectorError(errors.New("baz"))
+			return "", false, markAsRetriableConnectorError(errors.New("baz"))
 		}
 
 		conn, err := c.dialTenantCluster(ctx, nil /* requester */)
@@ -319,8 +319,8 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 		defer cancel()
 
 		c := &connector{}
-		c.testingKnobs.lookupAddr = func(ctx context.Context) (string, error) {
-			return "", errors.Wrap(context.Canceled, "foobar")
+		c.testingKnobs.lookupAddr = func(ctx context.Context) (string, bool, error) {
+			return "", false, errors.Wrap(context.Canceled, "foobar")
 		}
 
 		conn, err := c.dialTenantCluster(ctx, nil /* requester */)
@@ -338,8 +338,8 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 			DialTenantLatency: metric.NewLatency(metaDialTenantLatency, time.Millisecond),
 			DialTenantRetries: metric.NewCounter(metaDialTenantRetries),
 		}
-		c.testingKnobs.lookupAddr = func(ctx context.Context) (string, error) {
-			return "", errors.New("baz")
+		c.testingKnobs.lookupAddr = func(ctx context.Context) (string, bool, error) {
+			return "", false, errors.New("baz")
 		}
 
 		conn, err := c.dialTenantCluster(ctx, nil /* requester */)
@@ -347,6 +347,7 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 		require.Nil(t, conn)
 
 		require.Equal(t, c.DialTenantLatency.TotalCount(), int64(1))
+		require.Equal(t, c.DialTenantColdStartLatency.TotalCount(), int64(0))
 		require.Equal(t, c.DialTenantRetries.Count(), int64(0))
 	})
 
@@ -390,12 +391,12 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 		// 1. retriable error on lookupAddr.
 		// 2. retriable error on dialSQLServer.
 		var addrLookupFnCount, dialSQLServerCount int
-		c.testingKnobs.lookupAddr = func(ctx context.Context) (string, error) {
+		c.testingKnobs.lookupAddr = func(ctx context.Context) (string, bool, error) {
 			addrLookupFnCount++
 			if addrLookupFnCount == 1 {
-				return "", markAsRetriableConnectorError(errors.New("foo"))
+				return "", false, markAsRetriableConnectorError(errors.New("foo"))
 			}
-			return "127.0.0.10:42", nil
+			return "127.0.0.10:42", true, nil
 		}
 		c.testingKnobs.dialSQLServer = func(serverAssignment *balancer.ServerAssignment) (net.Conn, error) {
 			require.Equal(t, serverAssignment.Addr(), "127.0.0.10:42")
@@ -414,6 +415,7 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 		require.Equal(t, 2, dialSQLServerCount)
 		require.Equal(t, 1, reportFailureFnCount)
 		require.Equal(t, c.DialTenantLatency.TotalCount(), int64(1))
+		require.Equal(t, c.DialTenantColdStartLatency.TotalCount(), int64(1))
 		require.Equal(t, c.DialTenantRetries.Count(), int64(2))
 	})
 
@@ -549,7 +551,7 @@ func TestConnector_lookupAddr(t *testing.T) {
 			},
 		}
 
-		addr, err := c.lookupAddr(ctx)
+		addr, _, err := c.lookupAddr(ctx)
 		require.NoError(t, err)
 		require.Equal(t, "127.0.0.10:80", addr)
 		require.Equal(t, 1, lookupTenantPodsFnCount)
@@ -574,7 +576,7 @@ func TestConnector_lookupAddr(t *testing.T) {
 			},
 		}
 
-		addr, err := c.lookupAddr(ctx)
+		addr, _, err := c.lookupAddr(ctx)
 		require.EqualError(t, err, "codeUnavailable: foo")
 		require.Equal(t, "", addr)
 		require.Equal(t, 1, lookupTenantPodsFnCount)
@@ -599,7 +601,7 @@ func TestConnector_lookupAddr(t *testing.T) {
 			},
 		}
 
-		addr, err := c.lookupAddr(ctx)
+		addr, _, err := c.lookupAddr(ctx)
 		require.EqualError(t, err, "codeParamsRoutingFailed: cluster my-foo-10 not found")
 		require.Equal(t, "", addr)
 		require.Equal(t, 1, lookupTenantPodsFnCount)
@@ -624,7 +626,7 @@ func TestConnector_lookupAddr(t *testing.T) {
 			},
 		}
 
-		addr, err := c.lookupAddr(ctx)
+		addr, _, err := c.lookupAddr(ctx)
 		require.EqualError(t, err, "foo")
 		require.True(t, isRetriableConnectorError(err))
 		require.Equal(t, "", addr)
@@ -787,8 +789,9 @@ type testTenantDirectoryCache struct {
 // LookupTenantPods implements the tenant.DirectoryCache interface.
 func (r *testTenantDirectoryCache) LookupTenantPods(
 	ctx context.Context, tenantID roachpb.TenantID, clusterName string,
-) ([]*tenant.Pod, error) {
-	return r.lookupTenantPodsFn(ctx, tenantID, clusterName)
+) ([]*tenant.Pod, bool, error) {
+	pod, err := r.lookupTenantPodsFn(ctx, tenantID, clusterName)
+	return pod, false, err
 }
 
 // TryLookupTenantPods implements the tenant.DirectoryCache interface.

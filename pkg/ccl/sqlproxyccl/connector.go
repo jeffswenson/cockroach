@@ -78,6 +78,10 @@ type connector struct {
 	// a tenant and set up a tcp connection to the address.
 	DialTenantLatency *metric.Histogram
 
+	// DialTenantColdStartLatency is the DialTenantLatency metric, but filtered
+	// to cold starts.
+	DialTenantColdStartLatency *metric.Histogram
+
 	// DialTenantRetries counts how often dialing a tenant is retried.
 	DialTenantRetries *metric.Counter
 
@@ -85,7 +89,7 @@ type connector struct {
 	// be called instead of the actual logic.
 	testingKnobs struct {
 		dialTenantCluster func(ctx context.Context, requester balancer.ConnectionHandle) (net.Conn, error)
-		lookupAddr        func(ctx context.Context) (string, error)
+		lookupAddr        func(ctx context.Context) (string, bool, error)
 		dialSQLServer     func(serverAssignment *balancer.ServerAssignment) (net.Conn, error)
 	}
 }
@@ -175,9 +179,15 @@ func (c *connector) dialTenantCluster(
 		return c.testingKnobs.dialTenantCluster(ctx, requester)
 	}
 
-	if c.DialTenantLatency != nil {
+	var isColdStart bool
+	if c.DialTenantLatency != nil && c.DialTenantColdStartLatency != nil {
 		start := timeutil.Now()
-		defer func() { c.DialTenantLatency.RecordValue(timeutil.Since(start).Nanoseconds()) }()
+		defer func() {
+			c.DialTenantLatency.RecordValue(timeutil.Since(start).Nanoseconds())
+			if isColdStart {
+				c.DialTenantColdStartLatency.RecordValue(timeutil.Since(start).Nanoseconds())
+			}
+		}()
 	}
 
 	// Repeatedly try to make a connection until context is canceled, or until
@@ -206,7 +216,8 @@ func (c *connector) dialTenantCluster(
 		isRetry = true
 
 		// Retrieve a SQL pod address to connect to.
-		serverAddr, err = c.lookupAddr(ctx)
+		var coldStart bool
+		serverAddr, coldStart, err = c.lookupAddr(ctx)
 		if err != nil {
 			if isRetriableConnectorError(err) {
 				lookupAddrErrs++
@@ -218,6 +229,9 @@ func (c *connector) dialTenantCluster(
 				continue
 			}
 			return nil, err
+		}
+		if coldStart {
+			isColdStart = true
 		}
 
 		// Make a connection to the SQL pod.
@@ -284,14 +298,14 @@ func (c *connector) dialTenantCluster(
 // This will be called within an infinite backoff loop. If an error is
 // transient, this will return an error that has been marked with
 // errRetryConnectorSentinel (i.e. markAsRetriableConnectorError).
-func (c *connector) lookupAddr(ctx context.Context) (string, error) {
+func (c *connector) lookupAddr(ctx context.Context) (string, bool, error) {
 	if c.testingKnobs.lookupAddr != nil {
 		return c.testingKnobs.lookupAddr(ctx)
 	}
 
 	// Lookup tenant in the directory cache. Once we have retrieve the list of
 	// pods, use the Balancer for load balancing.
-	pods, err := c.DirectoryCache.LookupTenantPods(ctx, c.TenantID, c.ClusterName)
+	pods, coldStart, err := c.DirectoryCache.LookupTenantPods(ctx, c.TenantID, c.ClusterName)
 	switch {
 	case err == nil:
 		runningPods := make([]*tenant.Pod, 0, len(pods))
@@ -305,22 +319,22 @@ func (c *connector) lookupAddr(ctx context.Context) (string, error) {
 			// This should never happen because LookupTenantPods ensured that
 			// there should be at least one RUNNING pod. Mark it as a retriable
 			// connection anyway.
-			return "", markAsRetriableConnectorError(err)
+			return "", false, markAsRetriableConnectorError(err)
 		}
-		return pod.Addr, nil
+		return pod.Addr, coldStart, nil
 
 	case status.Code(err) == codes.FailedPrecondition:
 		if st, ok := status.FromError(err); ok {
-			return "", newErrorf(codeUnavailable, "%v", st.Message())
+			return "", false, newErrorf(codeUnavailable, "%v", st.Message())
 		}
-		return "", newErrorf(codeUnavailable, "unavailable")
+		return "", false, newErrorf(codeUnavailable, "unavailable")
 
 	case status.Code(err) == codes.NotFound:
-		return "", newErrorf(codeParamsRoutingFailed,
+		return "", false, newErrorf(codeParamsRoutingFailed,
 			"cluster %s-%d not found", c.ClusterName, c.TenantID.ToUint64())
 
 	default:
-		return "", markAsRetriableConnectorError(err)
+		return "", false, markAsRetriableConnectorError(err)
 	}
 }
 

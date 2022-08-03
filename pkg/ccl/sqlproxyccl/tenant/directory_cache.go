@@ -33,7 +33,7 @@ type DirectoryCache interface {
 	//
 	// If no matching pods are found (e.g. cluster name mismatch, or tenant was
 	// deleted), this will return a GRPC NotFound error.
-	LookupTenantPods(ctx context.Context, tenantID roachpb.TenantID, clusterName string) ([]*Pod, error)
+	LookupTenantPods(ctx context.Context, tenantID roachpb.TenantID, clusterName string) (pods []*Pod, cold_start bool, err error)
 
 	// TryLookupTenantPods returns the IP addresses for all available SQL
 	// processes for the given tenant. It returns a GRPC NotFound error if the
@@ -174,11 +174,11 @@ func NewDirectoryCache(
 // LookupTenantPods implements the DirectoryCache interface.
 func (d *directoryCache) LookupTenantPods(
 	ctx context.Context, tenantID roachpb.TenantID, clusterName string,
-) ([]*Pod, error) {
+) ([]*Pod, bool, error) {
 	// Ensure that a directory entry has been created for this tenant.
 	entry, err := d.getEntry(ctx, tenantID, true /* allowCreate */)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// Check if the cluster name matches. This can be skipped if clusterName
@@ -186,12 +186,13 @@ func (d *directoryCache) LookupTenantPods(
 	if clusterName != "" && entry.ClusterName != "" && clusterName != entry.ClusterName {
 		// Return a GRPC NotFound error.
 		log.Errorf(ctx, "cluster name %s doesn't match expected %s", clusterName, entry.ClusterName)
-		return nil, status.Errorf(codes.NotFound,
+		return nil, false, status.Errorf(codes.NotFound,
 			"cluster name %s doesn't match expected %s", clusterName, entry.ClusterName)
 	}
 
 	ctx, _ = d.stopper.WithCancelOnQuiesce(ctx)
 	tenantPods := entry.GetPods()
+	var coldStart bool
 
 	// Trigger resumption if there are no RUNNING pods.
 	if !hasRunningPod(tenantPods) {
@@ -199,14 +200,14 @@ func (d *directoryCache) LookupTenantPods(
 		// the directory server. Resume the tenant if it is suspended; that
 		// will always result in at least one pod IP address (or an error).
 		var err error
-		if tenantPods, err = entry.EnsureTenantPod(ctx, d.client, d.options.deterministic); err != nil {
+		if tenantPods, coldStart, err = entry.EnsureTenantPod(ctx, d.client, d.options.deterministic); err != nil {
 			if status.Code(err) == codes.NotFound {
 				d.deleteEntry(entry)
 			}
-			return nil, err
+			return nil, false, err
 		}
 	}
-	return tenantPods, nil
+	return tenantPods, coldStart, nil
 }
 
 // TryLookupTenantPods returns a list of SQL pods in the RUNNING and DRAINING

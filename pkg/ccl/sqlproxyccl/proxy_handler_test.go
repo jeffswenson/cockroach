@@ -1095,20 +1095,20 @@ func TestConnectionMigration(t *testing.T) {
 		// Set up forwarder hooks.
 		prevTenant1 := true
 		var lookupAddrDelayDuration time.Duration
-		f.connector.testingKnobs.lookupAddr = func(ctx context.Context) (string, error) {
+		f.connector.testingKnobs.lookupAddr = func(ctx context.Context) (string, bool, error) {
 			if lookupAddrDelayDuration != 0 {
 				select {
 				case <-ctx.Done():
-					return "", errors.Wrap(ctx.Err(), "injected delays")
+					return "", false, errors.Wrap(ctx.Err(), "injected delays")
 				case <-time.After(lookupAddrDelayDuration):
 				}
 			}
 			if prevTenant1 {
 				prevTenant1 = false
-				return tenant2.SQLAddr(), nil
+				return tenant2.SQLAddr(), false, nil
 			}
 			prevTenant1 = true
-			return tenant1.SQLAddr(), nil
+			return tenant1.SQLAddr(), false, nil
 		}
 
 		t.Run("normal_transfer", func(t *testing.T) {
@@ -1305,13 +1305,13 @@ func TestConnectionMigration(t *testing.T) {
 
 		// Set up forwarder hooks.
 		prevTenant1 := true
-		f.connector.testingKnobs.lookupAddr = func(ctx context.Context) (string, error) {
+		f.connector.testingKnobs.lookupAddr = func(ctx context.Context) (string, bool, error) {
 			if prevTenant1 {
 				prevTenant1 = false
-				return tenant2.SQLAddr(), nil
+				return tenant2.SQLAddr(), false, nil
 			}
 			prevTenant1 = true
-			return tenant1.SQLAddr(), nil
+			return tenant1.SQLAddr(), false, nil
 		}
 		defer testutils.TestingHook(&isSafeTransferPointLocked, func(req *processor, res *processor) bool {
 			return true

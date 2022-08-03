@@ -159,7 +159,7 @@ func (e *tenantEntry) GetPods() []*Pod {
 // pods available rather than blocking.
 func (e *tenantEntry) EnsureTenantPod(
 	ctx context.Context, client DirectoryClient, errorIfNoPods bool,
-) (pods []*Pod, err error) {
+) (pods []*Pod, coldStart bool, err error) {
 	const retryDelay = 100 * time.Millisecond
 
 	e.calls.Lock()
@@ -170,19 +170,22 @@ func (e *tenantEntry) EnsureTenantPod(
 	// first thread does the work to get information about the tenant.
 	pods = e.GetPods()
 	if hasRunningPod(pods) {
-		return pods, nil
+		return pods, false, nil
 	}
 
 	for {
 		// Check for context cancellation or timeout.
 		if err = ctx.Err(); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		// Try to resume the tenant if not yet resumed.
-		_, err = client.EnsurePod(ctx, &EnsurePodRequest{e.TenantID.ToUint64()})
+		resp, err := client.EnsurePod(ctx, &EnsurePodRequest{e.TenantID.ToUint64()})
 		if err != nil {
-			return nil, err
+			return nil, false, err
+		}
+		if 0 < resp.NewPods {
+			coldStart = true
 		}
 
 		// Get pod information for the newly resumed tenant. Except in rare
@@ -191,7 +194,7 @@ func (e *tenantEntry) EnsureTenantPod(
 		// address.
 		pods, err = e.fetchPodsLocked(ctx, client)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if hasRunningPod(pods) {
 			log.Infof(ctx, "resumed tenant %d", e.TenantID)
@@ -201,12 +204,12 @@ func (e *tenantEntry) EnsureTenantPod(
 		// In rare case where no IP address is ready, wait for a bit before
 		// retrying.
 		if errorIfNoPods {
-			return nil, fmt.Errorf("no pods available for tenant %s", e.TenantID)
+			return nil, false, fmt.Errorf("no pods available for tenant %s", e.TenantID)
 		}
 		sleepContext(ctx, retryDelay)
 	}
 
-	return pods, nil
+	return pods, coldStart, nil
 }
 
 // fetchPodsLocked makes a synchronous directory server call to get the latest
