@@ -906,9 +906,15 @@ CREATE TABLE crdb_internal.jobs (
 						errorStr = tree.NewDString(fmt.Sprintf("error decoding payload: %v", err))
 					}
 				}
-				if sessionID, ok := sessionIDBytes.(*tree.DBytes); ok {
+				if sessionIDRaw, ok := sessionIDBytes.(*tree.DBytes); ok {
+					// TODO(jeffswenson): handle the !ok branch
+					sessionID, err := sqlliveness.DecodeSessionID([]byte(*sessionIDRaw))
+					if err != nil {
+						// TODO(jeffswenson): descriptive error message
+						return nil, err
+					}
 					if isAlive, err := p.EvalContext().SQLLivenessReader.IsAlive(
-						ctx, sqlliveness.SessionID(*sessionID),
+						ctx, sqlliveness.SessionID(sessionID),
 					); err != nil {
 						// Silently swallow the error for checking for liveness.
 					} else if instanceID, ok := instanceID.(*tree.DInt); ok && isAlive {

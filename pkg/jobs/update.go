@@ -11,7 +11,6 @@
 package jobs
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -180,8 +179,12 @@ func (j *Job) update(ctx context.Context, txn *kv.Txn, useReadLock bool, updateF
 					"with status %q: expected session %q but found NULL",
 					status, j.session.ID())
 			}
-			storedSession := []byte(*row[3].(*tree.DBytes))
-			if !bytes.Equal(storedSession, j.session.ID().UnsafeBytes()) {
+			storedSession, err := sqlliveness.DecodeSessionID([]byte(*row[3].(*tree.DBytes)))
+			if err != nil {
+				// TODO(jeffswenosn): return a better error
+				return err
+			}
+			if storedSession != j.session.ID() {
 				return errors.Errorf(
 					"with status %q: expected session %q but found %q",
 					status, j.session.ID(), sqlliveness.SessionID(storedSession))

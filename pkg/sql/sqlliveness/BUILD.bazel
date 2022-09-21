@@ -8,9 +8,12 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
+        "//pkg/sql/rowenc/valueside",
+        "//pkg/sql/sem/tree",
         "//pkg/util/encoding",
         "//pkg/util/hlc",
         "//pkg/util/metric",
+        "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )

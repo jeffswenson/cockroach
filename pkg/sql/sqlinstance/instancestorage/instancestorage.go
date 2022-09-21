@@ -79,7 +79,7 @@ func (s *Storage) CreateInstance(
 	if len(addr) == 0 {
 		return base.SQLInstanceID(0), errors.New("no address information for instance")
 	}
-	if len(sessionID) == 0 {
+	if sessionID.Empty() {
 		return base.SQLInstanceID(0), errors.New("no session information for instance")
 	}
 	ctx = multitenant.WithTenantCostControlExemption(ctx)

@@ -72,7 +72,7 @@ func TestStorage(t *testing.T) {
 		stopper, storage, _, clock := setup(t)
 		defer stopper.Stop(ctx)
 		const id = base.SQLInstanceID(1)
-		const sessionID = sqlliveness.SessionID("session_id")
+		sessionID := sqlliveness.MakeSessionID("region")
 		const addr = "addr"
 		locality := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "test"}, {Key: "az", Value: "a"}}}
 		const expiration = time.Minute
@@ -89,7 +89,11 @@ func TestStorage(t *testing.T) {
 		// Create three instances and release one.
 		instanceIDs := [...]base.SQLInstanceID{1, 2, 3}
 		addresses := [...]string{"addr1", "addr2", "addr3"}
-		sessionIDs := [...]sqlliveness.SessionID{"session1", "session2", "session3"}
+		sessionIDs := [...]sqlliveness.SessionID{
+			sqlliveness.MakeSessionID("region"),
+			sqlliveness.MakeSessionID("region"),
+			sqlliveness.MakeSessionID("region"),
+		}
 		localities := [...]roachpb.Locality{
 			{Tiers: []roachpb.Tier{{Key: "region", Value: "region1"}}},
 			{Tiers: []roachpb.Tier{{Key: "region", Value: "region2"}}},
@@ -142,7 +146,7 @@ func TestStorage(t *testing.T) {
 		{
 			var err error
 			var instanceID base.SQLInstanceID
-			newSessionID := sqlliveness.SessionID("session4")
+			newSessionID := sqlliveness.MakeSessionID("region")
 			newAddr := "addr4"
 			newLocality := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "region4"}}}
 			newSessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
@@ -172,7 +176,7 @@ func TestStorage(t *testing.T) {
 		{
 			var err error
 			var instanceID base.SQLInstanceID
-			newSessionID := sqlliveness.SessionID("session5")
+			newSessionID := sqlliveness.MakeSessionID("region")
 			newAddr := "addr5"
 			newLocality := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "region5"}}}
 			newSessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
@@ -222,13 +226,13 @@ func TestSQLAccess(t *testing.T) {
 	defer stopper.Stop(ctx)
 	storage := instancestorage.NewTestingStorage(kvDB, keys.SystemSQLCodec, tableID, slstorage.NewFakeStorage())
 	const (
-		sessionID       = sqlliveness.SessionID("session")
 		addr            = "addr"
 		tierStr         = "region=test1,zone=test2"
 		localityStr     = "{\"Tiers\": \"" + tierStr + "\"}"
 		expiration      = time.Minute
 		expectedNumCols = 4
 	)
+	sessionID := sqlliveness.MakeSessionID("region")
 	var locality roachpb.Locality
 	if err := locality.Set(tierStr); err != nil {
 		t.Fatal(err)
@@ -287,10 +291,10 @@ func TestConcurrentCreateAndRelease(t *testing.T) {
 		runsPerWorker   = 100
 		workers         = 100
 		controllerSteps = 100
-		sessionID       = sqlliveness.SessionID("session")
 		addr            = "addr"
 		expiration      = time.Minute
 	)
+	sessionID := sqlliveness.MakeSessionID("region")
 	locality := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "test-region"}}}
 	sessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
 	err := slStorage.Insert(ctx, sessionID, sessionExpiry)

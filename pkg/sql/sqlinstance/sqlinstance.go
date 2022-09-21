@@ -74,7 +74,7 @@ func (p *fakeSQLProvider) Start(ctx context.Context) error {
 func (p *fakeSQLProvider) Instance(
 	ctx context.Context,
 ) (_ base.SQLInstanceID, _ sqlliveness.SessionID, err error) {
-	return base.SQLInstanceID(0), "", NotASQLInstanceError
+	return base.SQLInstanceID(0), sqlliveness.SessionID{}, NotASQLInstanceError
 }
 
 // GetInstance implements the AddressResolver interface.

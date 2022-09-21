@@ -150,7 +150,7 @@ func (ts *testState) start(t *testing.T) {
 		return 0
 	}
 	instanceID := base.SQLInstanceID(1)
-	sessionID := sqlliveness.SessionID("foo")
+	sessionID := sqlliveness.MakeSessionID("foo")
 	if err := ts.controller.Start(
 		ctx, ts.stopper, instanceID, sessionID, externalUsageFn, nextLiveInstanceIDFn,
 	); err != nil {
@@ -775,7 +775,7 @@ func TestWaitingRU(t *testing.T) {
 	}
 	nextLiveInstanceID := func(ctx context.Context) base.SQLInstanceID { return 2 }
 	require.NoError(t, ctrl.Start(
-		ctx, stopper, 1, "test", externalUsage, nextLiveInstanceID))
+		ctx, stopper, 1, sqlliveness.MakeSessionID("test-region"), externalUsage, nextLiveInstanceID))
 
 	// Wait for the initial token bucket response.
 	require.True(t, eventWait.WaitForEvent(tenantcostclient.TokenBucketResponseError))

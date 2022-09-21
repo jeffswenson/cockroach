@@ -72,7 +72,7 @@ func TestReader(t *testing.T) {
 	t.Run("basic-get-instance-data", func(t *testing.T) {
 		storage, slStorage, clock, reader := setup(t)
 		require.NoError(t, reader.Start(ctx))
-		const sessionID = sqlliveness.SessionID("session_id")
+		sessionID := sqlliveness.MakeSessionID("region")
 		const addr = "addr"
 		locality := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "test"}, {Key: "az", Value: "a"}}}
 		// Set a high enough expiration to ensure the session stays
@@ -113,7 +113,11 @@ func TestReader(t *testing.T) {
 		// Set up expected test data.
 		instanceIDs := []base.SQLInstanceID{1, 2, 3}
 		addresses := []string{"addr1", "addr2", "addr3"}
-		sessionIDs := []sqlliveness.SessionID{"session1", "session2", "session3"}
+		sessionIDs := []sqlliveness.SessionID{
+			sqlliveness.MakeSessionID("region"),
+			sqlliveness.MakeSessionID("region"),
+			sqlliveness.MakeSessionID("region"),
+		}
 		localities := []roachpb.Locality{
 			{Tiers: []roachpb.Tier{{Key: "region", Value: "region1"}}},
 			{Tiers: []roachpb.Tier{{Key: "region", Value: "region2"}}},
@@ -200,7 +204,7 @@ func TestReader(t *testing.T) {
 		// the latest instance information is returned. This heuristic is used
 		// when instance information isn't released correctly prior to SQL instance shutdown.
 		{
-			sessionID := sqlliveness.SessionID("session4")
+			sessionID := sqlliveness.MakeSessionID("region")
 			locality := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "region4"}}}
 			sessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
 			id, err := storage.CreateInstance(ctx, sessionID, sessionExpiry, addresses[2], locality)
@@ -230,7 +234,11 @@ func TestReader(t *testing.T) {
 		// Create three instances and release one.
 		instanceIDs := [...]base.SQLInstanceID{1, 2, 3}
 		addresses := [...]string{"addr1", "addr2", "addr3"}
-		sessionIDs := [...]sqlliveness.SessionID{"session1", "session2", "session3"}
+		sessionIDs := [...]sqlliveness.SessionID{
+			sqlliveness.MakeSessionID("region"),
+			sqlliveness.MakeSessionID("region"),
+			sqlliveness.MakeSessionID("region"),
+		}
 		localities := [...]roachpb.Locality{
 			{Tiers: []roachpb.Tier{{Key: "region", Value: "region1"}}},
 			{Tiers: []roachpb.Tier{{Key: "region", Value: "region2"}}},
