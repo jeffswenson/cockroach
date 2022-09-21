@@ -356,7 +356,7 @@ func (c *tenantSideCostController) Start(
 	if instanceID == 0 {
 		return errors.New("invalid SQLInstanceID")
 	}
-	if sessionID == "" {
+	if sessionID == sqlliveness.EmptySessionID() {
 		return errors.New("invalid sqlliveness.SessionID")
 	}
 	c.stopper = stopper

@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 var (
@@ -165,7 +164,7 @@ func (l *Instance) clearSession(ctx context.Context) {
 // createSession tries until it can create a new session and returns an error
 // only if the heart beat loop should exit.
 func (l *Instance) createSession(ctx context.Context) (*session, error) {
-	id := sqlliveness.SessionID(uuid.MakeV4().GetBytes())
+	id := sqlliveness.MakeSessionID("TODO-REGION")
 	start := l.clock.Now()
 	exp := start.Add(l.ttl().Nanoseconds(), 0)
 	s := &session{

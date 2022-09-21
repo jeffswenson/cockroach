@@ -127,8 +127,8 @@ func TestStorage(t *testing.T) {
 
 		// Create two records which will expire before nextGC.
 		exp := clock.Now().Add(gcInterval.Nanoseconds()-1, 0)
-		const id1 = "asdf"
-		const id2 = "ghjk"
+		id1 := sqlliveness.MakeSessionID("region")
+		id2 := sqlliveness.MakeSessionID("region")
 		{
 			require.NoError(t, storage.Insert(ctx, id1, exp))
 			require.NoError(t, storage.Insert(ctx, id2, exp))

@@ -20,16 +20,45 @@ import (
 	"encoding/hex"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
 // SessionID represents an opaque identifier for a session. This ID should be
 // globally unique. It is a string so that it can be used as a map key but it
 // may not be a well-formed UTF8 string.
-type SessionID string
+type SessionID struct {
+	region string // not actually string
+	uuid   uuid.UUID
+}
+
+func MakeSessionID(region string) SessionID {
+	return SessionID{
+		region: region,
+		uuid:   uuid.MakeV4(),
+	}
+}
+
+func DecodeSessionID(session tree.DBytes) (SessionID, error) {
+	return SessionID{}, errors.New("unimplemented")
+}
+
+func (s *SessionID) Empty() bool {
+	return *s == SessionID{}
+}
+
+func (id *SessionID) Encode(bytes []byte, colID valueside.ColumnIDDelta) []byte {
+	// 1 + len(region) + 16
+	// [version, region..., uuid...]
+	// TODO(jeffswenson):implement this
+	// TODO(jeffswenson): use valueside.Encode to encode this correctly
+	return bytes
+}
 
 // Provider is a wrapper around the sqllivness subsystem for external
 // consumption.

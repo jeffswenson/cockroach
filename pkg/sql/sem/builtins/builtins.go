@@ -6120,7 +6120,11 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{{"session_id", types.Bytes}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				sid := sqlliveness.SessionID(*(args[0].(*tree.DBytes)))
+				sid, err := sqlliveness.DecodeSessionID(*(args[0].(*tree.DBytes)))
+				if err != nil {
+					// TODO(jeffswenson): create a better error message
+					return nil, err
+				}
 				live, err := evalCtx.SQLLivenessReader.IsAlive(evalCtx.Context, sid)
 				if err != nil {
 					return tree.MakeDBool(true), err

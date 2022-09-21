@@ -115,13 +115,13 @@ func (p *provider) Instance(
 	ctx context.Context,
 ) (_ base.SQLInstanceID, _ sqlliveness.SessionID, err error) {
 	if !p.started() {
-		return base.SQLInstanceID(0), "", sqlinstance.NotStartedError
+		return base.SQLInstanceID(0), sqlliveness.SessionID{}, sqlinstance.NotStartedError
 	}
 	select {
 	case <-ctx.Done():
-		return base.SQLInstanceID(0), "", ctx.Err()
+		return base.SQLInstanceID(0), sqlliveness.SessionID{}, ctx.Err()
 	case <-p.stopper.ShouldQuiesce():
-		return base.SQLInstanceID(0), "", stop.ErrUnavailable
+		return base.SQLInstanceID(0), sqlliveness.SessionID{}, stop.ErrUnavailable
 	case <-p.initialized:
 		return p.instanceID, p.sessionID, p.initError
 	}

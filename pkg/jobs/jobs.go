@@ -753,7 +753,7 @@ type JobNotFoundError struct {
 
 // Error makes JobNotFoundError an error.
 func (e *JobNotFoundError) Error() string {
-	if e.sessionID != "" {
+	if (e.sessionID != sqlliveness.SessionID{}) {
 		return fmt.Sprintf("job with ID %d does not exist with claim session id %q", e.jobID, e.sessionID.String())
 	}
 	return fmt.Sprintf("job with ID %d does not exist", e.jobID)

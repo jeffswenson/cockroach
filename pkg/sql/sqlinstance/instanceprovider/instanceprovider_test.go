@@ -69,7 +69,7 @@ func TestInstanceProvider(t *testing.T) {
 		instanceID, sessionID, err := instanceProvider.Instance(ctx)
 		require.NoError(t, err)
 		require.Equal(t, expectedInstanceID, instanceID)
-		require.NotEqual(t, sqlliveness.SessionID(""), sessionID)
+		require.NotEqual(t, sqlliveness.SessionID{}, sessionID)
 
 		// Verify an additional call to Instance(), returns the same instance
 		instanceID, sessionID2, err := instanceProvider.Instance(ctx)

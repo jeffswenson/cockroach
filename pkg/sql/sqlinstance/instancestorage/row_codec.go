@@ -62,12 +62,8 @@ func (d *rowCodec) encodeRow(
 	if err != nil {
 		return kv, err
 	}
-	sessionDatum := tree.NewDBytes(tree.DBytes(sessionID.UnsafeBytes()))
 	sessionColDiff := valueside.MakeColumnIDDelta(d.columns[1].GetID(), d.columns[2].GetID())
-	valueBuf, err = valueside.Encode(valueBuf, sessionColDiff, sessionDatum, []byte(nil))
-	if err != nil {
-		return kv, err
-	}
+	valueBuf = sessionID.Encode(valueBuf, sessionColDiff)
 	// Preserve the ordering of locality.Tiers, even though we convert it to json.
 	builder := json.NewObjectBuilder(1)
 	builder.Add("Tiers", json.FromString(locality.String()))
@@ -103,48 +99,51 @@ func (d *rowCodec) decodeRow(
 		row := make([]rowenc.EncDatum, 1)
 		_, _, err := rowenc.DecodeIndexKey(d.codec, types, row, nil, kv.Key)
 		if err != nil {
-			return base.SQLInstanceID(0), "", "", roachpb.Locality{}, hlc.Timestamp{}, false, errors.Wrap(err, "failed to decode key")
+			return base.SQLInstanceID(0), "", sqlliveness.SessionID{}, roachpb.Locality{}, hlc.Timestamp{}, false, errors.Wrap(err, "failed to decode key")
 		}
 		if err := row[0].EnsureDecoded(types[0], &alloc); err != nil {
-			return base.SQLInstanceID(0), "", "", roachpb.Locality{}, hlc.Timestamp{}, false, err
+			return base.SQLInstanceID(0), "", sqlliveness.SessionID{}, roachpb.Locality{}, hlc.Timestamp{}, false, err
 		}
 		instanceID = base.SQLInstanceID(tree.MustBeDInt(row[0].Datum))
 	}
 	if !kv.Value.IsPresent() {
-		return instanceID, "", "", roachpb.Locality{}, hlc.Timestamp{}, true, nil
+		return instanceID, "", sqlliveness.SessionID{}, roachpb.Locality{}, hlc.Timestamp{}, true, nil
 	}
 	timestamp = kv.Value.Timestamp
 	// The rest of the columns are stored as a family.
 	bytes, err := kv.Value.GetTuple()
 	if err != nil {
-		return instanceID, "", "", roachpb.Locality{}, hlc.Timestamp{}, false, err
+		return instanceID, "", sqlliveness.SessionID{}, roachpb.Locality{}, hlc.Timestamp{}, false, err
 	}
 
 	datums, err := d.decoder.Decode(&alloc, bytes)
 	if err != nil {
-		return instanceID, "", "", roachpb.Locality{}, hlc.Timestamp{}, false, err
+		return instanceID, "", sqlliveness.SessionID{}, roachpb.Locality{}, hlc.Timestamp{}, false, err
 	}
 
 	if addrVal := datums[1]; addrVal != tree.DNull {
 		addr = string(tree.MustBeDString(addrVal))
 	}
 	if sessionIDVal := datums[2]; sessionIDVal != tree.DNull {
-		sessionID = sqlliveness.SessionID(tree.MustBeDBytes(sessionIDVal))
+		sessionID, err = sqlliveness.DecodeSessionID(tree.MustBeDBytes(sessionIDVal))
+		if err != nil {
+			return instanceID, "", sqlliveness.SessionID{}, roachpb.Locality{}, hlc.Timestamp{}, false, err
+		}
 	}
 	if localityVal := datums[3]; localityVal != tree.DNull {
 		localityJ := tree.MustBeDJSON(localityVal)
 		v, err := localityJ.FetchValKey("Tiers")
 		if err != nil {
-			return instanceID, "", "", roachpb.Locality{}, hlc.Timestamp{}, false, errors.Wrap(err, "failed to find Tiers attribute in locality")
+			return instanceID, "", sqlliveness.SessionID{}, roachpb.Locality{}, hlc.Timestamp{}, false, errors.Wrap(err, "failed to find Tiers attribute in locality")
 		}
 		if v != nil {
 			vStr, err := v.AsText()
 			if err != nil {
-				return instanceID, "", "", roachpb.Locality{}, hlc.Timestamp{}, false, err
+				return instanceID, "", sqlliveness.SessionID{}, roachpb.Locality{}, hlc.Timestamp{}, false, err
 			}
 			if len(*vStr) > 0 {
 				if err := locality.Set(*vStr); err != nil {
-					return instanceID, "", "", roachpb.Locality{}, hlc.Timestamp{}, false, err
+					return instanceID, "", sqlliveness.SessionID{}, roachpb.Locality{}, hlc.Timestamp{}, false, err
 				}
 			}
 		}

@@ -1214,7 +1214,7 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		// to confirm that the sessionDuration overrides the lease duration while
 		// setting the transaction deadline.
 		sessionDuration := base.DefaultDescriptorLeaseDuration - time.Minute
-		fs := fakeSession{exp: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0)}
+		fs := makeFakeSession(s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0))
 		defer setClientSessionOverride(&fs)()
 
 		txn, err := sqlConn.Begin()
@@ -1237,7 +1237,7 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		// to confirm that the lease duration overrides the session duration while
 		// setting the transaction deadline
 		sessionDuration := base.DefaultDescriptorLeaseDuration + time.Minute
-		fs := fakeSession{exp: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0)}
+		fs := makeFakeSession(s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0))
 		defer setClientSessionOverride(&fs)()
 
 		txn, err := sqlConn.Begin()
@@ -1261,7 +1261,7 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		// and observe that we get a clear error indicating that the session
 		// was expired.
 		sessionDuration := -time.Nanosecond
-		fs := fakeSession{exp: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0)}
+		fs := makeFakeSession(s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0))
 		defer setClientSessionOverride(&fs)()
 		txn, err := sqlConn.Begin()
 		if err != nil {
@@ -1291,7 +1291,7 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		}
 
 		// Inject an already expired session to observe that it has no effect.
-		fs := &fakeSession{exp: s.Clock().Now().Add(-time.Minute.Nanoseconds(), 0)}
+		fs := makeFakeSession(s.Clock().Now().Add(-time.Minute.Nanoseconds(), 0))
 		defer setClientSessionOverride(fs)()
 		txn, err := dbConn.Begin()
 		if err != nil {
@@ -1809,9 +1809,19 @@ func noopRequestFilter(ctx context.Context, request roachpb.BatchRequest) *roach
 	return nil
 }
 
-type fakeSession struct{ exp hlc.Timestamp }
+type fakeSession struct {
+	id  sqlliveness.SessionID
+	exp hlc.Timestamp
+}
 
-func (f fakeSession) ID() sqlliveness.SessionID { return "foo" }
+func makeFakeSession(exp hlc.Timestamp) fakeSession {
+	return fakeSession{
+		id:  sqlliveness.MakeSessionID("foo-region"),
+		exp: exp,
+	}
+}
+
+func (f fakeSession) ID() sqlliveness.SessionID { return f.id }
 func (f fakeSession) Expiration() hlc.Timestamp { return f.exp }
 func (f fakeSession) Start() hlc.Timestamp      { panic("unimplemented") }
 func (f fakeSession) RegisterCallbackForSessionExpiry(func(ctx context.Context)) {
