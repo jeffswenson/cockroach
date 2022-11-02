@@ -544,6 +544,7 @@ func init() {
 		f := mtStartSQLCmd.Flags()
 		cliflagcfg.VarFlag(f, &tenantIDWrapper{&serverCfg.SQLConfig.TenantID}, cliflags.TenantID)
 		cliflagcfg.StringSliceFlag(f, &serverCfg.SQLConfig.TenantKVAddrs, cliflags.KVAddrs)
+		cliflagcfg.BoolFlag(f, &serverCfg.SQLConfig.MrSystemDatabase, cliflags.MrSystemDatabse)
 	}
 
 	// Flags that apply to commands that start servers.

@@ -440,6 +440,12 @@ type SQLConfig struct {
 	// node clocks have necessarily passed it.
 	// Environment Variable: COCKROACH_EXPERIMENTAL_LINEARIZABLE
 	Linearizable bool
+
+	// MrSystemDatabase is set to true if the tenant should use the
+	// multi-region optimized system table layouts.
+	// TODO(jeffswenson): clean up MrSystemDatabase after writing upgrade
+	// migrations for the new system table formats.
+	MrSystemDatabase bool
 }
 
 // MakeSQLConfig returns a SQLConfig with default values.

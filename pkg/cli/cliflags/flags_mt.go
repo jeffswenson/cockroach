@@ -24,6 +24,16 @@ var (
 		Description: `A comma-separated list of KV endpoints (load balancers allowed).`,
 	}
 
+	// TODO(jeffswenson): The MR system database option is a temporary option
+	// to enable the multi-region optimized system database layouts. The flag
+	// exists in order to defer the implementation of migrations. Once the
+	// migrations are ready, the flag should be deleted.
+	MrSystemDatabse = FlagInfo{
+		Name:        "unsafe-mr-system-database",
+		EnvVar:      "COCKROACH_MR_SYSTEM_DATABASE",
+		Description: `Enables the multi-region system database features`,
+	}
+
 	DenyList = FlagInfo{
 		Name:        "denylist-file",
 		Description: "Denylist file to limit access to IP addresses and tenant ids.",
