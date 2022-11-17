@@ -85,7 +85,7 @@ func TestStorage(t *testing.T) {
 	instancestorage.PreallocatedCount.Override(ctx, &s.ClusterSettings().SV, preallocatedCount)
 
 	t.Run("create-instance-get-instance", func(t *testing.T) {
-		stopper, storage, _, clock := setup(t)
+		stopper, storage, _, _ := setup(t)
 		defer stopper.Stop(ctx)
 		const id = base.SQLInstanceID(1)
 		sessionID := makeSession()
@@ -93,7 +93,7 @@ func TestStorage(t *testing.T) {
 		locality := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "test"}, {Key: "az", Value: "a"}}}
 		const expiration = time.Minute
 		{
-			instanceID, err := storage.CreateInstance(ctx, sessionID, clock.Now().Add(expiration.Nanoseconds(), 0), addr, locality)
+			instanceID, err := storage.CreateInstance(ctx, sessionID, addr, locality)
 			require.NoError(t, err)
 			require.Equal(t, id, instanceID)
 		}
@@ -118,7 +118,7 @@ func TestStorage(t *testing.T) {
 		}
 		sessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
 		for _, index := range []int{0, 1, 2} {
-			instanceID, err := storage.CreateInstance(ctx, sessionIDs[index], sessionExpiry, addresses[index], localities[index])
+			instanceID, err := storage.CreateInstance(ctx, sessionIDs[index], addresses[index], localities[index])
 			require.NoError(t, err)
 			require.NoError(t, slStorage.Insert(ctx, sessionIDs[index], sessionExpiry))
 			require.Equal(t, instanceIDs[index], instanceID)
@@ -146,7 +146,7 @@ func TestStorage(t *testing.T) {
 
 		// Create two more instances.
 		for _, index := range []int{3, 4} {
-			instanceID, err := storage.CreateInstance(ctx, sessionIDs[index], sessionExpiry, addresses[index], localities[index])
+			instanceID, err := storage.CreateInstance(ctx, sessionIDs[index], addresses[index], localities[index])
 			require.NoError(t, err)
 			require.NoError(t, slStorage.Insert(ctx, sessionIDs[index], sessionExpiry))
 			require.Equal(t, instanceIDs[index], instanceID)
@@ -190,7 +190,7 @@ func TestStorage(t *testing.T) {
 			var err error
 			var instanceID base.SQLInstanceID
 			require.NoError(t, slStorage.Insert(ctx, sessionID6, sessionExpiry))
-			instanceID, err = storage.CreateInstance(ctx, sessionID6, sessionExpiry, addr6, locality6)
+			instanceID, err = storage.CreateInstance(ctx, sessionID6, addr6, locality6)
 			require.NoError(t, err)
 			require.Equal(t, instanceIDs[4], instanceID)
 			var instances []sqlinstance.InstanceInfo
@@ -221,7 +221,7 @@ func TestStorage(t *testing.T) {
 			newSessionID := makeSession()
 			newAddr := "addr7"
 			newLocality := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "region7"}}}
-			instanceID, err = storage.CreateInstance(ctx, newSessionID, sessionExpiry, newAddr, newLocality)
+			instanceID, err = storage.CreateInstance(ctx, newSessionID, newAddr, newLocality)
 			require.NoError(t, err)
 			require.Equal(t, instanceIDs[0], instanceID)
 			var instances []sqlinstance.InstanceInfo
@@ -265,7 +265,6 @@ func TestSQLAccess(t *testing.T) {
 	ctx := context.Background()
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
-	clock := hlc.NewClock(timeutil.NewTestTimeSource(), base.DefaultMaxClockOffset)
 	tDB := sqlutils.MakeSQLRunner(sqlDB)
 	dbName := t.Name()
 	tDB.Exec(t, `CREATE DATABASE "`+dbName+`"`)
@@ -288,7 +287,7 @@ func TestSQLAccess(t *testing.T) {
 	sessionID := makeSession()
 	var locality roachpb.Locality
 	require.NoError(t, locality.Set(tierStr))
-	instanceID, err := storage.CreateInstance(ctx, sessionID, clock.Now().Add(expiration.Nanoseconds(), 0), addr, locality)
+	instanceID, err := storage.CreateInstance(ctx, sessionID, addr, locality)
 	require.NoError(t, err)
 
 	// Query the table through SQL and verify the query completes successfully.
@@ -381,7 +380,7 @@ func TestConcurrentCreateAndRelease(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			instanceID, err := storage.CreateInstance(ctx, sessionID, sessionExpiry, addr, locality)
+			instanceID, err := storage.CreateInstance(ctx, sessionID, addr, locality)
 			require.NoError(t, err)
 			if len(state.freeInstances) > 0 {
 				_, free := state.freeInstances[instanceID]

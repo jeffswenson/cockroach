@@ -1334,7 +1334,7 @@ func (s *SQLServer) preStart(
 		}
 		// Acquire our instance ID.
 		instanceID, err := s.sqlInstanceStorage.CreateInstance(
-			ctx, session.ID(), session.Expiration(), s.cfg.AdvertiseAddr, s.distSQLServer.Locality)
+			ctx, session.ID(), s.cfg.AdvertiseAddr, s.distSQLServer.Locality)
 		if err != nil {
 			return err
 		}

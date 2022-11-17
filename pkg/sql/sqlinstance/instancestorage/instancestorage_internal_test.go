@@ -298,12 +298,10 @@ func TestGenerateAvailableInstanceRows(t *testing.T) {
 	regions := [][]byte{enum.One}
 
 	t.Run("nothing preallocated", func(t *testing.T) {
-		stopper, storage, _, clock := setup(t, sqlDB, kvDB, s.ClusterSettings())
+		stopper, storage, _, _ := setup(t, sqlDB, kvDB, s.ClusterSettings())
 		defer stopper.Stop(ctx)
 
-		sessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
-
-		require.NoError(t, storage.generateAvailableInstanceRows(ctx, regions, sessionExpiry))
+		require.NoError(t, storage.generateAvailableInstanceRows(ctx, regions))
 
 		instances, err := storage.GetAllInstancesDataForTest(ctx)
 		sortInstancesForTest(instances)
@@ -344,7 +342,7 @@ func TestGenerateAvailableInstanceRows(t *testing.T) {
 		}
 
 		// Generate available rows.
-		require.NoError(t, storage.generateAvailableInstanceRows(ctx, regions, sessionExpiry))
+		require.NoError(t, storage.generateAvailableInstanceRows(ctx, regions))
 
 		instances, err := storage.GetAllInstancesDataForTest(ctx)
 		sortInstancesForTest(instances)

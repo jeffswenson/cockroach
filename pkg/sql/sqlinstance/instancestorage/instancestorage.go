@@ -136,11 +136,7 @@ func NewStorage(
 // CreateInstance claims a unique instance identifier for the SQL pod, and
 // associates it with its SQL address and session information.
 func (s *Storage) CreateInstance(
-	ctx context.Context,
-	sessionID sqlliveness.SessionID,
-	sessionExpiration hlc.Timestamp,
-	addr string,
-	locality roachpb.Locality,
+	ctx context.Context, sessionID sqlliveness.SessionID, addr string, locality roachpb.Locality,
 ) (instanceID base.SQLInstanceID, _ error) {
 	if len(addr) == 0 {
 		return base.SQLInstanceID(0), errors.New("no address information for instance")
@@ -154,8 +150,6 @@ func (s *Storage) CreateInstance(
 		return base.SQLInstanceID(0), errors.Wrap(err, "unable to determine region for sql_instance")
 	}
 
-	// TODO(jeffswenson): advance session expiration. This can get stuck in a
-	// loop if the session already expired.
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 	assignInstance := func() (base.SQLInstanceID, error) {
 		var availableID base.SQLInstanceID
@@ -163,13 +157,6 @@ func (s *Storage) CreateInstance(
 			// Run the claim transaction as high priority to ensure that it does not
 			// contend with other transactions.
 			err := txn.SetUserPriority(roachpb.MaxUserPriority)
-			if err != nil {
-				return err
-			}
-
-			// Set the transaction deadline to the session expiration to ensure
-			// transaction commits before the session expires.
-			err = txn.UpdateDeadline(ctx, sessionExpiration)
 			if err != nil {
 				return err
 			}
@@ -217,7 +204,7 @@ func (s *Storage) CreateInstance(
 		// If the transaction failed because there were no pre-allocated rows,
 		// trigger reclaiming, and retry. This blocks until the reclaim process
 		// completes.
-		if err := s.generateAvailableInstanceRows(ctx, [][]byte{region}, sessionExpiration); err != nil {
+		if err := s.generateAvailableInstanceRows(ctx, [][]byte{region}); err != nil {
 			log.Warningf(ctx, "failed to generate available instance rows: %v", err)
 		}
 	}
@@ -417,7 +404,7 @@ func (s *Storage) RunInstanceIDReclaimLoop(
 				}
 
 				// Allocate new ids regions that do not have enough pre-allocated sql instances.
-				if err := s.generateAvailableInstanceRows(ctx, regions, sessionExpirationFn()); err != nil {
+				if err := s.generateAvailableInstanceRows(ctx, regions); err != nil {
 					log.Warningf(ctx, "failed to generate available instance rows: %v", err)
 				}
 			}
@@ -435,9 +422,7 @@ func (s *Storage) RunInstanceIDReclaimLoop(
 // read for each region assuming that the number of pre-allocated entries is
 // insufficient. One global KV read and write would be sufficient for **all**
 // regions.
-func (s *Storage) generateAvailableInstanceRows(
-	ctx context.Context, regions [][]byte, sessionExpiration hlc.Timestamp,
-) error {
+func (s *Storage) generateAvailableInstanceRows(ctx context.Context, regions [][]byte) error {
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 	target := int(PreallocatedCount.Get(&s.settings.SV))
 

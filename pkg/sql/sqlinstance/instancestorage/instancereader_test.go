@@ -81,7 +81,7 @@ func TestReader(t *testing.T) {
 		const expiration = 10 * time.Minute
 		{
 			sessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
-			id, err := storage.CreateInstance(ctx, sessionID, sessionExpiry, addr, locality)
+			id, err := storage.CreateInstance(ctx, sessionID, addr, locality)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -146,7 +146,7 @@ func TestReader(t *testing.T) {
 			// Set up mock data within instance and session storage.
 			for index, addr := range addresses {
 				sessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
-				_, err := storage.CreateInstance(ctx, sessionIDs[index], sessionExpiry, addr, localities[index])
+				_, err := storage.CreateInstance(ctx, sessionIDs[index], addr, localities[index])
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -205,7 +205,7 @@ func TestReader(t *testing.T) {
 			sessionID := makeSession()
 			locality := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "region4"}}}
 			sessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
-			id, err := storage.CreateInstance(ctx, sessionID, sessionExpiry, addresses[2], locality)
+			id, err := storage.CreateInstance(ctx, sessionID, addresses[2], locality)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -243,7 +243,7 @@ func TestReader(t *testing.T) {
 			// Set up mock data within instance and session storage.
 			for index, addr := range addresses {
 				sessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
-				_, err := storage.CreateInstance(ctx, sessionIDs[index], sessionExpiry, addr, localities[index])
+				_, err := storage.CreateInstance(ctx, sessionIDs[index], addr, localities[index])
 				if err != nil {
 					t.Fatal(err)
 				}
