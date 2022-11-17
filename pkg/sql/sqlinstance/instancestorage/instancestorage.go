@@ -154,13 +154,6 @@ func (s *Storage) CreateInstance(
 	assignInstance := func() (base.SQLInstanceID, error) {
 		var availableID base.SQLInstanceID
 		if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			// Run the claim transaction as high priority to ensure that it does not
-			// contend with other transactions.
-			err := txn.SetUserPriority(roachpb.MaxUserPriority)
-			if err != nil {
-				return err
-			}
-
 			// Try to retrieve an available instance ID. This blocks until one is
 			// available.
 			availableID, err = s.getAvailableInstanceIDForRegion(ctx, region, txn)
