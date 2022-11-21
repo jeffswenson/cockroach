@@ -12,6 +12,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -20,26 +21,32 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance/instancestorage"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slstorage"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
-
 
 func TestMrSystemDatabase(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	defer envutil.TestSetEnv(t, "COCKROACH_MR_SYSTEM_DATABASE", "1")()
 
+	ctx := context.Background()
+
 	// Enable settings required for configuring a tenant's system database as multi-region.
 	cs := cluster.MakeTestingClusterSettings()
-	sql.SecondaryTenantsMultiRegionAbstractionsEnabled.Override(context.Background(), &cs.SV, true)
-	sql.SecondaryTenantZoneConfigsEnabled.Override(context.Background(), &cs.SV, true)
+	sql.SecondaryTenantsMultiRegionAbstractionsEnabled.Override(ctx, &cs.SV, true)
+	sql.SecondaryTenantZoneConfigsEnabled.Override(ctx, &cs.SV, true)
+	instancestorage.ReclaimLoopInterval.Override(ctx, &cs.SV, 150*time.Millisecond)
 
 	cluster, _, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(t, 3, base.TestingKnobs{}, multiregionccltestutils.WithSettings(cs))
 	defer cleanup()
@@ -133,6 +140,67 @@ func TestMrSystemDatabase(t *testing.T) {
 				}
 			}
 			require.NoError(t, rows.Close())
+
+			query = `
+				SELECT count(id), crdb_region
+				FROM system.sql_instances
+				WHERE session_id IS NULL GROUP BY crdb_region
+			`
+			preallocatedCount := instancestorage.PreallocatedCount.Get(&cs.SV)
+			testutils.SucceedsSoon(t, func() error {
+				rows := tDB.Query(t, query)
+				require.True(t, rows.Next())
+
+				countMap := map[string]int{}
+				for {
+					var count int
+					var crdb_region string
+
+					require.NoError(t, rows.Scan(&count, &crdb_region))
+					countMap[crdb_region] = count
+
+					if !rows.Next() {
+						break
+					}
+				}
+				require.NoError(t, rows.Close())
+				if len(countMap) != 3 {
+					return errors.New("some regions have not been preallocated")
+				}
+				for _, r := range []string{"us-east1", "us-east2", "us-east3"} {
+					c, ok := countMap[r]
+					require.True(t, ok)
+					if c != int(preallocatedCount) {
+						return errors.Newf("require %d, but got %d", preallocatedCount, c)
+					}
+				}
+				return nil
+			})
+		})
+
+		t.Run("Reclaim", func(t *testing.T) {
+			id := uuid.MakeV4()
+			s1, err := slstorage.MakeSessionID(make([]byte, 100), id)
+			require.NoError(t, err)
+			s2, err := slstorage.MakeSessionID(make([]byte, 200), id)
+			require.NoError(t, err)
+
+			// Insert expired entries into sql_instances.
+			tDB.Exec(t, `INSERT INTO system.sql_instances (id, addr, session_id, locality, crdb_region) VALUES
+		   		(100, NULL, $1, NULL, 'us-east2'),
+		   		(200, NULL, $2, NULL, 'us-east3')`, s1.UnsafeBytes(), s2.UnsafeBytes())
+
+			query := `SELECT count(*) FROM system.sql_instances WHERE id = 42`
+
+			// Wait until expired entries get removed.
+			testutils.SucceedsSoon(t, func() error {
+				var rowCount int
+				tDB.QueryRow(t, query).Scan(&rowCount)
+				if rowCount != 0 {
+					return errors.New("some regions have not been reclaimed")
+				}
+				return nil
+			})
 		})
 	})
 }
