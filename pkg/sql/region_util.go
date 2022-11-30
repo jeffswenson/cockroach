@@ -2436,11 +2436,13 @@ func (p *planner) OptimizeSystemDatabase(ctx context.Context) error {
 		"namespace",
 		"table_statistics",
 		"web_sessions",
+		"database_role_settings",
 	}
 
 	rbrTables := []string{
 		"sqlliveness",
 		"sql_instances",
+		"lease",
 	}
 
 	if !systemschema.TestSupportMultiRegion() {
