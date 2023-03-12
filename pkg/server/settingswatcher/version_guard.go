@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/errors"
 )
 
 // VersionGuard is a utility for checking the cluster version in a transaction.
@@ -41,12 +42,22 @@ type VersionGuard struct {
 func (s *SettingsWatcher) MakeVersionGuard(
 	ctx context.Context, txn *kv.Txn, maxGate clusterversion.Key,
 ) (VersionGuard, error) {
-	if s.settings.Version.IsActive(ctx, maxGate) {
+	activeVersion := s.settings.Version.ActiveVersion(ctx)
+	if activeVersion.IsActive(maxGate) {
 		return VersionGuard{
 			maxGateIsActive: true,
 		}, nil
 	}
+
 	txnVersion, err := s.GetClusterVersionFromStorage(ctx, txn)
+	if errors.Is(err, errVersionSettingNotFound) {
+		// TODO(jeffswenson): this case shows up during tests. Figure out if
+		// version guard needs to be fixed or if the test server needs to be
+		// fixed.
+		return VersionGuard{
+			txnVersion: activeVersion,
+		}, nil
+	}
 	return VersionGuard{
 		txnVersion: txnVersion,
 	}, err
