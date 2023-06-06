@@ -13,7 +13,6 @@ package tenantcostmodel
 import (
 	"context"
 	"encoding/json"
-	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -110,6 +109,7 @@ var (
 		settings.NonNegativeFloat,
 	)
 
+	// TODO(jeffswenson): rename this setting
 	RegionalCostMultiplierTableSetting = func() *settings.StringSetting {
 		s := settings.RegisterValidatedStringSetting(
 			settings.TenantReadOnly,
@@ -139,202 +139,108 @@ var (
 )
 
 func validateRegionalCostMultiplierTableSetting(values *settings.Values, tableStr string) error {
-	_, err := parseRegionalCostMultiplierTableSetting(tableStr)
+	_, err := NewNetworkCostTable(tableStr)
 	return err
 }
 
-func parseRegionalCostMultiplierTableSetting(
-	tableStr string,
-) (*RegionalCostMultiplierCompactTable, error) {
-	var compact RegionalCostMultiplierCompactTable
-	if tableStr == "" {
-		return &compact, nil
-	}
-	if err := json.Unmarshal([]byte(tableStr), &compact); err != nil {
-		return nil, err
-	}
-	if err := compact.Validate(); err != nil {
-		return nil, err
-	}
-	return &compact, nil
+// TODO(jeffswenson): document
+type regionCostEntry struct {
+	FromRegion string  `json:"fromRegion"`
+	ToRegion   string  `json:"toRegion"`
+	Cost       float64 `json:"cost"`
 }
 
-// RegionalCostMultiplierCompactTable describes the cost multiplier table for
-// cross-region transfers in compacted form. This model assumes that the cost
-// is the same for both directions.
-type RegionalCostMultiplierCompactTable struct {
-	// Regions represents the list of region names. The indexes of the regions
-	// will be used alongside with the matrix.
-	Regions []string `json:"regions,omitempty"`
-	// Matrix represents the compacted version of the regional cost multiplier
-	// table. The compacted version only takes everything above the diagonal
-	// matrix of the table, including itself.
-	//
-	// Consider the following cost multiplier table:
-	//     | a | b | c
-	//   --------------
-	//   a | 1 | 1 | 2
-	//   b | 1 | 1 | 2
-	//   c | 2 | 2 | 1
-	//
-	// That can be represented as:
-	// - Regions=[a, b, c]
-	// - Matrix=[[1, 1, 2], [1, 2], [1]]
-	Matrix [][]RUMultiplier `json:"matrix,omitempty"`
+// TODO(jeffswenson): document
+type networkCostTableSetting struct {
+	RegionPairs []regionCostEntry `json:"regionPairs"`
 }
 
 // Validate returns nil if the compacted cost multiplier table is valid, or
 // an error otherwise.
-func (ct *RegionalCostMultiplierCompactTable) Validate() error {
-	if len(ct.Regions) != len(ct.Matrix) {
-		return errors.Newf(
-			"unexpected number of rows: found %d regions, but %d rows in matrix",
-			len(ct.Regions),
-			len(ct.Matrix),
-		)
-	}
-	expectedNumCols := len(ct.Regions)
-	for _, row := range ct.Matrix {
-		if len(row) != expectedNumCols {
-			return errors.New("malformed cost multiplier matrix")
-		}
-		for _, val := range row {
-			if val < 0 {
-				return errors.New("values must be non-negative")
-			}
-		}
-		expectedNumCols--
-	}
+func (ct *networkCostTableSetting) Validate() error {
+	// TODO(jeffswenson): transform to the internal form
+	// TODO(jeffswenson): validate the internal form
 	return nil
 }
 
-// RegionalCostMultiplierTable describes the cost multiplier table for
-// cross-region transfers. This model assumes that the cost is the same for both
-// directions.
-type RegionalCostMultiplierTable struct {
-	// Matrix represents the expanded version of the regional cost multiplier
-	// table.
-	Matrix map[string]map[string]RUMultiplier `json:",omitempty"`
+type NetworkPath struct {
+	FromRegion string
+	ToRegion   string
 }
 
-// CostMultiplier returns the cost multiplier for transfers between regions r1
-// and r2. If the mapping could not be found, a multiplier of 1 is assumed.
-func (et *RegionalCostMultiplierTable) CostMultiplier(r1, r2 string) RUMultiplier {
-	if et.Matrix == nil {
-		return RUMultiplier(1)
-	}
-	t2, ok := et.Matrix[r1]
-	if !ok || t2 == nil {
-		return RUMultiplier(1)
-	}
-	val, ok2 := t2[r2]
-	if !ok2 {
-		return RUMultiplier(1)
-	}
-	return val
+// NetworkCostTable describes the cost of network bandwidith between pairs of
+// region.
+type NetworkCostTable struct {
+	// Matrix[source][destination] describes the network cost for the region
+	// pairs.
+	Matrix map[NetworkPath]NetworkCost `json:",omitempty"`
 }
 
 // Validate returns nil if the expanded cost multiplier table is valid, or
 // an error otherwise.
-func (et *RegionalCostMultiplierTable) Validate() error {
+func (et *NetworkCostTable) validate() error {
 	if et.Matrix == nil {
+		// TODO(jeffswenson): can I remove this nil check?
 		return nil
 	}
-	hasValue := func(fromRegion, toRegion string, val RUMultiplier) bool {
-		inner, ok := et.Matrix[fromRegion]
-		if !ok {
-			return false
-		}
-		v, ok2 := inner[toRegion]
-		if !ok2 {
-			return false
-		}
-		return v == val
-	}
-	for fromRegion, row := range et.Matrix {
-		if row == nil {
-			return errors.New("inner matrix cannot be nil")
-		}
-		if len(row) != len(et.Matrix) {
-			return errors.Newf("number of rows and columns do not match: rows=%d, cols=%d",
-				len(et.Matrix), len(row))
-		}
-		for toRegion, val := range row {
-			if !hasValue(fromRegion, toRegion, val) || !hasValue(toRegion, fromRegion, val) {
-				return errors.New("table values are invalid")
-			}
-			if val < 0 {
-				return errors.New("table values must be non-negative")
-			}
-		}
-	}
+
 	return nil
 }
 
-// MakeRegionalCostMultiplierTableFromCompact creates an expanded regional cost
-// multiplier table from its compacted form. This assumes that the input
-// compacted table is valid.
-func MakeRegionalCostMultiplierTableFromCompact(
-	compact *RegionalCostMultiplierCompactTable,
-) RegionalCostMultiplierTable {
-	idxToRegion := make(map[int]string)
-	for idx, region := range compact.Regions {
-		idxToRegion[idx] = region
+// NewNetworkCostTable parses the setting value, validates the setting, then
+// returns a form that is programatically usable.
+func NewNetworkCostTable(setting string) (*NetworkCostTable, error) {
+	if setting == "" {
+		return nil, nil
 	}
-	matrix := make(map[string]map[string]RUMultiplier)
-	linkRegion := func(a, b string, val RUMultiplier) {
-		if _, ok := matrix[a]; !ok {
-			matrix[a] = make(map[string]RUMultiplier)
+
+	var jsonObj networkCostTableSetting
+	if err := json.Unmarshal([]byte(setting), &jsonObj); err != nil {
+		return nil, errors.Wrap(err, "unable to unmarshal json")
+	}
+
+	// Convert the setting into a hash table and validate the individual entries
+	table := newEmptyCostTable()
+	for i, entry := range jsonObj.RegionPairs {
+		if entry.FromRegion == "" {
+			return nil, errors.Newf("entry %d is missing 'fromRegion'", i)
 		}
-		matrix[a][b] = val
+		if entry.ToRegion == "" {
+			return nil, errors.Newf("entry %d is missing 'toRegion'", i)
+		}
+		if entry.Cost < 0 {
+			return nil, errors.Newf("network cost for '%s' -> '%s' must not be negative", entry.FromRegion, entry.ToRegion)
+		}
+		path := NetworkPath{
+			FromRegion: entry.FromRegion,
+			ToRegion:   entry.ToRegion,
+		}
+		table.Matrix[path] = NetworkCost(entry.Cost)
 	}
-	for fromIdx, row := range compact.Matrix {
-		fromRegion := idxToRegion[fromIdx]
-		toIdx := fromIdx
-		for _, multiplier := range row {
-			toRegion := idxToRegion[toIdx]
-			linkRegion(fromRegion, toRegion, multiplier)
-			if fromIdx != toIdx {
-				linkRegion(toRegion, fromRegion, multiplier)
+
+	// Verify the table is complete
+	regionSet := map[string]struct{}{}
+	for path := range table.Matrix {
+		regionSet[path.FromRegion] = struct{}{}
+		regionSet[path.ToRegion] = struct{}{}
+	}
+	for from := range regionSet {
+		for to := range regionSet {
+			_, ok := table.Matrix[NetworkPath{
+				FromRegion: from,
+				ToRegion:   to,
+			}]
+			if !ok {
+				return nil, errors.Newf("the network cost table is missing from region '%s' to region '%s'", from, to)
 			}
-			toIdx++
 		}
 	}
-	return RegionalCostMultiplierTable{Matrix: matrix}
+
+	return table, nil
 }
 
-// MakeRegionalCostMultiplierCompactTableFromExpanded creates a compacted version
-// of the regional cost multiplier table from its expanded form. This assumes
-// that the input expanded table is valid.
-func MakeRegionalCostMultiplierCompactTableFromExpanded(
-	expanded *RegionalCostMultiplierTable,
-) RegionalCostMultiplierCompactTable {
-	regions := make([]string, 0, len(expanded.Matrix))
-	for key := range expanded.Matrix {
-		regions = append(regions, key)
-	}
-
-	// Sort for deterministic ordering.
-	sort.Strings(regions)
-
-	// Build empty diagonal matrix table.
-	matrix := make([][]RUMultiplier, len(expanded.Matrix))
-	numCols := len(matrix)
-	for i := 0; i < len(matrix); i++ {
-		matrix[i] = make([]RUMultiplier, numCols)
-		numCols--
-	}
-
-	// Fill the table.
-	for i := 0; i < len(matrix); i++ {
-		fromIdx, toIdx := i, i
-		for j := 0; j < len(matrix[i]); j++ {
-			fromRegion, toRegion := regions[fromIdx], regions[toIdx]
-			matrix[i][j] = expanded.Matrix[fromRegion][toRegion]
-			toIdx++
-		}
-	}
-	return RegionalCostMultiplierCompactTable{Regions: regions, Matrix: matrix}
+func newEmptyCostTable() *NetworkCostTable {
+	return &NetworkCostTable{Matrix: make(map[NetworkPath]NetworkCost)}
 }
 
 const perMiBToPerByte = float64(1) / (1024 * 1024)
@@ -342,61 +248,52 @@ const perMiBToPerByte = float64(1) / (1024 * 1024)
 // ConfigFromSettings constructs a Config using the cluster setting values.
 func ConfigFromSettings(sv *settings.Values) Config {
 	tableStr := RegionalCostMultiplierTableSetting.Get(sv)
-	compact, err := parseRegionalCostMultiplierTableSetting(tableStr)
+
+	networkTable, err := NewNetworkCostTable(tableStr)
 	if err != nil {
 		// This should not happen unless someone manually updates the settings
 		// table, bypassing the validation.
 		log.Errorf(
 			context.Background(),
-			"failed to parse regional cost RU multiplier table %q: err=%v; defaulting to no multipliers",
+			"failed to parse the network cost table %q: err=%v",
 			tableStr,
 			err,
 		)
-		compact = &RegionalCostMultiplierCompactTable{}
 	}
+	if networkTable == nil {
+		networkTable = newEmptyCostTable()
+	}
+
 	return Config{
-		KVReadBatch:                    RU(ReadBatchCost.Get(sv)),
-		KVReadRequest:                  RU(ReadRequestCost.Get(sv)),
-		KVReadByte:                     RU(ReadPayloadCostPerMiB.Get(sv) * perMiBToPerByte),
-		KVWriteBatch:                   RU(WriteBatchCost.Get(sv)),
-		KVWriteRequest:                 RU(WriteRequestCost.Get(sv)),
-		KVWriteByte:                    RU(WritePayloadCostPerMiB.Get(sv) * perMiBToPerByte),
-		PodCPUSecond:                   RU(SQLCPUSecondCost.Get(sv)),
-		PGWireEgressByte:               RU(PgwireEgressCostPerMiB.Get(sv) * perMiBToPerByte),
-		ExternalIOIngressByte:          RU(ExternalIOIngressCostPerMiB.Get(sv) * perMiBToPerByte),
-		ExternalIOEgressByte:           RU(ExternalIOEgressCostPerMiB.Get(sv) * perMiBToPerByte),
-		KVInterRegionRUMultiplierTable: MakeRegionalCostMultiplierTableFromCompact(compact),
+		KVReadBatch:           RU(ReadBatchCost.Get(sv)),
+		KVReadRequest:         RU(ReadRequestCost.Get(sv)),
+		KVReadByte:            RU(ReadPayloadCostPerMiB.Get(sv) * perMiBToPerByte),
+		KVWriteBatch:          RU(WriteBatchCost.Get(sv)),
+		KVWriteRequest:        RU(WriteRequestCost.Get(sv)),
+		KVWriteByte:           RU(WritePayloadCostPerMiB.Get(sv) * perMiBToPerByte),
+		PodCPUSecond:          RU(SQLCPUSecondCost.Get(sv)),
+		PGWireEgressByte:      RU(PgwireEgressCostPerMiB.Get(sv) * perMiBToPerByte),
+		ExternalIOIngressByte: RU(ExternalIOIngressCostPerMiB.Get(sv) * perMiBToPerByte),
+		ExternalIOEgressByte:  RU(ExternalIOEgressCostPerMiB.Get(sv) * perMiBToPerByte),
+		NetworkCostTable:      *networkTable,
 	}
 }
 
 // DefaultConfig returns the configuration that corresponds to the default
 // setting values.
 func DefaultConfig() Config {
-	tableStr := RegionalCostMultiplierTableSetting.Default()
-	compact, err := parseRegionalCostMultiplierTableSetting(tableStr)
-	if err != nil {
-		// This should not happen unless someone manually updates the settings
-		// table, bypassing the validation.
-		log.Errorf(
-			context.Background(),
-			"failed to parse regional cost RU multiplier table %q: err=%v; defaulting to no multipliers",
-			tableStr,
-			err,
-		)
-		compact = &RegionalCostMultiplierCompactTable{}
-	}
 	return Config{
-		KVReadBatch:                    RU(ReadBatchCost.Default()),
-		KVReadRequest:                  RU(ReadRequestCost.Default()),
-		KVReadByte:                     RU(ReadPayloadCostPerMiB.Default() * perMiBToPerByte),
-		KVWriteBatch:                   RU(WriteBatchCost.Default()),
-		KVWriteRequest:                 RU(WriteRequestCost.Default()),
-		KVWriteByte:                    RU(WritePayloadCostPerMiB.Default() * perMiBToPerByte),
-		PodCPUSecond:                   RU(SQLCPUSecondCost.Default()),
-		PGWireEgressByte:               RU(PgwireEgressCostPerMiB.Default() * perMiBToPerByte),
-		ExternalIOIngressByte:          RU(ExternalIOEgressCostPerMiB.Default() * perMiBToPerByte),
-		ExternalIOEgressByte:           RU(ExternalIOIngressCostPerMiB.Default() * perMiBToPerByte),
-		KVInterRegionRUMultiplierTable: MakeRegionalCostMultiplierTableFromCompact(compact),
+		KVReadBatch:           RU(ReadBatchCost.Default()),
+		KVReadRequest:         RU(ReadRequestCost.Default()),
+		KVReadByte:            RU(ReadPayloadCostPerMiB.Default() * perMiBToPerByte),
+		KVWriteBatch:          RU(WriteBatchCost.Default()),
+		KVWriteRequest:        RU(WriteRequestCost.Default()),
+		KVWriteByte:           RU(WritePayloadCostPerMiB.Default() * perMiBToPerByte),
+		PodCPUSecond:          RU(SQLCPUSecondCost.Default()),
+		PGWireEgressByte:      RU(PgwireEgressCostPerMiB.Default() * perMiBToPerByte),
+		ExternalIOIngressByte: RU(ExternalIOEgressCostPerMiB.Default() * perMiBToPerByte),
+		ExternalIOEgressByte:  RU(ExternalIOIngressCostPerMiB.Default() * perMiBToPerByte),
+		NetworkCostTable:      *newEmptyCostTable(),
 	}
 }
 
@@ -412,4 +309,3 @@ func SetOnChange(sv *settings.Values, fn func(context.Context)) {
 
 var _ = SetOnChange
 var _ = ConfigFromSettings
-var _ = MakeRegionalCostMultiplierCompactTableFromExpanded
