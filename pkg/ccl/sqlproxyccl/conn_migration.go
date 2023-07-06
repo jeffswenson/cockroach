@@ -73,38 +73,26 @@ func (t *transferContext) isRecoverable() bool {
 // otherwise. If the transfer can be started, it updates the state of the
 // forwarder to indicate that a transfer is in progress, and a cleanup function
 // will be returned.
-func (f *forwarder) tryBeginTransfer() (started bool, cleanupFn func()) {
+func (f *forwarder) tryBeginTransfer() (err error, requestTimestamp uint64, cleanupFn func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	// Forwarder hasn't been initialized.
 	if !f.mu.isInitialized {
-		return false, nil
+		return errors.New("connection is not initialized"), 0, nil
 	}
 
 	// Transfer is already in progress. No concurrent transfers are allowed.
 	if f.mu.isTransferring {
-		return false, nil
-	}
-
-	request, response := f.mu.request, f.mu.response
-	request.mu.Lock()
-	response.mu.Lock()
-	defer request.mu.Unlock()
-	defer response.mu.Unlock()
-
-	if !isSafeTransferPointLocked(request, response) {
-		return false, nil
+		return errors.New("connection is already transferring"), 0, nil
 	}
 
 	// Once we mark the forwarder as transferring, attempt to suspend right
 	// away before unlocking, but without blocking. This ensures that no other
 	// messages are forwarded.
 	f.mu.isTransferring = true
-	request.mu.suspendReq = true
-	response.mu.suspendReq = true
 
-	return true, func() {
+	return nil, f.mu.request.mu.lastMessageTransferredAt, func() {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.mu.isTransferring = false
@@ -137,9 +125,9 @@ func (f *forwarder) TransferConnection() (retErr error) {
 		return f.ctx.Err()
 	}
 
-	started, cleanupFn := f.tryBeginTransfer()
-	if !started {
-		return errTransferCannotStart
+	err, requestTimestamp, cleanupFn := f.tryBeginTransfer()
+	if err != nil {
+		return errors.Wrap(err, "begin transfer")
 	}
 	defer cleanupFn()
 
@@ -165,6 +153,15 @@ func (f *forwarder) TransferConnection() (retErr error) {
 		}
 	}()
 
+	// Suspend both processors before starting the transfer.
+	request, response := f.getProcessors()
+	if err := response.suspend(ctx, requestTimestamp); err != nil {
+		return errors.Wrap(err, "suspending response processor")
+	}
+	if err := request.suspend(ctx, 0); err != nil {
+		return errors.Wrap(err, "suspending request processor")
+	}
+
 	// Use a separate context for logging because f.ctx will be closed whenever
 	// the connection is non-recoverable.
 	//
@@ -182,6 +179,7 @@ func (f *forwarder) TransferConnection() (retErr error) {
 
 		// When TransferConnection returns, it's either the forwarder has been
 		// closed, or the procesors have been resumed.
+		// TODO(jeffswenson): move this logging into the caller instead of this function
 		if !ctx.isRecoverable() {
 			log.Infof(logCtx, "transfer failed: connection closed, latency=%v, err=%v", latencyDur, retErr)
 			f.metrics.ConnMigrationErrorFatalCount.Inc(1)
@@ -202,13 +200,21 @@ func (f *forwarder) TransferConnection() (retErr error) {
 		}
 	}()
 
-	// Suspend both processors before starting the transfer.
-	request, response := f.getProcessors()
-	if err := request.suspend(ctx); err != nil {
-		return errors.Wrap(err, "suspending request processor")
-	}
-	if err := response.suspend(ctx); err != nil {
-		return errors.Wrap(err, "suspending response processor")
+	err = func() error {
+		request, response := f.mu.request, f.mu.response
+		request.mu.Lock()
+		response.mu.Lock()
+		defer request.mu.Unlock()
+		defer response.mu.Unlock()
+
+		if err := isSafeTransferPointLocked(request, response); err != nil {
+			return errors.Wrap(err, "connection is not at a safe point")
+		}
+
+		return nil
+	}()
+	if err != nil {
+		return err
 	}
 
 	// Transfer the connection.
@@ -297,7 +303,7 @@ func transferConnection(
 
 // isSafeTransferPointLocked returns true if we're at a point where we're safe
 // to transfer, and false otherwise.
-var isSafeTransferPointLocked = func(request *processor, response *processor) bool {
+var isSafeTransferPointLocked = func(request *processor, response *processor) error {
 	// Three conditions when evaluating a safe transfer point:
 	//   1. The last message sent to the SQL pod was a Sync(S) or SimpleQuery(Q),
 	//      and a ReadyForQuery(Z) has been received after.
@@ -309,7 +315,7 @@ var isSafeTransferPointLocked = func(request *processor, response *processor) bo
 	// The conditions above are not possible if this is true. They cannot be
 	// equal since the same logical clock is used (except during initialization).
 	if request.mu.lastMessageTransferredAt > response.mu.lastMessageTransferredAt {
-		return false
+		return errors.New("server is processing a request")
 	}
 
 	// We need to check zero values here to handle the initialization case
@@ -323,9 +329,12 @@ var isSafeTransferPointLocked = func(request *processor, response *processor) bo
 		pgwirebase.ClientMsgCopyFail:
 
 		serverMsg := pgwirebase.ServerMessageType(response.mu.lastMessageType)
-		return serverMsg == pgwirebase.ServerMsgReady || serverMsg == pgwirebase.ServerMessageType(0)
+		if serverMsg == pgwirebase.ServerMsgReady || serverMsg == pgwirebase.ServerMessageType(0) {
+			return nil
+		}
+		return errors.New("server did not reply with ready for query")
 	default:
-		return false
+		return errors.Newf("client message type %d is not supported for transfer", request.mu.lastMessageType)
 	}
 }
 

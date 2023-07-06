@@ -543,6 +543,7 @@ func TestSuspendResumeProcessor(t *testing.T) {
 
 		p := newProcessor(
 			makeLogicalClockFn(),
+			alwaysTrue,
 			interceptor.NewPGConn(clientProxy),
 			interceptor.NewPGConn(serverProxy),
 		)
@@ -568,6 +569,7 @@ func TestSuspendResumeProcessor(t *testing.T) {
 
 		p := newProcessor(
 			makeLogicalClockFn(),
+			alwaysTrue,
 			interceptor.NewPGConn(clientProxy),
 			interceptor.NewPGConn(serverProxy),
 		)
@@ -611,6 +613,7 @@ func TestSuspendResumeProcessor(t *testing.T) {
 
 		p := newProcessor(
 			makeLogicalClockFn(),
+			alwaysTrue,
 			interceptor.NewPGConn(clientProxy),
 			interceptor.NewPGConn(serverProxy),
 		)
@@ -667,6 +670,7 @@ func TestSuspendResumeProcessor(t *testing.T) {
 
 		p := newProcessor(
 			makeLogicalClockFn(),
+			alwaysTrue,
 			interceptor.NewPGConn(clientProxy),
 			interceptor.NewPGConn(serverProxy),
 		)

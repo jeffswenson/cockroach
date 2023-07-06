@@ -69,7 +69,7 @@ const (
 	// defaultMaxConcurrentRebalances represents the maximum number of
 	// concurrent rebalance requests that are being processed. This effectively
 	// limits the number of concurrent transfers per proxy.
-	defaultMaxConcurrentRebalances = 100
+	defaultMaxConcurrentRebalances = 10000
 
 	// maxTransferAttempts represents the maximum number of transfer attempts
 	// per rebalance request when the previous attempts failed (possibly due to
@@ -375,6 +375,8 @@ func (b *Balancer) processQueue(ctx context.Context) {
 				if err == nil || errors.Is(err, context.Canceled) {
 					break
 				}
+
+				log.Warningf(ctx, "attempt to transfer connection failed: %s", err.Error())
 
 				// Retry again if the connection hasn't been closed.
 				time.Sleep(250 * time.Millisecond)

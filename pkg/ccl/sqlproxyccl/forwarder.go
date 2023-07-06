@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/balancer"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/interceptor"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -188,8 +189,8 @@ func (f *forwarder) run(clientConn net.Conn, serverConn net.Conn) error {
 		// Note that we don't obtain the f.mu lock here since the processors have
 		// not been resumed yet.
 		clockFn := makeLogicalClockFn()
-		f.mu.request = newProcessor(clockFn, f.mu.clientConn, f.mu.serverConn)  // client -> server
-		f.mu.response = newProcessor(clockFn, f.mu.serverConn, f.mu.clientConn) // server -> client
+		f.mu.request = newProcessor(clockFn, alwaysTrue, f.mu.clientConn, f.mu.serverConn)  // client -> server
+		f.mu.response = newProcessor(clockFn, isServerReadyForQuery, f.mu.serverConn, f.mu.clientConn) // server -> client
 
 		// Forwarder is considered active initially.
 		f.mu.activity.lastRequestTransferredAt = f.mu.request.lastMessageTransferredAt()
@@ -359,8 +360,8 @@ func (f *forwarder) replaceServerConn(newServerConn *interceptor.PGConn) {
 	clockFn := makeLogicalClockFn()
 	f.mu.serverConn.Close()
 	f.mu.serverConn = newServerConn
-	f.mu.request = newProcessor(clockFn, f.mu.clientConn, f.mu.serverConn)
-	f.mu.response = newProcessor(clockFn, f.mu.serverConn, f.mu.clientConn)
+	f.mu.request = newProcessor(clockFn, alwaysTrue, f.mu.clientConn, f.mu.serverConn)
+	f.mu.response = newProcessor(clockFn, isServerReadyForQuery, f.mu.serverConn, f.mu.clientConn)
 }
 
 // wrapClientToServerError overrides client to server errors for external
@@ -440,19 +441,21 @@ type processor struct {
 		resumed    bool
 		inPeek     bool
 		suspendReq bool // Indicates that a suspend has been requested.
+		minSuspendTimstamp uint64
 
 		lastMessageTransferredAt uint64 // Updated through logicalClockFn
 		lastMessageType          byte
 	}
 	logicalClockFn func() uint64
+	readyToPause func(messageType byte)bool
 
 	testingKnobs struct {
 		beforeForwardMsg func()
 	}
 }
 
-func newProcessor(logicalClockFn func() uint64, src, dst *interceptor.PGConn) *processor {
-	p := &processor{logicalClockFn: logicalClockFn, src: src, dst: dst}
+func newProcessor(logicalClockFn func() uint64, readyToPause func(messageType byte)bool, src, dst *interceptor.PGConn) *processor {
+	p := &processor{logicalClockFn: logicalClockFn, readyToPause: readyToPause, src: src, dst: dst}
 	p.mu.cond = sync.NewCond(&p.mu)
 	return p
 }
@@ -491,8 +494,11 @@ func (p *processor) resume(ctx context.Context) (retErr error) {
 		if terminate := func() bool {
 			p.mu.Lock()
 			defer p.mu.Unlock()
-			// Suspend has been requested. Suspend now before blocking.
-			if p.mu.suspendReq {
+			// Suspend has been requested and the last message is eligible to be paused.
+			shouldSuspend := p.mu.suspendReq &&
+				 p.readyToPause(p.mu.lastMessageType) &&
+				 p.mu.minSuspendTimstamp <= p.mu.lastMessageTransferredAt
+			if shouldSuspend {
 				return true
 			}
 			p.mu.inPeek = true
@@ -518,11 +524,17 @@ func (p *processor) resume(ctx context.Context) (retErr error) {
 		//
 		// When suspending, we return nil so that the processor can be resumed
 		// in the future.
+		// TODO(jeffswenson): think hard about this branch. Is it possible that it
+		// will be in a non-ready to suspend state after the pause is requested and
+		// the timeout is ste?
+		shouldSuspend := p.mu.suspendReq &&
+			 p.readyToPause(p.mu.lastMessageType) &&
+			 p.mu.minSuspendTimstamp <= p.mu.lastMessageTransferredAt
 		var netErr net.Error
 		switch {
-		case p.mu.suspendReq && peekErr == nil:
+		case shouldSuspend && peekErr == nil:
 			return true, nil
-		case p.mu.suspendReq && errors.As(peekErr, &netErr) && netErr.Timeout():
+		case shouldSuspend && errors.As(peekErr, &netErr) && netErr.Timeout():
 			return true, nil
 		case peekErr != nil:
 			return false, errors.Wrap(peekErr, "peeking message")
@@ -579,7 +591,7 @@ func (p *processor) waitResumed(ctx context.Context) error {
 // suspend requests for the processor to be suspended if it is in a safe state,
 // and blocks until the processor has been terminated. If the suspend request
 // failed, suspend returns an error, and the caller is safe to retry again.
-func (p *processor) suspend(ctx context.Context) error {
+func (p *processor) suspend(ctx context.Context, minTimestamp uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -599,8 +611,10 @@ func (p *processor) suspend(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+
 		p.mu.suspendReq = true
-		if p.mu.inPeek {
+		p.mu.minSuspendTimstamp = minTimestamp
+		if p.mu.inPeek && minTimestamp <= p.mu.lastMessageTransferredAt && p.readyToPause(p.mu.lastMessageType) {
 			if err := p.src.SetReadDeadline(aLongTimeAgo); err != nil {
 				return err
 			}
@@ -608,6 +622,15 @@ func (p *processor) suspend(ctx context.Context) error {
 		p.mu.cond.Wait()
 	}
 	return nil
+}
+
+func alwaysTrue(serverMsgType byte) bool {
+		return true
+}
+
+func isServerReadyForQuery(serverMsgType byte) bool {
+		serverMsg := pgwirebase.ServerMessageType(serverMsgType)
+		return serverMsg == pgwirebase.ServerMsgReady || serverMsg == pgwirebase.ServerMessageType(0)
 }
 
 // lastMessageTransferredAt returns the logical clock's value that the message
