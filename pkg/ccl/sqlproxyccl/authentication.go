@@ -105,12 +105,12 @@ var authenticate = func(
 		// `pgproto3.ReadyForQuery` is encountered which signifies that server
 		// is ready to serve queries.
 		case *pgproto3.AuthenticationOk:
-			throttleError := throttleHook(throttler.AttemptOK)
-			if throttleError != nil {
-				if err = feSend(toPgError(throttleError)); err != nil {
+			hookError := throttleHook(throttler.AttemptOK)
+			if err != nil {
+				if err = feSend(toPgError(throttledError)); err != nil {
 					return nil, err
 				}
-				return nil, throttleError
+				return nil, hookError
 			}
 			if err = feSend(backendMsg); err != nil {
 				return nil, err
@@ -121,17 +121,17 @@ var authenticate = func(
 		case *pgproto3.ErrorResponse:
 			// The error may be in response of auth message but may not indicate
 			// unsuccessful authentication. Clear throttle if this is the case.
-			var throttleError error
+			var hookError error
 			if slices.Contains(pgPostAuthErrorCodes, tp.Code) {
-				throttleError = throttleHook(throttler.AttemptOK)
+				hookError = throttleHook(throttler.AttemptOK)
 			} else {
-				throttleError = throttleHook(throttler.AttemptInvalidCredentials)
+				hookError = throttleHook(throttler.AttemptInvalidCredentials)
 			}
-			if throttleError != nil {
-				if err = feSend(toPgError(throttleError)); err != nil {
+			if hookError != nil {
+				if err = feSend(toPgError(throttledError)); err != nil {
 					return nil, err
 				}
-				return nil, throttleError
+				return nil, hookError
 			}
 
 			if err = feSend(backendMsg); err != nil {

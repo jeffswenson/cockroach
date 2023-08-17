@@ -54,6 +54,9 @@ message Pod {
   reserved 4;
   // StateTimestamp represents the timestamp that the state was last updated.
   google.protobuf.Timestamp stateTimestamp = 5 [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
+
+	// StampedAt is the time the pod was stamped for the tenant.
+	google.protobuf.Timestamp stamped_at = 6;
 }
 
 // ListPodsRequest is used to query the server for the list of current pods of

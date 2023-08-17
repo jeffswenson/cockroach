@@ -21,16 +21,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/acl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/balancer"
+	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/conntrace"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenantdirsvr"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/throttler"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/certmgr"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/jackc/pgproto3/v2"
@@ -315,9 +314,7 @@ func newProxyHandler(
 
 // handle is called by the proxy server to handle a single incoming client
 // connection.
-func (handler *proxyHandler) handle(ctx context.Context, incomingConn net.Conn) error {
-	connReceivedTime := timeutil.Now()
-
+func (handler *proxyHandler) handle(ctx context.Context, trace *conntrace.Trace, incomingConn net.Conn) (resultErr error) {
 	// Parse headers before admitting the connection since the connection may
 	// be upgraded to TLS.
 	var endpointID string
@@ -348,14 +345,7 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn net.Conn) 
 	// request or not.
 	if cr := fe.CancelRequest; cr != nil {
 		_ = incomingConn.Close()
-		if err := handler.handleCancelRequest(cr, true /* allowForward */); err != nil {
-			// Lots of noise from this log indicates that somebody is spamming
-			// fake cancel requests.
-			log.Warningf(
-				ctx, "could not handle cancel request from client %s: %v",
-				incomingConn.RemoteAddr().String(), err,
-			)
-		}
+		trace.RecordCancelRequest(handler.handleCancelRequest(cr, true /* allowForward */))
 		return nil
 	}
 
@@ -370,9 +360,8 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn net.Conn) 
 	backendStartupMsg, clusterName, tenID, err := clusterNameAndTenantFromParams(ctx, fe)
 	if err != nil {
 		clientErr := withCode(err, codeParamsRoutingFailed)
-		log.Errorf(ctx, "unable to extract cluster name and tenant id: %s", err.Error())
 		updateMetricsAndSendErrToClient(clientErr, fe.Conn, handler.metrics)
-		return clientErr
+		return errors.Wrap(err, "extracing cluster name and tenant id")
 	}
 
 	ctx = logtags.AddTag(ctx, "cluster", clusterName)
@@ -383,9 +372,8 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn net.Conn) 
 	ipAddr, _, err := addr.SplitHostPort(fe.Conn.RemoteAddr().String(), "")
 	if err != nil {
 		clientErr := withCode(errors.New("unexpected connection address"), codeParamsRoutingFailed)
-		log.Errorf(ctx, "could not parse address: %v", err.Error())
 		updateMetricsAndSendErrToClient(clientErr, fe.Conn, handler.metrics)
-		return clientErr
+		return errors.Wrapf(err, "parsing ip address %s", fe.Conn.RemoteAddr().String())
 	}
 
 	// Validate the incoming connection and ensure that the cluster name
@@ -417,24 +405,22 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn net.Conn) 
 		},
 	)
 	if err != nil {
-		// It is possible that we get a NotFound error here because of a race
-		// with a deleting tenant. This case is rare, and we'll just return a
-		// "connection refused" error. The next time they connect, they will
-		// get a "not found" error.
-		log.Errorf(ctx, "connection blocked by access control list: %v", err)
-		err = withCode(errors.New("connection refused"), codeProxyRefusedConnection)
-		updateMetricsAndSendErrToClient(err, fe.Conn, handler.metrics)
-		return err
+		// It is possible that we get a NotFound error here because of a race with
+		// a deleting tenant. This case is rare, and we'll just return a
+		// "connection refused" error. The next time they connect, they will get a
+		// "not found" error.
+		clientErr := withCode(errors.New("connection refused"), codeProxyRefusedConnection)
+		updateMetricsAndSendErrToClient(clientErr, fe.Conn, handler.metrics)
+		return errors.Wrap(err, "connection blocked by access control list")
 	}
 	defer removeListener()
 
 	throttleTags := throttler.ConnectionTags{IP: ipAddr, TenantID: tenID.String()}
 	throttleTime, err := handler.throttleService.LoginCheck(throttleTags)
 	if err != nil {
-		log.Errorf(ctx, "throttler refused connection: %v", err.Error())
-		err = throttledError
-		updateMetricsAndSendErrToClient(err, fe.Conn, handler.metrics)
-		return err
+		// TODO(jeffswenson): include the error we send to the client in the connection trace
+		updateMetricsAndSendErrToClient(throttledError, fe.Conn, handler.metrics)
+		return errors.Wrap(err, "authentication throttle refused connection")
 	}
 
 	connector := &connector{
@@ -458,6 +444,7 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn net.Conn) 
 		connector.TLSConfig = &tls.Config{InsecureSkipVerify: handler.SkipVerify}
 	}
 
+	// TODO(jeffswenson): should the trace be here instead of 
 	f := newForwarder(ctx, connector, handler.metrics, nil /* timeSource */)
 	defer f.Close()
 
@@ -466,20 +453,18 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn net.Conn) 
 			if err := handler.throttleService.ReportAttempt(
 				ctx, throttleTags, throttleTime, status,
 			); err != nil {
-				log.Errorf(ctx, "throttler refused connection after authentication: %v", err.Error())
-				return throttledError
+				return errors.Wrap(err, "throttler refused connection after authentication")
 			}
 			return nil
 		},
 	)
 	if err != nil {
-		log.Errorf(ctx, "could not connect to cluster: %v", err.Error())
 		if sentToClient {
 			handler.metrics.updateForError(err)
 		} else {
 			updateMetricsAndSendErrToClient(err, fe.Conn, handler.metrics)
 		}
-		return err
+		return errors.Wrap(err, "could not connect to cluster")
 	}
 	defer func() { _ = crdbConn.Close() }()
 
@@ -487,13 +472,10 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn net.Conn) 
 	handler.cancelInfoMap.addCancelInfo(connector.CancelInfo.proxySecretID(), connector.CancelInfo)
 
 	// Record the connection success and how long it took.
-	handler.metrics.ConnectionLatency.RecordValue(timeutil.Since(connReceivedTime).Nanoseconds())
+	handler.metrics.ConnectionLatency.RecordValue(trace.ConnectionAge().Nanoseconds())
 	handler.metrics.SuccessfulConnCount.Inc(1)
 
-	log.Infof(ctx, "new connection")
-	connBegin := timeutil.Now()
 	defer func() {
-		log.Infof(ctx, "closing after %.2fs", timeutil.Since(connBegin).Seconds())
 		handler.cancelInfoMap.deleteCancelInfo(connector.CancelInfo.proxySecretID())
 	}()
 
@@ -508,7 +490,7 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn net.Conn) 
 	}
 
 	// Pass ownership of conn and crdbConn to the forwarder.
-	if err := f.run(clientConn, crdbConn); err != nil {
+	if err := f.run(trace, clientConn, crdbConn); err != nil {
 		// Don't send to the client here for the same reason below.
 		handler.metrics.updateForError(err)
 		return errors.Wrap(err, "running forwarder")
@@ -549,7 +531,7 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn net.Conn) 
 // connection knows some additional information about the tenant (i.e. the
 // cluster name) before being allowed to connect.
 func (handler *proxyHandler) validateConnection(
-	ctx context.Context, tenantID roachpb.TenantID, clusterName string,
+	ctx context.Context, trace *conntrace.Trace, tenantID roachpb.TenantID, clusterName string,
 ) error {
 	tenant, err := handler.directoryCache.LookupTenant(ctx, tenantID)
 	if err != nil && status.Code(err) != codes.NotFound {
@@ -559,12 +541,11 @@ func (handler *proxyHandler) validateConnection(
 		if tenant.ClusterName == "" || tenant.ClusterName == clusterName {
 			return nil
 		}
-		log.Errorf(
-			ctx,
+		trace.Log(
+			"ERROR",
 			"could not validate connection: cluster name '%s' doesn't match expected '%s'",
 			clusterName,
-			tenant.ClusterName,
-		)
+			tenant.ClusterName)
 	}
 	return withCode(
 		errors.Newf("cluster %s-%d not found", clusterName, tenantID.ToUint64()),
@@ -793,7 +774,7 @@ func clusterNameAndTenantFromParams(
 // parseClusterIdentifier will parse an identifier received via DB, opts or SNI
 // and extract the tenant cluster name and tenant ID.
 func parseClusterIdentifier(
-	ctx context.Context, clusterIdentifier string,
+	trace *conntrace.Trace, clusterIdentifier string,
 ) (string, roachpb.TenantID, error) {
 	sepIdx := strings.LastIndex(clusterIdentifier, clusterTenantSep)
 
@@ -819,7 +800,7 @@ func parseClusterIdentifier(
 	tenID, err := strconv.ParseUint(tenantIDStr, 10, 64)
 	if err != nil {
 		// Log these non user-facing errors.
-		log.Errorf(ctx, "cannot parse tenant ID in %s: %v", clusterIdentifier, err)
+		trace.Log("ERROR","cannot parse tenant ID in %s: %v", clusterIdentifier, err)
 		err := errors.Errorf("invalid cluster identifier '%s'", clusterIdentifier)
 		err = errors.WithHintf(err, "Is '%s' a valid tenant ID?", tenantIDStr)
 		err = errors.WithHint(err, clusterNameFormHint)
@@ -829,7 +810,7 @@ func parseClusterIdentifier(
 	// This case only happens if tenID is 0 or 1 (system tenant).
 	if tenID < roachpb.MinTenantID.ToUint64() {
 		// Log these non user-facing errors.
-		log.Errorf(ctx, "%s contains an invalid tenant ID", clusterIdentifier)
+		trace.Log("ERROR", "%s contains an invalid tenant ID", clusterIdentifier)
 		err := errors.Errorf("invalid cluster identifier '%s'", clusterIdentifier)
 		err = errors.WithHintf(err, "Tenant ID %d is invalid.", tenID)
 		return "", roachpb.MaxTenantID, err

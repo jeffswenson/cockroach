@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/balancer"
+	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/conntrace"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/throttler"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -85,6 +86,9 @@ type connector struct {
 	// CancelInfo contains the data used to implement pgwire query cancellation.
 	// It is only populated after authenticating the connection.
 	CancelInfo *cancelInfo
+
+	// Trace is used to record things that happen to the connection. 
+	Trace *conntrace.Trace
 
 	// Testing knobs for internal connector calls. If specified, these will
 	// be called instead of the actual logic.

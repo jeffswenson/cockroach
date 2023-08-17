@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/balancer"
+	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/conntrace"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/interceptor"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -164,7 +165,7 @@ func newForwarder(
 // return a context cancellation error.
 //
 // run can only be called once throughout the lifetime of the forwarder.
-func (f *forwarder) run(clientConn net.Conn, serverConn net.Conn) error {
+func (f *forwarder) run(trace *conntrace.Trace, clientConn net.Conn, serverConn net.Conn) error {
 	setup := func() error {
 		f.mu.Lock()
 		defer f.mu.Unlock()

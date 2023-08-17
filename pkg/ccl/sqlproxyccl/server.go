@@ -16,6 +16,7 @@ import (
 	"net/http/pprof"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/conntrace"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -250,9 +251,12 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			defer s.metrics.CurConnCount.Dec(1)
 			remoteAddr := conn.RemoteAddr()
 			ctxWithTag := logtags.AddTag(ctx, "client", log.SafeOperational(remoteAddr))
-			if err := s.handler.handle(ctxWithTag, conn); err != nil {
-				log.Infof(ctxWithTag, "connection error: %v", err)
-			}
+
+			trace := conntrace.NewTrace(conn.RemoteAddr().String())
+			defer trace.Write(ctx)
+			
+			err := s.handler.handle(ctxWithTag, trace, conn)
+			trace.RecordClosed(err)
 		})
 		if err != nil {
 			return err
