@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -50,6 +51,10 @@ func (s *instance) TokenBucketRequest(
 	// the same order with the system table changes.
 	metrics.mutex.Lock()
 	defer metrics.mutex.Unlock()
+
+	// Use high admission priority because incorrect RU throttling can make load
+	// worse.
+	txnPriority := isql.WithPriority(admissionpb.HighPri)
 
 	result := &kvpb.TokenBucketResponse{}
 	var consumption kvpb.TenantConsumption
@@ -115,7 +120,7 @@ func (s *instance) TokenBucketRequest(
 		}
 		consumption = tenant.Consumption
 		return nil
-	}); err != nil {
+	}, txnPriority); err != nil {
 		return &kvpb.TokenBucketResponse{
 			Error: errors.EncodeError(ctx, err),
 		}

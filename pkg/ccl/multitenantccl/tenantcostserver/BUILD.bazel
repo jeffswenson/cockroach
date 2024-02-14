@@ -3,6 +3,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "tenantcostserver",
     srcs = [
+        "batch_token_bucket.go",
         "configure.go",
         "metrics.go",
         "server.go",
@@ -26,6 +27,7 @@ go_library(
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sessiondata",
+        "//pkg/util/admission/admissionpb",
         "//pkg/util/buildutil",
         "//pkg/util/log",
         "//pkg/util/metric",
