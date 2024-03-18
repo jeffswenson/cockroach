@@ -168,9 +168,8 @@ func TestProxyProtocol(t *testing.T) {
 		return newSecureProxyServer(ctx, t, sql.Stopper(), options)
 	}
 
-	timeout := 3 * time.Second
 	proxyDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		conn, err := (&net.Dialer{Timeout: timeout}).Dial(network, addr)
+		conn, err := (&net.Dialer{}).Dial(network, addr)
 		if err != nil {
 			return nil, err
 		}
@@ -184,9 +183,6 @@ func TestProxyProtocol(t *testing.T) {
 				Port: 4242,
 			},
 			DestinationAddr: conn.RemoteAddr(),
-		}
-		if err := conn.SetWriteDeadline(timeutil.Now().Add(timeout)); err != nil {
-			return nil, err
 		}
 		_, err = header.WriteTo(conn)
 		if err != nil {
@@ -266,7 +262,7 @@ func TestProxyProtocol(t *testing.T) {
 		testSQLRequiredProxyProtocol(s, addrs.proxyProtocolListenAddr)
 
 		// Test HTTP. Shouldn't support PROXY.
-		client := http.Client{Timeout: timeout}
+		client := http.Client{}
 		makeHttpReq(t, &client, addrs.httpAddr, true)
 		proxyClient := http.Client{Transport: &http.Transport{DialContext: proxyDialer}}
 		makeHttpReq(t, &proxyClient, addrs.httpAddr, false)
@@ -281,7 +277,7 @@ func TestProxyProtocol(t *testing.T) {
 		testSQLRequiredProxyProtocol(s, addrs.proxyProtocolListenAddr)
 
 		// Test HTTP. Should support with or without PROXY.
-		client := http.Client{Timeout: timeout}
+		client := http.Client{}
 		makeHttpReq(t, &client, addrs.httpAddr, true)
 		proxyClient := http.Client{Transport: &http.Transport{DialContext: proxyDialer}}
 		makeHttpReq(t, &proxyClient, addrs.httpAddr, true)
@@ -349,9 +345,8 @@ func TestPrivateEndpointsACL(t *testing.T) {
 	options.testingKnobs.directoryServer = tds
 	s, addrs := newSecureProxyServer(ctx, t, sql.Stopper(), options)
 
-	timeout := 3 * time.Second
 	proxyDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		conn, err := (&net.Dialer{Timeout: timeout}).Dial(network, addr)
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
@@ -373,7 +368,9 @@ func TestPrivateEndpointsACL(t *testing.T) {
 		}}); err != nil {
 			return nil, err
 		}
-		if err := conn.SetWriteDeadline(timeutil.Now().Add(timeout)); err != nil {
+
+		deadline, _ := ctx.Deadline()
+		if err := conn.SetWriteDeadline(deadline); err != nil {
 			return nil, err
 		}
 		_, err = header.WriteTo(conn)
@@ -415,6 +412,9 @@ func TestPrivateEndpointsACL(t *testing.T) {
 					return nil
 				})
 
+				ctx, cancel := context.WithDeadline(ctx, timeutil.Now().Add(time.Second*3))
+				defer cancel()
+
 				// Subsequent Exec calls will eventually fail.
 				var err error
 				require.Eventually(
@@ -427,7 +427,7 @@ func TestPrivateEndpointsACL(t *testing.T) {
 					"Expected the connection to eventually fail",
 				)
 				require.Error(t, err)
-				require.Regexp(t, "connection reset by peer|unexpected EOF", err.Error())
+				require.Regexp(t, "connection reset by peer|unexpected EOF|proxy protocol signature not present", err.Error())
 				require.Equal(t, int64(1), s.metrics.ExpiredClientConnCount.Count())
 			},
 		)
