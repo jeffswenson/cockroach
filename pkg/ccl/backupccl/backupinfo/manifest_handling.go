@@ -85,15 +85,6 @@ const (
 	BackupProgressDirectory = "progress"
 )
 
-// WriteMetadataSST controls if we write the experimental new format BACKUP
-// metadata file.
-var WriteMetadataSST = settings.RegisterBoolSetting(
-	settings.ApplicationLevel,
-	"kv.bulkio.write_metadata_sst.enabled",
-	"write experimental new format BACKUP metadata file",
-	metamorphic.ConstantWithTestBool("write-metadata-sst", false),
-)
-
 // WriteMetadataWithExternalSSTsEnabled controls if we write a `BACKUP_METADATA`
 // file along with external SSTs containing lists of `BackupManifest_Files` and
 // descriptors. This new format of metadata is written in addition to the

@@ -951,7 +951,7 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %token <str> CURRENT_ROLE CURRENT_TIME CURRENT_TIMESTAMP
 %token <str> CURRENT_USER CURSOR CYCLE
 
-%token <str> DATA DATABASE DATABASES DATE DAY DEBUG_IDS DEC DEBUG_DUMP_METADATA_SST DECIMAL DEFAULT DEFAULTS DEFINER
+%token <str> DATA DATABASE DATABASES DATE DAY DEBUG_IDS DEC DECIMAL DEFAULT DEFAULTS DEFINER
 %token <str> DEALLOCATE DECLARE DEFERRABLE DEFERRED DELETE DELIMITER DEPENDS DESC DESTINATION DETACHED DETAILS
 %token <str> DISCARD DISTANCE DISTINCT DO DOMAIN DOUBLE DROP
 
@@ -8410,10 +8410,6 @@ show_backup_options:
  | ENCRYPTION_INFO_DIR '=' string_or_placeholder
  {
  $$.val = &tree.ShowBackupOptions{EncryptionInfoDir: $3.expr()}
- }
- | DEBUG_DUMP_METADATA_SST
- {
- $$.val = &tree.ShowBackupOptions{DebugMetadataSST: true}
  }
 
 opt_with_show_backup_connection_options_list:
@@ -17563,7 +17559,6 @@ unreserved_keyword:
 | DAY
 | DEALLOCATE
 | DEBUG_IDS
-| DEBUG_DUMP_METADATA_SST
 | DECLARE
 | DELETE
 | DEFAULTS
@@ -18074,7 +18069,6 @@ bare_label_keywords:
 | DATABASE
 | DATABASES
 | DEALLOCATE
-| DEBUG_DUMP_METADATA_SST
 | DEBUG_IDS
 | DEC
 | DECIMAL

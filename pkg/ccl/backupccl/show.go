@@ -46,7 +46,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -130,53 +129,7 @@ func (m manifestInfoReader) showBackup(
 	return nil
 }
 
-type metadataSSTInfoReader struct{}
-
 var _ backupInfoReader = manifestInfoReader{}
-
-func (m metadataSSTInfoReader) header() colinfo.ResultColumns {
-	return colinfo.ResultColumns{
-		{Name: "file", Typ: types.String},
-		{Name: "key", Typ: types.String},
-		{Name: "detail", Typ: types.Jsonb},
-	}
-}
-
-func (m metadataSSTInfoReader) showBackup(
-	ctx context.Context,
-	_ *mon.BoundAccount,
-	mkStore cloud.ExternalStorageFromURIFactory,
-	info backupInfo,
-	user username.SQLUsername,
-	kmsEnv cloud.KMSEnv,
-	resultsCh chan<- tree.Datums,
-) error {
-	filename := backupinfo.MetadataSSTName
-	push := func(_, readable string, value json.JSON) error {
-		val := tree.DNull
-		if value != nil {
-			val = tree.NewDJSON(value)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case resultsCh <- []tree.Datum{tree.NewDString(filename), tree.NewDString(readable), val}:
-			return nil
-		}
-	}
-	for _, uri := range info.defaultURIs {
-		store, err := mkStore(ctx, uri, user)
-		if err != nil {
-			return errors.Wrapf(err, "creating external store")
-		}
-		defer store.Close()
-		if err := backupinfo.DebugDumpMetadataSST(ctx, store, filename, info.enc,
-			kmsEnv, push); err != nil {
-			return err
-		}
-	}
-	return nil
-}
 
 func showBackupTypeCheck(
 	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
@@ -545,9 +498,7 @@ you must pass the 'encryption_info_dir' parameter that points to the directory o
 
 func getBackupInfoReader(p sql.PlanHookState, showStmt *tree.ShowBackup) backupInfoReader {
 	var infoReader backupInfoReader
-	if showStmt.Options.DebugMetadataSST {
-		infoReader = metadataSSTInfoReader{}
-	} else if showStmt.Options.AsJson {
+	if showStmt.Options.AsJson {
 		infoReader = manifestInfoReader{shower: jsonShower}
 	} else {
 		var shower backupShower
@@ -606,10 +557,9 @@ func checkBackupFiles(
 		// they're validated in resolveBackupManifests.
 		for _, metaFile := range []string{
 			backupinfo.FileInfoPath,
-			backupinfo.MetadataSSTName,
 			backupbase.BackupManifestName + backupinfo.BackupManifestChecksumSuffix} {
 			if _, err := defaultStore.Size(ctx, metaFile); err != nil {
-				if metaFile == backupinfo.FileInfoPath || metaFile == backupinfo.MetadataSSTName {
+				if metaFile == backupinfo.FileInfoPath {
 					log.Warningf(ctx, `%v not found. This is only relevant if kv.bulkio.write_metadata_sst.enabled = true`, metaFile)
 					continue
 				}

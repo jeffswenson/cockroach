@@ -244,6 +244,7 @@ var retiredSettings = map[InternalKey]struct{}{
 	// removed as of 24.3
 	"bulkio.backup.split_keys_on_timestamps": {},
 	"sql.create_tenant.default_template":     {},
+	"kv.bulkio.write_metadata_sst.enabled":   {},
 }
 
 // sqlDefaultSettings is the list of "grandfathered" existing sql.defaults

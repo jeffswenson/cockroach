@@ -1,12 +1,5 @@
 # This test that we don't back up forecasts or merged statistics.
-#
-# This also serves as a regression test for #86806 -- a bug in which 2
-# or more forecsts would break metadata SST writing.
 new-cluster name=s
-----
-
-exec-sql
-SET CLUSTER SETTING kv.bulkio.write_metadata_sst.enabled = true;
 ----
 
 # Automatic collection is disabled to avoid flakiness.
