@@ -29,10 +29,11 @@ import (
 )
 
 type partitionedStreamClient struct {
-	urlPlaceholder url.URL
-	pgxConfig      *pgx.ConnConfig
-	compressed     bool
-	logical        bool
+	urlPlaceholder    url.URL
+	pgxConfig         *pgx.ConnConfig
+	compressed        bool
+	logical           bool
+	ignoreNodeRouting bool
 
 	mu struct {
 		syncutil.Mutex
@@ -134,12 +135,14 @@ func (p *partitionedStreamClient) Heartbeat(
 
 // postgresURL converts an SQL serving address into a postgres URL.
 func (p *partitionedStreamClient) postgresURL(servingAddr string) (url.URL, error) {
-	host, port, err := net.SplitHostPort(servingAddr)
-	if err != nil {
-		return url.URL{}, err
-	}
 	res := p.urlPlaceholder
-	res.Host = net.JoinHostPort(host, port)
+	if !p.ignoreNodeRouting {
+		host, port, err := net.SplitHostPort(servingAddr)
+		if err != nil {
+			return url.URL{}, err
+		}
+		res.Host = net.JoinHostPort(host, port)
+	}
 	return res, nil
 }
 

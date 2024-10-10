@@ -438,6 +438,7 @@ func (sip *streamIngestionProcessor) Start(ctx context.Context) {
 			log.Infof(ctx, "using testing client")
 		} else {
 			streamClient, err = streamclient.NewStreamClient(ctx, crosscluster.StreamAddress(addr), db,
+				// TODO(jeffswenson): add WithCanRouteToNodes
 				streamclient.WithStreamID(streampb.StreamID(sip.spec.StreamID)),
 				streamclient.WithCompression(compress.Get(&st.SV)))
 			if err != nil {

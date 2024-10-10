@@ -75,6 +75,12 @@ message StreamIngestionDetails {
   // addresses of the stream's partitions.
   string stream_address = 1;
 
+	// UseStreamAddress is set to true if all processors should connect to the
+	// stream address instead of individual node addresses. This is desirable if
+	// the source cluster nodes and not ip routable from the destination cluster
+	// nodes.
+	bool use_stream_address = 16;
+
   uint64 stream_id = 4 [(gogoproto.customname) = "StreamID"];
 
   // Span is the keyspan into which this job will ingest KVs.

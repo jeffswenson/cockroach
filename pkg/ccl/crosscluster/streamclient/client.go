@@ -301,9 +301,10 @@ func getFirstDialer(
 }
 
 type options struct {
-	streamID   streampb.StreamID
-	compressed bool
-	logical    bool
+	streamID    streampb.StreamID
+	compressed  bool
+	logical     bool
+	nodeRouting bool
 }
 
 func (o *options) appName() string {
@@ -339,8 +340,16 @@ func WithLogical() Option {
 	}
 }
 
+func WithCanRouteToNodes(canRouteToNodes bool) Option {
+	return func(o *options) {
+			o.nodeRouting = true
+	}
+}
+
 func processOptions(opts []Option) *options {
-	ret := &options{}
+	ret := &options{
+		nodeRouting: true,
+	}
 	for _, o := range opts {
 		o(ret)
 	}
