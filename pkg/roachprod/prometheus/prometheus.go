@@ -130,6 +130,27 @@ func (cfg *Config) WithCluster(nodes install.Nodes) *Config {
 	return cfg
 }
 
+func (cfg *Config) WithSqlServers(servers []install.ServiceDesc) *Config {
+	var sl []ScrapeConfig
+	for i, server := range servers {
+		sl = append(sl, ScrapeConfig {
+			JobName: fmt.Sprintf("sql-server-%d", i),
+			// https://swenson-b-0002.roachprod.crdb.io:29001/_status/vars
+			MetricsPath: "/_status/vars",
+			Labels: map[string]string {
+				"node":   strconv.Itoa(int(server.Node)),
+				"tenant": server.VirtualClusterName,
+			},
+			ScrapeNodes: []ScrapeNode {{
+				Node: server.Node,
+				Port: server.Port,
+			}},
+		})
+	}
+	cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, sl...)
+	return cfg
+}
+
 // WithTenantPod adds scraping for a tenant SQL pod running on the given nodes.
 // Chains for convenience.
 func (cfg *Config) WithTenantPod(node install.Node, tenantID int) *Config {
