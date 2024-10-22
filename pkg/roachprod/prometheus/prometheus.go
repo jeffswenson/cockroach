@@ -82,8 +82,7 @@ type GrafanaConfig struct {
 // given node and port. If the workload is in the config, the node and port will be
 // added to the workload's scrape config (i.e. allows for chaining). If port == 0,
 // defaultWorkloadPort is used.
-func (cfg *Config) WithWorkload(workloadName string, nodes install.Node, port int) *Config {
-
+func (cfg *Config) WithWorkload(workloadName string, nodes install.Node, port int, labels map[string]string) *Config {
 	// Find the workload's scrapeConfig, if it exists.
 	var sc *ScrapeConfig
 	for i := range cfg.ScrapeConfigs {
@@ -99,7 +98,7 @@ func (cfg *Config) WithWorkload(workloadName string, nodes install.Node, port in
 	}
 	sn := ScrapeNode{Node: nodes, Port: port}
 	if sc == nil {
-		cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, MakeWorkloadScrapeConfig(workloadName, "/", []ScrapeNode{sn}))
+		cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, MakeWorkloadScrapeConfig(workloadName, "/", []ScrapeNode{sn}, labels))
 	} else {
 		sc.ScrapeNodes = append(sc.ScrapeNodes, sn)
 	}
@@ -108,12 +107,13 @@ func (cfg *Config) WithWorkload(workloadName string, nodes install.Node, port in
 
 // MakeWorkloadScrapeConfig creates a scrape config for a workload.
 func MakeWorkloadScrapeConfig(
-	jobName string, metricsPath string, scrapeNodes []ScrapeNode,
+	jobName string, metricsPath string, scrapeNodes []ScrapeNode, labels map[string]string,
 ) ScrapeConfig {
 	return ScrapeConfig{
 		JobName:     jobName,
 		MetricsPath: metricsPath,
 		ScrapeNodes: scrapeNodes,
+		Labels: labels,
 	}
 }
 
@@ -127,6 +127,27 @@ func (cfg *Config) WithPrometheusNode(node install.Node) *Config {
 // Chains for convenience.
 func (cfg *Config) WithCluster(nodes install.Nodes) *Config {
 	cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, MakeInsecureCockroachScrapeConfig(nodes)...)
+	return cfg
+}
+
+func (cfg *Config) WithSqlServers(servers []install.ServiceDesc) *Config {
+	var sl []ScrapeConfig
+	for i, server := range servers {
+		sl = append(sl, ScrapeConfig {
+			JobName: fmt.Sprintf("sql-server-%d", i),
+			// https://swenson-b-0002.roachprod.crdb.io:29001/_status/vars
+			MetricsPath: "/_status/vars",
+			Labels: map[string]string {
+				"node":   strconv.Itoa(int(server.Node)),
+				"tenant": server.VirtualClusterName,
+			},
+			ScrapeNodes: []ScrapeNode {{
+				Node: server.Node,
+				Port: server.Port,
+			}},
+		})
+	}
+	cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, sl...)
 	return cfg
 }
 

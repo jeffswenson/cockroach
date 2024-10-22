@@ -1857,7 +1857,21 @@ func StartGrafana(
 		return err
 	}
 
+	externalVirtualClusters, err := c.ListExternalVirtualClusters(ctx)
+	if err != nil {
+		return err
+	}
+	var sqlServers []install.ServiceDesc
+	for _, tenant := range externalVirtualClusters {
+		desc, err := c.DiscoverServices(ctx, tenant, install.ServiceTypeUI)
+		if err != nil {
+			return err
+		}
+		sqlServers = append(sqlServers, desc...)
+	}
+
 	if promCfg == nil {
+
 		promCfg = &prometheus.Config{}
 		// Configure the prometheus/grafana servers to run on the last node in the cluster
 		promCfg.WithPrometheusNode(nodes[len(nodes)-1])
@@ -1865,9 +1879,16 @@ func StartGrafana(
 		// Configure scraping on all nodes in the cluster
 		promCfg.WithCluster(nodes)
 		promCfg.WithNodeExporter(nodes)
+		promCfg.WithSqlServers(sqlServers)
 		// Scrape all workload prometheus ports, just in case.
-		for _, i := range nodes {
-			promCfg.WithWorkload(fmt.Sprintf("workload_on_n%d", i), i, 0 /* use default port */)
+		// for _, i := range nodes {
+		//	promCfg.WithWorkload(fmt.Sprintf("workload_on_n%d", i), i, 0 /* use default port */)
+		// }
+		// 2112
+		for i := 1; i <= 20; i++ {
+			promCfg.WithWorkload(fmt.Sprintf("workload-tenant-%d", i), nodes[len(nodes)-1], 2111+i, map[string]string {
+				"tenant": fmt.Sprintf("tenant-%02d", i),
+			})
 		}
 
 		// By default, spin up a grafana server

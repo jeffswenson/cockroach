@@ -138,6 +138,7 @@ func registerIndexBackfill(r registry.Registry) {
 							c.WorkloadNode().InstallNodes()[0],
 							[]workloadInstance{{nodes: c.WorkloadNode()}},
 						),
+						nil,
 					),
 				)
 

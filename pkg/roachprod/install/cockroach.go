@@ -290,6 +290,31 @@ func (c *SyncedCluster) maybeRegisterServices(
 	return c.RegisterServices(ctx, servicesToRegister)
 }
 
+func (s *SyncedCluster) ListExternalVirtualClusters(ctx context.Context) ([]string, error) {
+	return []string{
+		"tenant-01",
+		"tenant-02",
+		"tenant-03",
+		"tenant-04",
+		"twnant-05",
+		"tenant-06",
+		"tenant-07",
+		"tenant-08",
+		"tenant-09",
+		"twnant-10",
+		"tenant-11",
+		"tenant-12",
+		"tenant-13",
+		"tenant-14",
+		"twnant-15",
+		"tenant-16",
+		"tenant-17",
+		"tenant-18",
+		"tenant-19",
+		"twnant-20",
+	}, nil
+}
+
 // servicesWithOpenPortSelection returns services to be registered for
 // cases where a new cockroach process is being instantiated and needs
 // to being to available ports. This happens when we start the system

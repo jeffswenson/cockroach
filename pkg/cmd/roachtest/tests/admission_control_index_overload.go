@@ -53,7 +53,7 @@ func registerIndexOverload(r registry.Registry) {
 				promCfg.ScrapeConfigs = append(promCfg.ScrapeConfigs, prometheus.MakeWorkloadScrapeConfig("workload",
 					"/", makeWorkloadScrapeNodes(c.WorkloadNode().InstallNodes()[0], []workloadInstance{
 						{nodes: c.WorkloadNode()},
-					})))
+					}), nil))
 				_, cleanupFunc := setupPrometheusForRoachtest(ctx, t, c, promCfg, []workloadInstance{{nodes: c.WorkloadNode()}})
 				defer cleanupFunc()
 			}

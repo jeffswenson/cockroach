@@ -1807,7 +1807,7 @@ func setupPrometheusForRoachtest(
 		cfg.WithCluster(c.CRDBNodes().InstallNodes())
 		if len(workloadInstances) > 0 {
 			cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, prometheus.MakeWorkloadScrapeConfig("workload",
-				"/", makeWorkloadScrapeNodes(workloadNode, workloadInstances)))
+				"/", makeWorkloadScrapeNodes(workloadNode, workloadInstances), nil))
 		}
 	}
 	if c.IsLocal() {
