@@ -61,6 +61,8 @@ type tpch struct {
 	useClusterVectorizeSetting bool
 	verbose                    bool
 
+	rate float64
+
 	queriesRaw      string
 	selectedQueries []int
 
@@ -90,6 +92,7 @@ var tpchMeta = workload.Meta{
 			`dist-sql`:      {RuntimeOnly: true},
 			`enable-checks`: {RuntimeOnly: true},
 			`vectorize`:     {RuntimeOnly: true},
+			`rate`:          {RuntimeOnly: true},
 		}
 		g.flags.Uint64Var(&g.seed, `seed`, 1, `Random number generator seed.`)
 		g.flags.IntVar(&g.scaleFactor, `scale-factor`, 1,
@@ -108,6 +111,7 @@ var tpchMeta = workload.Meta{
 			`Ignore vectorize option and use the current cluster setting sql.defaults.vectorize.`)
 		g.flags.BoolVar(&g.verbose, `verbose`, false,
 			`Prints out the queries being run as well as histograms.`)
+		g.flags.Float64Var(&g.rate, `rate`, 0, `target query rante`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -283,7 +287,6 @@ func (w *tpch) Tables() []workload.Table {
 			FillBatch:  w.tpchLineItemInitialRowBatch,
 		},
 	}
-
 	return []workload.Table{
 		nation, region, part, supplier, partsupp, customer, orders, lineitem,
 	}
@@ -301,6 +304,12 @@ func (w *tpch) Ops(
 	db.SetMaxOpenConns(w.connFlags.Concurrency + 1)
 	db.SetMaxIdleConns(w.connFlags.Concurrency + 1)
 
+	var limiter chan struct{}
+	if w.rate != 0 {
+		limiter = Limit(w.connFlags.Concurrency*2, w.rate)
+	}
+	
+
 	ql := workload.QueryLoad{}
 	for i := 0; i < w.connFlags.Concurrency; i++ {
 		worker := &worker{
@@ -308,6 +317,7 @@ func (w *tpch) Ops(
 			hists:   reg.GetHandle(),
 			db:      db,
 			queries: makeQueriesForStream(i),
+			limiter: limiter,
 		}
 		ql.WorkerFns = append(ql.WorkerFns, worker.run)
 	}
@@ -320,9 +330,14 @@ type worker struct {
 	db      *gosql.DB
 	ops     int
 	queries map[int]string
+	limiter chan struct{}
 }
 
 func (w *worker) run(ctx context.Context) error {
+	if w.limiter != nil {
+		<- w.limiter	
+	}
+
 	queryNum := w.config.selectedQueries[w.ops%len(w.config.selectedQueries)]
 	w.ops++
 

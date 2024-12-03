@@ -233,8 +233,6 @@ func initFlags() {
 	runCmd.Flags().StringVarP(&extraSSHOptions,
 		"ssh-options", "O", "", "extra args to pass to ssh")
 
-	startCmd.Flags().IntVarP(&numRacks,
-		"racks", "r", 0, "the number of racks to partition the nodes into")
 	startCmd.Flags().StringArrayVarP(&startOpts.ExtraArgs,
 		"args", "a", nil, `node arguments (example: --args "--cache=25%" --args "--max-sql-memory=25%")`)
 	startCmd.Flags().StringArrayVarP(&nodeEnv,
@@ -427,6 +425,8 @@ func initFlags() {
 	}
 
 	for _, cmd := range []*cobra.Command{startCmd, startInstanceCmd} {
+		cmd.Flags().IntVarP(&numRacks,
+			"racks", "r", 0, "the number of racks to partition the nodes into")
 		cmd.Flags().BoolVar(&startOpts.ScheduleBackups,
 			"schedule-backups", startOpts.ScheduleBackups,
 			"create a cluster backup schedule once the cluster has started (by default, "+

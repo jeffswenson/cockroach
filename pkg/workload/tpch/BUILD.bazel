@@ -7,6 +7,7 @@ go_library(
         "generate.go",
         "queries.go",
         "random.go",
+        "rate.go",
         "tpch.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/workload/tpch",
