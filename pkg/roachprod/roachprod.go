@@ -2937,7 +2937,7 @@ func CaptureSideEyeSnapshot(
 		if errors.Is(err, sideeyeclient.NoProcessesError{}) {
 			msg += "; is cockroach running?"
 		}
-		l.PrintfCtx(ctx, "Side-Eye failed to capture cluster snapshot: %s", msg)
+		l.PrintfCtx(ctx, "Side-Eye failed to capture cluster snapshot: %s: %+v", msg, err)
 		return "", false
 	}
 
