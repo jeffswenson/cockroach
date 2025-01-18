@@ -568,5 +568,9 @@ message LogicalReplicationOfflineScanSpec {
     repeated TableRekey rekey = 7 [(gogoproto.nullable) = false];
 
     optional string metrics_label = 8 [(gogoproto.nullable) = false];
+}
 
+message MergeSstSpec {
+	optional int64 job_id = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "JobID"];
+	optional int64 first_task = 2 [(gogoproto.nullable) = false];
 }

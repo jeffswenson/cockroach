@@ -236,6 +236,8 @@ func DetailsType(d isPayload_Details) (Type, error) {
 		return TypeUpdateTableMetadataCache, nil
 	case *Payload_StandbyReadTsPollerDetails:
 		return TypeStandbyReadTSPoller, nil
+	case *Payload_SstIngestDetails:
+		return TypeSSTIngest, nil
 	default:
 		return TypeUnspecified, errors.Newf("Payload.Type called on a payload with an unknown details type: %T", d)
 	}
@@ -289,6 +291,7 @@ var JobDetailsForEveryJobType = map[Type]Details{
 	TypeLogicalReplication:           LogicalReplicationDetails{},
 	TypeUpdateTableMetadataCache:     UpdateTableMetadataCacheDetails{},
 	TypeStandbyReadTSPoller:          StandbyReadTSPollerDetails{},
+	TypeSSTIngest:                    SstIngestDetails{},
 }
 
 // WrapProgressDetails wraps a ProgressDetails object in the protobuf wrapper
@@ -356,6 +359,8 @@ func WrapProgressDetails(details ProgressDetails) interface {
 		return &Progress_TableMetadataCache{TableMetadataCache: &d}
 	case StandbyReadTSPollerProgress:
 		return &Progress_StandbyReadTsPoller{StandbyReadTsPoller: &d}
+	case SstIngestProgress:
+		return &Progress_SstIngest{SstIngest: &d}
 	default:
 		panic(errors.AssertionFailedf("WrapProgressDetails: unknown progress type %T", d))
 	}
@@ -575,6 +580,8 @@ func WrapPayloadDetails(details Details) interface {
 		return &Payload_UpdateTableMetadataCacheDetails{UpdateTableMetadataCacheDetails: &d}
 	case StandbyReadTSPollerDetails:
 		return &Payload_StandbyReadTsPollerDetails{StandbyReadTsPollerDetails: &d}
+	case SstIngestDetails:
+		return &Payload_SstIngestDetails{SstIngestDetails: &d}
 	default:
 		panic(errors.AssertionFailedf("jobs.WrapPayloadDetails: unknown details type %T", d))
 	}
@@ -610,7 +617,7 @@ const (
 func (Type) SafeValue() {}
 
 // NumJobTypes is the number of jobs types.
-const NumJobTypes = 31
+const NumJobTypes = 32
 
 // ChangefeedDetailsMarshaler allows for dependency injection of
 // cloud.SanitizeExternalStorageURI to avoid the dependency from this

@@ -1,0 +1,60 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "sstmerge",
+    srcs = [
+        "merge.go",
+        "merge_coordinator.go",
+        "merge_processor.go",
+        "models.go",
+        "splits.go",
+        "sst_ingest_job.go",
+        "task_set.go",
+        "work.go",
+    ],
+    importpath = "github.com/cockroachdb/cockroach/pkg/sstmerge",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/jobs",
+        "//pkg/jobs/jobspb",
+        "//pkg/settings/cluster",
+        "//pkg/storage",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_pebble//:pebble",
+        "@com_github_cockroachdb_pebble//objstorage",
+        "@com_github_cockroachdb_pebble//objstorage/objstorageprovider",
+        "@com_github_cockroachdb_pebble//sstable",
+        "@com_github_cockroachdb_pebble//vfs",
+    ],
+)
+
+go_test(
+    name = "sstmerge_test",
+    srcs = [
+        "main_test.go",
+        "merge_test.go",
+        "sst_ingest_job_test.go",
+        "task_set_test.go",
+    ],
+    embed = [":sstmerge"],
+    deps = [
+        "//pkg/base",
+        "//pkg/jobs",
+        "//pkg/jobs/jobspb",
+        "//pkg/kv/kvclient/kvtenant",
+        "//pkg/security/securityassets",
+        "//pkg/security/securitytest",
+        "//pkg/security/username",
+        "//pkg/server",
+        "//pkg/sql/isql",
+        "//pkg/storage",
+        "//pkg/testutils/jobutils",
+        "//pkg/testutils/serverutils",
+        "//pkg/testutils/sqlutils",
+        "//pkg/testutils/testcluster",
+        "//pkg/util/leaktest",
+        "//pkg/util/randutil",
+        "@com_github_cockroachdb_pebble//sstable",
+        "@com_github_stretchr_testify//require",
+    ],
+)
