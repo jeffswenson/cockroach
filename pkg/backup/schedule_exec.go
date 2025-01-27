@@ -359,7 +359,9 @@ func (e *scheduledBackupExecutor) backupSucceeded(
 	// If this schedule is designated as maintaining the "LastBackup" metric used
 	// for monitoring an RPO SLA, update that metric.
 	if args.UpdatesLastBackupMetric {
-		e.metrics.RpoMetric.Update(details.(jobspb.BackupDetails).EndTime.GoTime().Unix())
+		backupDetails := details.(jobspb.BackupDetails)
+		// backupDetails.SpecificTenantIds
+		e.metrics.RpoMetric.Update(backupDetails.EndTime.GoTime().Unix())
 	}
 
 	if args.UnpauseOnSuccess == jobspb.InvalidScheduleID {
