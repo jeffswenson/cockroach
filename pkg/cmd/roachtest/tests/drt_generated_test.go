@@ -38,7 +38,9 @@ func (m *MockClient) EXPECT() *MockClientMockRecorder {
 }
 
 // Query mocks base method.
-func (m *MockClient) Query(arg0 context.Context, arg1 string, arg2 time.Time, arg3 ...v1.Option) (model.Value, v1.Warnings, error) {
+func (m *MockClient) Query(
+	arg0 context.Context, arg1 string, arg2 time.Time, arg3 ...v1.Option,
+) (model.Value, v1.Warnings, error) {
 	m.ctrl.T.Helper()
 	varargs := []interface{}{arg0, arg1, arg2}
 	for _, a := range arg3 {
@@ -52,14 +54,18 @@ func (m *MockClient) Query(arg0 context.Context, arg1 string, arg2 time.Time, ar
 }
 
 // Query indicates an expected call of Query.
-func (mr *MockClientMockRecorder) Query(arg0, arg1, arg2 interface{}, arg3 ...interface{}) *gomock.Call {
+func (mr *MockClientMockRecorder) Query(
+	arg0, arg1, arg2 interface{}, arg3 ...interface{},
+) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	varargs := append([]interface{}{arg0, arg1, arg2}, arg3...)
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Query", reflect.TypeOf((*MockClient)(nil).Query), varargs...)
 }
 
 // QueryRange mocks base method.
-func (m *MockClient) QueryRange(arg0 context.Context, arg1 string, arg2 v1.Range, arg3 ...v1.Option) (model.Value, v1.Warnings, error) {
+func (m *MockClient) QueryRange(
+	arg0 context.Context, arg1 string, arg2 v1.Range, arg3 ...v1.Option,
+) (model.Value, v1.Warnings, error) {
 	m.ctrl.T.Helper()
 	varargs := []interface{}{arg0, arg1, arg2}
 	for _, a := range arg3 {
@@ -73,7 +79,9 @@ func (m *MockClient) QueryRange(arg0 context.Context, arg1 string, arg2 v1.Range
 }
 
 // QueryRange indicates an expected call of QueryRange.
-func (mr *MockClientMockRecorder) QueryRange(arg0, arg1, arg2 interface{}, arg3 ...interface{}) *gomock.Call {
+func (mr *MockClientMockRecorder) QueryRange(
+	arg0, arg1, arg2 interface{}, arg3 ...interface{},
+) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	varargs := append([]interface{}{arg0, arg1, arg2}, arg3...)
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "QueryRange", reflect.TypeOf((*MockClient)(nil).QueryRange), varargs...)

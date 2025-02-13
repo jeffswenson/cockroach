@@ -29,6 +29,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TODO(jeffswenson): record the expected fingerprint of the full backup and
+// final incremental using an AOST query.
 type TpccFixture struct {
 	Name                   string
 	ImportWarehouses       int
@@ -36,6 +38,7 @@ type TpccFixture struct {
 	MinutesPerIncremental  int
 	IncrementalChainLength int
 	RestoredSizeEstimate   string
+	CompatibleClouds       registry.CloudSet
 }
 
 // TinyFixture is a TPCC fixture that is intended for smoke tests, local
@@ -46,6 +49,7 @@ var TinyFixture = TpccFixture{
 	WorkloadWarehouses:     10,
 	IncrementalChainLength: 4,
 	RestoredSizeEstimate:   "700MiB",
+	CompatibleClouds:       registry.Clouds(spec.AWS, spec.GCE, spec.Local),
 }
 
 // SmallFixture is a TPCC fixture that is intended to be quick to restore and
@@ -56,6 +60,7 @@ var SmallFixture = TpccFixture{
 	WorkloadWarehouses:     1000,
 	IncrementalChainLength: 48,
 	RestoredSizeEstimate:   "350GiB",
+	CompatibleClouds:       registry.Clouds(spec.AWS, spec.GCE),
 }
 
 // MediumFixture is a TPCC fixture sized so that it is a tight fit in 3 nodes
@@ -66,6 +71,7 @@ var MediumFixture = TpccFixture{
 	WorkloadWarehouses:     5000,
 	IncrementalChainLength: 400,
 	RestoredSizeEstimate:   "2TiB",
+	CompatibleClouds:       registry.Clouds(spec.AWS, spec.GCE),
 }
 
 // LargeFixture is a TPCC fixture sized so that it is a tight fit in 3 nodes
@@ -78,6 +84,9 @@ var LargeFixture = TpccFixture{
 	WorkloadWarehouses:     7500,
 	IncrementalChainLength: 400,
 	RestoredSizeEstimate:   "20TiB",
+	// The large fixture is only generated on GCE to reduce the cost of
+	// storing the fixtures.
+	CompatibleClouds: registry.Clouds(spec.GCE),
 }
 
 type backupFixtureSpecs struct {
@@ -89,8 +98,6 @@ type backupFixtureSpecs struct {
 	timeout time.Duration
 
 	suites registry.SuiteSet
-
-	clouds []spec.Cloud
 
 	// If non-empty, the test will be skipped with the supplied reason.
 	skip string
@@ -272,7 +279,6 @@ func registerBackupFixtures(r registry.Registry) {
 			}),
 			timeout: 30 * time.Minute,
 			suites:  registry.Suites(registry.Nightly),
-			clouds:  []spec.Cloud{spec.AWS, spec.GCE, spec.Local},
 		},
 		{
 			fixture: SmallFixture,
@@ -281,7 +287,7 @@ func registerBackupFixtures(r registry.Registry) {
 			}),
 			timeout: 2 * time.Hour,
 			suites:  registry.Suites(registry.Nightly),
-			clouds:  []spec.Cloud{spec.AWS, spec.GCE}},
+		},
 		{
 			fixture: MediumFixture,
 			hardware: makeHardwareSpecs(hardwareSpecs{
@@ -291,7 +297,6 @@ func registerBackupFixtures(r registry.Registry) {
 			}),
 			timeout: 12 * time.Hour,
 			suites:  registry.Suites(registry.Weekly),
-			clouds:  []spec.Cloud{spec.AWS, spec.GCE},
 		},
 		{
 			fixture: LargeFixture,
@@ -303,9 +308,6 @@ func registerBackupFixtures(r registry.Registry) {
 			}),
 			timeout: 40 * time.Hour,
 			suites:  registry.Suites(registry.Weekly),
-			// The large fixture is only generated on GCE to reduce the cost of
-			// storing the fixtures.
-			clouds: []spec.Cloud{spec.GCE},
 		},
 	}
 	for _, bf := range specs {
@@ -320,9 +322,9 @@ func registerBackupFixtures(r registry.Registry) {
 			Cluster:           clusterSpec,
 			Timeout:           bf.timeout,
 			EncryptionSupport: registry.EncryptionMetamorphic,
-			CompatibleClouds:  registry.Clouds(bf.clouds...),
 			Suites:            bf.suites,
 			Skip:              bf.skip,
+			CompatibleClouds:  bf.fixture.CompatibleClouds,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				registry := newFixtureRegistry(ctx, t, c)
 

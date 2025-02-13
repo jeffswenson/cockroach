@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -24,8 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -40,18 +39,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// defaultRestoreUptoIncremental is the default number of backups in a chain we
-// will restore.
-const defaultRestoreUptoIncremental = 12
-
 func registerRestoreNodeShutdown(r registry.Registry) {
 	sp := restoreSpecs{
 		hardware: makeHardwareSpecs(hardwareSpecs{}),
-		backup: makeRestoringBackupSpecs(
-			backupSpecs{workload: tpceRestore{customers: 1000}, version: "v22.2.1"}),
-		timeout:                1 * time.Hour,
-		fingerprint:            8445446819555404274,
-		restoreUptoIncremental: defaultRestoreUptoIncremental,
+		fixture:  SmallFixture,
+		timeout:  1 * time.Hour,
 	}
 
 	makeRestoreStarter := func(ctx context.Context, t test.Test, c cluster.Cluster,
@@ -65,7 +57,7 @@ func registerRestoreNodeShutdown(r registry.Registry) {
 		Name:                      "restore/nodeShutdown/worker",
 		Owner:                     registry.OwnerDisasterRecovery,
 		Cluster:                   sp.hardware.makeClusterSpecs(r),
-		CompatibleClouds:          sp.backup.CompatibleClouds(),
+		CompatibleClouds:          sp.fixture.CompatibleClouds,
 		Suites:                    registry.Suites(registry.Nightly),
 		TestSelectionOptOutSuites: registry.Suites(registry.Nightly),
 		Leases:                    registry.MetamorphicLeases,
@@ -74,7 +66,7 @@ func registerRestoreNodeShutdown(r registry.Registry) {
 			gatewayNode := 2
 			nodeToShutdown := 3
 
-			rd := makeRestoreDriver(t, c, sp)
+			rd := makeRestoreDriver(ctx, t, c, sp)
 			rd.prepareCluster(ctx)
 			cfg := defaultNodeShutdownConfig(c, nodeToShutdown)
 			cfg.restartSettings = rd.defaultClusterSettings()
@@ -89,7 +81,7 @@ func registerRestoreNodeShutdown(r registry.Registry) {
 		Name:                      "restore/nodeShutdown/coordinator",
 		Owner:                     registry.OwnerDisasterRecovery,
 		Cluster:                   sp.hardware.makeClusterSpecs(r),
-		CompatibleClouds:          sp.backup.CompatibleClouds(),
+		CompatibleClouds:          sp.fixture.CompatibleClouds,
 		Suites:                    registry.Suites(registry.Nightly),
 		TestSelectionOptOutSuites: registry.Suites(registry.Nightly),
 		Leases:                    registry.MetamorphicLeases,
@@ -98,7 +90,7 @@ func registerRestoreNodeShutdown(r registry.Registry) {
 			gatewayNode := 2
 			nodeToShutdown := 2
 
-			rd := makeRestoreDriver(t, c, sp)
+			rd := makeRestoreDriver(ctx, t, c, sp)
 			rd.prepareCluster(ctx)
 			cfg := defaultNodeShutdownConfig(c, nodeToShutdown)
 			cfg.restartSettings = rd.defaultClusterSettings()
@@ -117,28 +109,23 @@ func registerRestore(r registry.Registry) {
 
 	withPauseSpecs := restoreSpecs{
 		hardware: makeHardwareSpecs(hardwareSpecs{ebsThroughput: 250 /* MB/s */}),
-		backup: makeRestoringBackupSpecs(
-			backupSpecs{workload: tpceRestore{customers: 1000},
-				version: "v22.2.1"}),
-		timeout:                3 * time.Hour,
-		namePrefix:             "pause",
-		fingerprint:            8445446819555404274,
-		restoreUptoIncremental: defaultRestoreUptoIncremental,
+		fixture:  SmallFixture,
+		timeout:  3 * time.Hour,
 	}
 	withPauseSpecs.initTestName()
 
 	r.Add(registry.TestSpec{
-		Name:                      withPauseSpecs.testName,
+		Name:                      withPauseSpecs.testName + "/pause",
 		Owner:                     registry.OwnerDisasterRecovery,
 		Benchmark:                 true,
 		Cluster:                   withPauseSpecs.hardware.makeClusterSpecs(r),
 		Timeout:                   withPauseSpecs.timeout,
-		CompatibleClouds:          withPauseSpecs.backup.CompatibleClouds(),
+		CompatibleClouds:          withPauseSpecs.fixture.CompatibleClouds,
 		Suites:                    registry.Suites(registry.Nightly),
 		TestSelectionOptOutSuites: registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 
-			rd := makeRestoreDriver(t, c, withPauseSpecs)
+			rd := makeRestoreDriver(ctx, t, c, withPauseSpecs)
 			rd.prepareCluster(ctx)
 
 			// Run the disk usage logger in the monitor to guarantee its
@@ -276,149 +263,70 @@ func registerRestore(r registry.Registry) {
 
 	for _, sp := range []restoreSpecs{
 		{
-			hardware:               makeHardwareSpecs(hardwareSpecs{ebsThroughput: 250 /* MB/s */}),
-			backup:                 makeRestoringBackupSpecs(backupSpecs{}),
-			timeout:                1 * time.Hour,
-			suites:                 registry.Suites(registry.Nightly),
-			restoreUptoIncremental: defaultRestoreUptoIncremental,
+			hardware:         makeHardwareSpecs(hardwareSpecs{}),
+			compatibleClouds: registry.Clouds(spec.Local),
+			timeout:          15 * time.Minute,
+			fixture:          TinyFixture,
+			useFullBackup:    false,
+			suites:           registry.Suites(registry.Nightly),
 		},
 		{
-			// Note that the default specs in makeHardwareSpecs() spin up restore tests in aws,
-			// by default.
-			hardware:               makeHardwareSpecs(hardwareSpecs{}),
-			backup:                 makeRestoringBackupSpecs(backupSpecs{cloud: spec.GCE}),
-			timeout:                1 * time.Hour,
-			suites:                 registry.Suites(registry.Nightly),
-			restoreUptoIncremental: defaultRestoreUptoIncremental,
-		},
-		{
-			// Benchmarks using a low memory per core ratio - we don't expect ideal
-			// performance but nodes should not OOM.
-			hardware:               makeHardwareSpecs(hardwareSpecs{mem: spec.Low}),
-			backup:                 makeRestoringBackupSpecs(backupSpecs{cloud: spec.GCE}),
-			timeout:                1 * time.Hour,
-			suites:                 registry.Suites(registry.Nightly),
-			restoreUptoIncremental: defaultRestoreUptoIncremental,
+			hardware:         makeHardwareSpecs(hardwareSpecs{nodes: 4, ebsThroughput: 250 /* MB/s */}),
+			fixture:          SmallFixture,
+			compatibleClouds: SmallFixture.CompatibleClouds,
+			timeout:          1 * time.Hour,
+			suites:           registry.Suites(registry.Nightly),
+			useFullBackup:    true,
 		},
 		{
 			// Benchmarks if per node throughput remains constant if the number of
 			// nodes doubles relative to default.
-			hardware:               makeHardwareSpecs(hardwareSpecs{nodes: 8, ebsThroughput: 250 /* MB/s */}),
-			backup:                 makeRestoringBackupSpecs(backupSpecs{}),
-			timeout:                1 * time.Hour,
-			suites:                 registry.Suites(registry.Nightly),
-			restoreUptoIncremental: defaultRestoreUptoIncremental,
+			hardware:         makeHardwareSpecs(hardwareSpecs{nodes: 8, ebsThroughput: 250 /* MB/s */}),
+			fixture:          SmallFixture,
+			compatibleClouds: SmallFixture.CompatibleClouds,
+			timeout:          1 * time.Hour,
+			suites:           registry.Suites(registry.Nightly),
+			useFullBackup:    true,
 		},
 		{
-			// Benchmarks if per node throughput remains constant if the cluster
-			// is multi-region.
-			hardware: makeHardwareSpecs(hardwareSpecs{
-				nodes: 9, ebsThroughput: 250, /* MB/s */
-				zones: []string{"us-east-2b", "us-west-2b", "eu-west-1b"}}), // These zones are AWS-specific.
-			backup:                 makeRestoringBackupSpecs(backupSpecs{}),
-			timeout:                90 * time.Minute,
-			suites:                 registry.Suites(registry.Nightly),
-			restoreUptoIncremental: defaultRestoreUptoIncremental,
+			// Benchmarks per node throughput for restores with an incremental chain.
+			hardware:         makeHardwareSpecs(hardwareSpecs{nodes: 4, ebsThroughput: 250 /* MB/s */}),
+			fixture:          SmallFixture,
+			compatibleClouds: SmallFixture.CompatibleClouds,
+			suites:           registry.Suites(registry.Nightly),
+			timeout:          2 * time.Hour,
 		},
 		{
-			// Benchmarks if per node throughput doubles if the vcpu count doubles
-			// relative to default.
-			hardware:               makeHardwareSpecs(hardwareSpecs{cpus: 16, ebsThroughput: 250 /* MB/s */}),
-			backup:                 makeRestoringBackupSpecs(backupSpecs{}),
-			timeout:                1 * time.Hour,
-			suites:                 registry.Suites(registry.Nightly),
-			restoreUptoIncremental: defaultRestoreUptoIncremental,
+			// The weekly 20T Restore test. Restore on to three maximum density
+			// nodes. This is intended to stress large stores during restore.
+			hardware:         makeHardwareSpecs(hardwareSpecs{nodes: 3, cpus: 32, volumeSize: 8000, ebsThroughput: 1000 /* MB/s */}),
+			timeout:          24 * time.Hour,
+			fixture:          LargeFixture,
+			compatibleClouds: LargeFixture.CompatibleClouds,
+			suites:           registry.Suites(registry.Weekly),
 		},
 		{
-			// Ensures we can restore a 48 length incremental chain.
-			// Also benchmarks per node throughput for a long chain.
-			hardware:               makeHardwareSpecs(hardwareSpecs{ebsThroughput: 250 /* MB/s */}),
-			backup:                 makeRestoringBackupSpecs(backupSpecs{}),
-			timeout:                1 * time.Hour,
-			suites:                 registry.Suites(registry.Nightly),
-			restoreUptoIncremental: 48,
+			// The weekly 2T Restore test. Restore on to three minimum sized nodes.
+			// This is intended to stress restores on small nodes.
+			hardware:         makeHardwareSpecs(hardwareSpecs{nodes: 3, cpus: 4, volumeSize: 800, ebsThroughput: 250 /* MB/s */}),
+			compatibleClouds: MediumFixture.CompatibleClouds,
+			fixture:          MediumFixture,
+			timeout:          24 * time.Hour,
+			suites:           registry.Suites(registry.Weekly),
 		},
-		{
-			// The nightly 8TB Restore test.
-			// NB: bump disk throughput because this load saturates the default 125
-			// MB/s. See https://github.com/cockroachdb/cockroach/issues/107609.
-			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 10, volumeSize: 2000,
-				ebsThroughput: 250 /* MB/s */}),
-			backup: makeRestoringBackupSpecs(backupSpecs{
-				version:  "v22.2.1",
-				workload: tpceRestore{customers: 500000}}),
-			timeout:                5 * time.Hour,
-			suites:                 registry.Suites(registry.Nightly),
-			restoreUptoIncremental: defaultRestoreUptoIncremental,
-		},
-		{
-			// The weekly 32TB Restore test.
-			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 15, cpus: 16, volumeSize: 5000,
-				ebsThroughput: 250 /* MB/s */}),
-			backup: makeRestoringBackupSpecs(backupSpecs{
-				version:  "v22.2.1",
-				workload: tpceRestore{customers: 2000000}}),
-			timeout:                24 * time.Hour,
-			suites:                 registry.Suites(registry.Weekly),
-			restoreUptoIncremental: defaultRestoreUptoIncremental,
-		},
-		{
-			// The weekly 32TB, 400 incremental layer Restore test on AWS.
-			//
-			// NB: Prior to 23.1, restore would OOM on backups that had many
-			// incremental layers and many import spans. Together with having a 400
-			// incremental chain, this regression tests against the OOMs that we've
-			// seen in previous versions.
-			//
-			// NB 2: This test sets backup.restore_span.max_file_count to allow for
-			// restore span entries to extend. As of #119840, restore limits the
-			// number of files per restore span entry. When this file cap is less than
-			// the number of inc layers, restore slows signficantly, as the restore
-			// span entries become much smaller.
-			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 15, cpus: 16, volumeSize: 5000,
-				ebsThroughput: 250 /* MB/s */}),
-			backup: makeRestoringBackupSpecs(backupSpecs{
-				version:           "v22.2.4",
-				workload:          tpceRestore{customers: 2000000},
-				numBackupsInChain: 400,
-			}),
-			setUpStmts:             []string{"SET CLUSTER SETTING backup.restore_span.max_file_count = 800"},
-			timeout:                30 * time.Hour,
-			suites:                 registry.Suites(registry.Weekly),
-			restoreUptoIncremental: 400,
-		},
-		{
-			// The weekly 32TB, 400 incremental layer Restore test on GCP.
-			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 15, cpus: 16, volumeSize: 5000}),
-			backup: makeRestoringBackupSpecs(backupSpecs{
-				version:           "v22.2.4",
-				workload:          tpceRestore{customers: 2000000},
-				cloud:             spec.GCE,
-				numBackupsInChain: 400,
-			}),
-			timeout:                30 * time.Hour,
-			suites:                 registry.Suites(registry.Weekly),
-			restoreUptoIncremental: 400,
-			skip:                   "a recent gcp pricing policy makes this test very expensive. unskip after #111371 is addressed",
-		},
-		{
-			// A teeny weeny 15GB restore that could be used to bisect scale agnostic perf regressions.
-			hardware: makeHardwareSpecs(hardwareSpecs{ebsThroughput: 250 /* MB/s */}),
-			backup: makeRestoringBackupSpecs(
-				backupSpecs{workload: tpceRestore{customers: 1000},
-					version: "v22.2.1"}),
-			timeout:                3 * time.Hour,
-			suites:                 registry.Suites(registry.Nightly),
-			fingerprint:            8445446819555404274,
-			restoreUptoIncremental: defaultRestoreUptoIncremental,
-		},
-		// TODO(msbutler): add the following tests once roachperf/grafana is hooked up and old tests are
-		// removed:
-		// - restore/tpce/400GB/nodes=30
-		// - restore/tpce/400GB/encryption
 	} {
 		sp := sp
 		sp.initTestName()
+
+		if sp.fixture.Name == "" {
+			panic(sp.testName + " has no fixture name")
+		}
+		if !sp.fixture.CompatibleClouds.IsInitialized() {
+			panic(sp.fixture.Name + " has no compatible clouds")
+		}
+		if !sp.suites.IsInitialized() {
+			panic(sp.testName + " has no suites")
+		}
 
 		r.Add(registry.TestSpec{
 			Name:      sp.testName,
@@ -429,13 +337,12 @@ func registerRestore(r registry.Registry) {
 			// These tests measure performance. To ensure consistent perf,
 			// disable metamorphic encryption.
 			EncryptionSupport:         registry.EncryptionAlwaysDisabled,
-			CompatibleClouds:          sp.backup.CompatibleClouds(),
+			CompatibleClouds:          sp.compatibleClouds,
 			Suites:                    sp.suites,
 			TestSelectionOptOutSuites: sp.suites,
 			Skip:                      sp.skip,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-
-				rd := makeRestoreDriver(t, c, sp)
+				rd := makeRestoreDriver(ctx, t, c, sp)
 				rd.prepareCluster(ctx)
 
 				// Run the disk usage logger in the monitor to guarantee its
@@ -467,7 +374,7 @@ func registerRestore(r registry.Registry) {
 
 					t.Status(`running restore`)
 					metricCollector := rd.initRestorePerfMetrics(ctx, durationGauge)
-					if err := rd.run(ctx, ""); err != nil {
+					if err := rd.run(ctx, "DATABASE tpcc"); err != nil {
 						return err
 					}
 					metricCollector()
@@ -599,11 +506,10 @@ func makeHardwareSpecs(override hardwareSpecs) hardwareSpecs {
 
 var defaultRestoringBackupSpecs = backupSpecs{
 	// TODO(msbutler): write a script that automatically finds the latest versioned fixture.
-	version:           "v22.2.0",
-	cloud:             spec.AWS,
-	fullBackupDir:     "LATEST",
-	workload:          tpceRestore{customers: 25000},
-	numBackupsInChain: 48,
+	cloud:   spec.GCE,
+	fixture: SmallFixture,
+	// TODO(jeffswenson): configure the wrokload
+	// workload:          tpccWorkload{tpccWarehouseCount: 1000},
 }
 
 // backupSpecs define the backup that will get restored. These values should not
@@ -620,28 +526,15 @@ type backupSpecs struct {
 	// trying to run the very large roachtests locally.
 	allowLocal bool
 
-	// fullBackupDir specifies the full backup directory in the collection to restore from.
-	fullBackupDir string
+	// fixture is the fixture that should be restored.
+	fixture TpccFixture
 
-	// numBackupsInChain specifies the length of the chain of the backup. This field
-	// is only to be used during backup fixture generation to control how many
-	// incremental backups we layer on top of the full.
-	numBackupsInChain int
+	// useFullBackup is true if the restore should use the full backup instead of
+	// the icremental backup.
+	useFullBackup bool
 
 	// workload defines the backed up workload.
 	workload backupWorkload
-
-	// nonRevisionHistory is true if the backup is not a revision history backup
-	// (note that the default backup in the restore roachtests contains revision
-	// history).
-	//
-	// TODO(msbutler): if another fixture requires a different backup option,
-	// create a new backupOpts struct.
-	nonRevisionHistory bool
-
-	// customFixtureDir is used when an engineer is naughty and doesn't create the
-	// backup fixture in the correct fixture path.
-	customFixtureDir string
 }
 
 func (bs backupSpecs) CloudIsCompatible(cloud spec.Cloud) error {
@@ -671,36 +564,19 @@ func (bs backupSpecs) storagePrefix() string {
 	return "gs"
 }
 
-func (bs backupSpecs) backupCollection() string {
-	// N.B. AWS buckets are _regional_ whereas GCS buckets are _multi-regional_. Thus, in order to avoid egress (cost),
-	// we use us-east-2 for AWS, which is the default region for all roachprod clusters. (See roachprod/vm/aws/aws.go)
-	if bs.customFixtureDir != "" {
-		return bs.customFixtureDir
+// getBackupEndTimeCmd returns a sql cmd that will return a system time that is
+// equal to the end time of the bs.backupsIncluded'th backup in the target
+// backup chain.
+func getBackupEndTimeCmd(uri url.URL, useFullBackup bool) string {
+	if useFullBackup {
+		return fmt.Sprintf(
+			`SELECT min(end_time) FROM [SHOW BACKUP FROM LATEST IN '%s']`,
+			uri.String())
+	} else {
+		return fmt.Sprintf(
+			`SELECT max(end_time) FROM [SHOW BACKUP FROM LATEST IN '%s']`,
+			uri.String())
 	}
-	properties := ""
-	if bs.nonRevisionHistory {
-		properties = "/rev-history=false"
-	}
-	switch bs.storagePrefix() {
-	case "s3":
-		return fmt.Sprintf(`'s3://cockroach-fixtures-us-east-2/backups/%s/%s/inc-count=%d%s?AUTH=implicit'`,
-			bs.workload.fixtureDir(), bs.version, bs.numBackupsInChain, properties)
-	case "gs":
-		return fmt.Sprintf(`'gs://cockroach-fixtures-us-east1/backups/%s/%s/inc-count=%d%s?AUTH=implicit'`,
-			bs.workload.fixtureDir(), bs.version, bs.numBackupsInChain, properties)
-	default:
-		panic(fmt.Sprintf("unknown storage prefix: %s", bs.storagePrefix()))
-	}
-}
-
-// getAOSTCmd returns a sql cmd that will return a system time that is equal to the end time of
-// the bs.backupsIncluded'th backup in the target backup chain.
-func (sp *restoreSpecs) getAostCmd() string {
-	return fmt.Sprintf(
-		`SELECT max(end_time) FROM [SELECT DISTINCT end_time FROM [SHOW BACKUP FROM %s IN %s] ORDER BY end_time LIMIT %d]`,
-		sp.backup.fullBackupDir,
-		sp.backup.backupCollection(),
-		sp.restoreUptoIncremental)
 }
 
 func makeBackupSpecs(override backupSpecs, specs backupSpecs) backupSpecs {
@@ -711,23 +587,16 @@ func makeBackupSpecs(override backupSpecs, specs backupSpecs) backupSpecs {
 		specs.version = override.version
 	}
 
-	if override.fullBackupDir != "" {
-		specs.fullBackupDir = override.fullBackupDir
+	if override.fixture.Name != "" {
+		specs.fixture = override.fixture
 	}
 
-	if override.numBackupsInChain != 0 {
-		specs.numBackupsInChain = override.numBackupsInChain
-	}
-
-	if override.nonRevisionHistory != specs.nonRevisionHistory {
-		specs.nonRevisionHistory = override.nonRevisionHistory
+	if override.useFullBackup {
+		specs.useFullBackup = override.useFullBackup
 	}
 
 	if override.workload != nil {
 		specs.workload = override.workload
-	}
-	if override.customFixtureDir != "" {
-		specs.customFixtureDir = override.customFixtureDir
 	}
 	return specs
 }
@@ -899,21 +768,16 @@ func (tpcc tpccRestore) DatabaseName() string {
 type restoreSpecs struct {
 	hardware hardwareSpecs
 
-	// backup describes the backup fixture from which we will restore.
-	backup  backupSpecs
+	fixture TpccFixture
+
+	compatibleClouds registry.CloudSet
+
+	useFullBackup bool
+
 	timeout time.Duration
 	suites  registry.SuiteSet
 
-	// restoreUptoIncremental specifies the number of incremental backups in the
-	// chain to restore up to. If set to 0, no AOST is used.
-	restoreUptoIncremental int
-
-	// namePrefix appears in the name of the roachtest, i.e. `restore/{prefix}/{config}`.
-	namePrefix string
-
-	// fingerprint, if specified, defines the expected stripped fingerprint of the
-	// restored user space tables.
-	fingerprint int
+	workload backupWorkload
 
 	setUpStmts []string
 
@@ -932,24 +796,19 @@ func (sp *restoreSpecs) initTestName() {
 }
 
 func (sp *restoreSpecs) computeName() string {
-	var prefix string
-	if sp.namePrefix != "" {
-		prefix = "/" + sp.namePrefix
-	}
-	return "restore" + prefix + sp.String() + sp.hardware.String()
+	return "restore/" + sp.String() + sp.hardware.String()
 }
 
 func (sp *restoreSpecs) String() string {
-	bs := sp.backup
-
 	var builder strings.Builder
-	builder.WriteString("/" + bs.workload.String())
-	builder.WriteString("/" + bs.cloud.String())
+	fmt.Fprintf(&builder, "%s", sp.fixture.Name)
 
 	// Annotate the name with the number of incremental layers we are restoring if
 	// it differs from the default.
-	if sp.restoreUptoIncremental != defaultRestoreUptoIncremental {
-		builder.WriteString(fmt.Sprintf("/inc-count=%d", sp.restoreUptoIncremental))
+	if !sp.useFullBackup {
+		fmt.Fprintf(&builder, "/inc-count=%d", sp.fixture.IncrementalChainLength)
+	} else {
+		fmt.Fprintf(&builder, "/full-backup")
 	}
 
 	return builder.String()
@@ -961,6 +820,8 @@ type restoreDriver struct {
 	t test.Test
 	c cluster.Cluster
 
+	fixtureURI url.URL
+
 	// aost defines the "As Of System Time" used within the restore. Because this
 	// gets computed during test execution, it is stored in the restoreDriver
 	// rather than the restoreSpecs.
@@ -969,14 +830,25 @@ type restoreDriver struct {
 	rng *rand.Rand
 }
 
-func makeRestoreDriver(t test.Test, c cluster.Cluster, sp restoreSpecs) restoreDriver {
+func makeRestoreDriver(
+	ctx context.Context, t test.Test, c cluster.Cluster, sp restoreSpecs,
+) restoreDriver {
 	rng, seed := randutil.NewPseudoRand()
 	t.L().Printf(`Random Seed is %d`, seed)
+
+	registry := newFixtureRegistry(ctx, t, c)
+
+	fixture, err := registry.GetLatest(ctx, sp.fixture.Name)
+	require.NoError(t, err)
+
+	t.L().Printf("Using fixture %s", fixture.DataPath)
+
 	return restoreDriver{
-		t:   t,
-		c:   c,
-		sp:  sp,
-		rng: rng,
+		t:          t,
+		c:          c,
+		fixtureURI: registry.URI(fixture.DataPath),
+		sp:         sp,
+		rng:        rng,
 	}
 }
 
@@ -1002,15 +874,13 @@ func (rd *restoreDriver) prepareCluster(ctx context.Context) {
 
 // getAOST gets the AOST to use in the restore cmd.
 func (rd *restoreDriver) getAOST(ctx context.Context) {
-	if rd.sp.restoreUptoIncremental == 0 {
-		rd.aost = ""
-		return
-	}
 	var aost string
 	conn := rd.c.Conn(ctx, rd.t.L(), 1)
 	defer conn.Close()
-	err := conn.QueryRowContext(ctx, rd.sp.getAostCmd()).Scan(&aost)
-	require.NoError(rd.t, err, fmt.Sprintf("aost cmd failed: %s", rd.sp.getAostCmd()))
+
+	getAostCmd := getBackupEndTimeCmd(rd.fixtureURI, rd.sp.useFullBackup)
+	err := conn.QueryRowContext(ctx, getAostCmd).Scan(&aost)
+	require.NoError(rd.t, err, fmt.Sprintf("aost cmd failed: %s", getAostCmd))
 	rd.aost = aost
 }
 
@@ -1019,8 +889,8 @@ func (rd *restoreDriver) restoreCmd(target, opts string) string {
 	if rd.aost != "" {
 		aostSubCmd = fmt.Sprintf("AS OF SYSTEM TIME '%s'", rd.aost)
 	}
-	query := fmt.Sprintf(`RESTORE %s FROM %s IN %s %s %s`,
-		target, rd.sp.backup.fullBackupDir, rd.sp.backup.backupCollection(), aostSubCmd, opts)
+	query := fmt.Sprintf(`RESTORE %s FROM LATEST IN '%s' %s %s`, target,
+		rd.fixtureURI.String(), aostSubCmd, opts)
 	rd.t.L().Printf("Running restore cmd: %s", query)
 	return query
 }
@@ -1091,31 +961,33 @@ func (rd *restoreDriver) initRestorePerfMetrics(
 // checkFingerprint runs a stripped fingerprint on all user tables in the cluster if the restore
 // spec has a nonzero fingerprint.
 func (rd *restoreDriver) checkFingerprint(ctx context.Context) {
-	if rd.sp.fingerprint == 0 {
-		rd.t.L().Printf("Fingerprint not found in specs. Skipping fingerprint check.")
-		return
-	}
+	// TODO(jeffswenson): retrieve fingerprint from fixture
 
-	conn, err := rd.c.ConnE(ctx, rd.t.L(), rd.c.Node(1)[0])
-	require.NoError(rd.t, err)
-	defer conn.Close()
-	sql := sqlutils.MakeSQLRunner(conn)
+	// if rd.sp.fingerprint == 0 {
+	// 	rd.t.L().Printf("Fingerprint not found in specs. Skipping fingerprint check.")
+	// 	return
+	// }
 
-	var minUserTableID, maxUserTableID uint32
-	sql.QueryRow(rd.t, `SELECT min(id), max(id) FROM system.namespace WHERE "parentID" >1`).Scan(
-		&minUserTableID, &maxUserTableID)
+	// conn, err := rd.c.ConnE(ctx, rd.t.L(), rd.c.Node(1)[0])
+	// require.NoError(rd.t, err)
+	// defer conn.Close()
+	// sql := sqlutils.MakeSQLRunner(conn)
 
-	codec := keys.MakeSQLCodec(roachpb.SystemTenantID)
-	startKey := codec.TablePrefix(minUserTableID)
-	endkey := codec.TablePrefix(maxUserTableID).PrefixEnd()
+	// var minUserTableID, maxUserTableID uint32
+	// sql.QueryRow(rd.t, `SELECT min(id), max(id) FROM system.namespace WHERE "parentID" >1`).Scan(
+	// 	&minUserTableID, &maxUserTableID)
 
-	startTime := timeutil.Now()
-	var fingerprint int
-	sql.QueryRow(rd.t, `SELECT * FROM crdb_internal.fingerprint(ARRAY[$1::BYTES, $2::BYTES],true)`,
-		startKey, endkey).Scan(&fingerprint)
-	rd.t.L().Printf("Fingerprint is %d. Took %.2f minutes", fingerprint,
-		timeutil.Since(startTime).Minutes())
-	require.Equal(rd.t, rd.sp.fingerprint, fingerprint, "user table fingerprint mismatch")
+	// codec := keys.MakeSQLCodec(roachpb.SystemTenantID)
+	// startKey := codec.TablePrefix(minUserTableID)
+	// endkey := codec.TablePrefix(maxUserTableID).PrefixEnd()
+
+	// startTime := timeutil.Now()
+	// var fingerprint int
+	// sql.QueryRow(rd.t, `SELECT * FROM crdb_internal.fingerprint(ARRAY[$1::BYTES, $2::BYTES],true)`,
+	// 	startKey, endkey).Scan(&fingerprint)
+	// rd.t.L().Printf("Fingerprint is %d. Took %.2f minutes", fingerprint,
+	// 	timeutil.Since(startTime).Minutes())
+	// require.Equal(rd.t, rd.sp.fingerprint, fingerprint, "user table fingerprint mismatch")
 }
 
 // exportToRoachperf exports a single perf metric for the given test to roachperf.

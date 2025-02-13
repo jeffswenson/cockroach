@@ -65,49 +65,46 @@ func registerOnlineRestorePerf(r registry.Registry) {
 	// latency relative to online restore (prefix restore/control/*).
 	for _, sp := range []onlineRestoreSpecs{
 		{
-			// 400GB tpce Online Restore
-			restoreSpecs: restoreSpecs{
-				hardware:               makeHardwareSpecs(hardwareSpecs{ebsThroughput: 1000 /* MB/s */, workloadNode: true}),
-				backup:                 makeRestoringBackupSpecs(backupSpecs{nonRevisionHistory: true, version: fixtureFromMasterVersion, numBackupsInChain: 5}),
-				timeout:                1 * time.Hour,
-				suites:                 registry.Suites(registry.Nightly),
-				restoreUptoIncremental: 1,
-				skip:                   "fails because of #118283",
-			},
-		},
-		{
 			// 350 GB tpcc Online Restore
 			restoreSpecs: restoreSpecs{
-				hardware: makeHardwareSpecs(hardwareSpecs{workloadNode: true}),
-				backup: makeRestoringBackupSpecs(backupSpecs{
-					nonRevisionHistory: true,
-					cloud:              spec.GCE,
-					version:            "24.1",
-					workload:           tpccRestore{tpccRestoreOptions{warehouses: 5000, waitFraction: 0, workers: 100, maxRate: 300}},
-					customFixtureDir:   `'gs://cockroach-fixtures-us-east1/backups/tpc-c/v24.1/db/warehouses=5k?AUTH=implicit'`}),
-				timeout:                1 * time.Hour,
-				suites:                 registry.Suites(registry.Nightly),
-				restoreUptoIncremental: 0,
+				hardware:         makeHardwareSpecs(hardwareSpecs{workloadNode: true}),
+				workload:         tpccRestore{tpccRestoreOptions{warehouses: 1, waitFraction: 0, workers: 1, maxRate: 3}},
+				timeout:          1 * time.Hour,
+				suites:           registry.Suites(registry.Nightly),
+				fixture:          TinyFixture,
+				compatibleClouds: registry.Clouds(spec.Local),
+				useFullBackup:    true,
 			},
 			linkPhaseTimeout:     30 * time.Second, // typically takes 15 seconds
 			downloadPhaseTimeout: 20 * time.Minute, // typically takes 10 minutes. Should get faster once we address #124767.
 		},
 		{
-			// 8.5TB tpcc Online Restore
+			// 350 GB tpcc Online Restore
 			restoreSpecs: restoreSpecs{
-				hardware: makeHardwareSpecs(hardwareSpecs{nodes: 10, volumeSize: 1500, workloadNode: true}),
-				backup: makeRestoringBackupSpecs(backupSpecs{
-					nonRevisionHistory: true,
-					cloud:              spec.GCE,
-					version:            "24.1",
-					workload:           tpccRestore{tpccRestoreOptions{warehouses: 150000, waitFraction: 0, workers: 100, maxRate: 1000}},
-					customFixtureDir:   `'gs://cockroach-fixtures-us-east1/backups/tpc-c/v24.1/db/warehouses=150k?AUTH=implicit'`}),
-				timeout:                3 * time.Hour,
-				suites:                 registry.Suites(registry.Nightly),
-				restoreUptoIncremental: 0,
+				hardware:         makeHardwareSpecs(hardwareSpecs{workloadNode: true}),
+				workload:         tpccRestore{tpccRestoreOptions{warehouses: 5000, waitFraction: 0, workers: 100, maxRate: 300}},
+				timeout:          1 * time.Hour,
+				suites:           registry.Suites(registry.Nightly),
+				fixture:          SmallFixture,
+				compatibleClouds: registry.Clouds(spec.GCE),
+				useFullBackup:    true,
+			},
+			linkPhaseTimeout:     30 * time.Second, // typically takes 15 seconds
+			downloadPhaseTimeout: 20 * time.Minute, // typically takes 10 minutes. Should get faster once we address #124767.
+		},
+		{
+			// 20Tib tpcc Online Restore
+			restoreSpecs: restoreSpecs{
+				hardware:         makeHardwareSpecs(hardwareSpecs{nodes: 10, volumeSize: 2500, workloadNode: true}),
+				workload:         tpccRestore{tpccRestoreOptions{warehouses: 150000, waitFraction: 0, workers: 100, maxRate: 1000}},
+				timeout:          1 * time.Hour,
+				suites:           registry.Suites(registry.Weekly),
+				fixture:          LargeFixture,
+				compatibleClouds: registry.Clouds(spec.GCE),
+				useFullBackup:    true,
 			},
 			linkPhaseTimeout:     10 * time.Minute, // typically takes 5 minutes
-			downloadPhaseTimeout: 4 * time.Hour,    // typically takes 2 hours. Should get faster once we address #124767.
+			downloadPhaseTimeout: 6 * time.Hour,    // typically takes 2 hours. Should get faster once we address #124767.
 		},
 	} {
 		for _, runOnline := range []bool{true, false} {
@@ -118,20 +115,17 @@ func registerOnlineRestorePerf(r registry.Registry) {
 					runWorkload := runWorkload
 					useWorkarounds := useWorkarounds
 
-					if runOnline {
-						sp.namePrefix = "online/"
-					} else {
-						sp.namePrefix = "offline/"
+					nameSuffix := fmt.Sprintf("/workload=%t/online=%t", runWorkload, runOnline)
+					if !runOnline {
 						sp.skip = "used for ad hoc experiments"
 					}
 					if !runWorkload {
 						sp.skip = "used for ad hoc experiments"
 					}
 
-					sp.namePrefix = sp.namePrefix + fmt.Sprintf("workload=%t", runWorkload)
 					if !useWorkarounds {
 						sp.skip = "used for ad hoc experiments"
-						sp.namePrefix = sp.namePrefix + fmt.Sprintf("/workarounds=%t", useWorkarounds)
+						nameSuffix += fmt.Sprintf("/workarounds=%t", useWorkarounds)
 					}
 
 					if sp.skip == "" && !backuptestutils.IsOnlineRestoreSupported() {
@@ -140,7 +134,7 @@ func registerOnlineRestorePerf(r registry.Registry) {
 
 					sp.initTestName()
 					r.Add(registry.TestSpec{
-						Name:      sp.testName,
+						Name:      sp.testName + nameSuffix,
 						Owner:     registry.OwnerDisasterRecovery,
 						Benchmark: true,
 						Cluster:   sp.hardware.makeClusterSpecs(r),
@@ -148,14 +142,14 @@ func registerOnlineRestorePerf(r registry.Registry) {
 						// These tests measure performance. To ensure consistent perf,
 						// disable metamorphic encryption.
 						EncryptionSupport:         registry.EncryptionAlwaysDisabled,
-						CompatibleClouds:          sp.backup.CompatibleClouds(),
+						CompatibleClouds:          sp.fixture.CompatibleClouds,
 						Suites:                    sp.suites,
 						TestSelectionOptOutSuites: sp.suites,
 						Skip:                      sp.skip,
 						// Takes 10 minutes on OR tests for some reason.
 						SkipPostValidations: registry.PostValidationReplicaDivergence,
 						Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-							rd := makeRestoreDriver(t, c, sp.restoreSpecs)
+							rd := makeRestoreDriver(ctx, t, c, sp.restoreSpecs)
 							rd.prepareCluster(ctx)
 
 							restoreStats := runRestore(ctx, t, c, sp, rd, runOnline, runWorkload, useWorkarounds)
@@ -164,7 +158,7 @@ func registerOnlineRestorePerf(r registry.Registry) {
 									ctx,
 									c,
 									t.L(),
-									sp.backup.workload.DatabaseName(),
+									"tpcc",
 									restoreStats.downloadEndTimeLowerBound,
 								))
 							}
@@ -208,25 +202,22 @@ func maybeAddSomeEmptyTables(ctx context.Context, rd restoreDriver) error {
 func registerOnlineRestoreCorrectness(r registry.Registry) {
 	sp := onlineRestoreSpecs{
 		restoreSpecs: restoreSpecs{
-			hardware: makeHardwareSpecs(hardwareSpecs{workloadNode: true}),
-			backup: makeRestoringBackupSpecs(backupSpecs{
-				nonRevisionHistory: true,
-				version:            fixtureFromMasterVersion,
-				workload:           tpccRestore{opts: tpccRestoreOptions{warehouses: 10, workers: 1, waitFraction: 0, maxOps: 1000}}}),
-			timeout:                15 * time.Minute,
-			suites:                 registry.Suites(registry.Nightly),
-			restoreUptoIncremental: 1,
-			namePrefix:             "online/correctness",
-			skip:                   "skip for now - flaky",
+			hardware:      makeHardwareSpecs(hardwareSpecs{workloadNode: true}),
+			fixture:       TinyFixture,
+			workload:      tpccRestore{opts: tpccRestoreOptions{warehouses: 10, workers: 1, waitFraction: 0, maxOps: 1000}},
+			timeout:       15 * time.Minute,
+			suites:        registry.Suites(registry.Nightly),
+			useFullBackup: true,
+			skip:          "skip for now - flaky",
 		}}
 	sp.initTestName()
 	r.Add(
 		registry.TestSpec{
-			Name:                      sp.testName,
+			Name:                      sp.testName + "/online",
 			Owner:                     registry.OwnerDisasterRecovery,
 			Cluster:                   sp.hardware.makeClusterSpecs(r),
 			Timeout:                   sp.timeout,
-			CompatibleClouds:          sp.backup.CompatibleClouds(),
+			CompatibleClouds:          sp.fixture.CompatibleClouds,
 			Suites:                    sp.suites,
 			TestSelectionOptOutSuites: sp.suites,
 			SkipPostValidations:       registry.PostValidationReplicaDivergence,
@@ -241,7 +232,7 @@ func registerOnlineRestoreCorrectness(r registry.Registry) {
 					t, sp, defaultSeed, defaultFakeTime, "-online.trace",
 				)
 
-				rd := makeRestoreDriver(t, c, sp.restoreSpecs)
+				rd := makeRestoreDriver(ctx, t, c, sp.restoreSpecs)
 				rd.prepareCluster(ctx)
 
 				runRestore(
@@ -485,7 +476,7 @@ func initCorrectnessRestoreSpecs(
 	t test.Test, baseSp onlineRestoreSpecs, seed uint64, fakeTime uint32, traceSuffix string,
 ) (onlineRestoreSpecs, tpccRestore) {
 	t.Helper()
-	tpccWorkload, ok := baseSp.backup.workload.(tpccRestore)
+	tpccWorkload, ok := baseSp.workload.(tpccRestore)
 	if !ok {
 		require.Fail(t, "only tpcc workloads are supported for correctness testing")
 	}
@@ -497,7 +488,7 @@ func initCorrectnessRestoreSpecs(
 	if tpccWorkload.opts.fakeTime == 0 {
 		tpccWorkload.opts.fakeTime = fakeTime
 	}
-	baseSp.backup.workload = tpccWorkload
+	baseSp.workload = tpccWorkload
 	return baseSp, tpccWorkload
 }
 
@@ -578,7 +569,7 @@ func runRestore(
 			defer timer.Stop()
 		}
 
-		restoreCmd := rd.restoreCmd(fmt.Sprintf("DATABASE %s", sp.backup.workload.DatabaseName()), opts)
+		restoreCmd := rd.restoreCmd(fmt.Sprintf("DATABASE %s", sp.workload.DatabaseName()), opts)
 		t.L().Printf("Running %s", restoreCmd)
 		if _, err = db.ExecContext(ctx, restoreCmd); err != nil {
 			return err
@@ -601,7 +592,7 @@ func runRestore(
 			return nil
 		}
 		workloadStartTime = timeutil.Now()
-		err := sp.backup.workload.run(ctx, t, c, sp.hardware)
+		err := sp.workload.run(ctx, t, c, sp.hardware)
 		// We expect the workload to return a context cancelled error because
 		// the roachtest driver cancels the monitor's context after the download job completes
 		if err != nil && ctx.Err() == nil {
