@@ -125,6 +125,9 @@ message ProcessorCoreUnion {
   optional LogicalReplicationOfflineScanSpec logicalReplicationOfflineScan = 46;
   optional VectorSearchSpec vectorSearch = 47;
   optional VectorMutationSearchSpec vectorMutationSearch = 48;
+  optional BulkMergeSpec bulkMerge = 49;
+  optional MergeCoordinatorSpec mergeCoordinator = 50;
+  optional MergeLoopbackSpec mergeLoopback = 51;
 
   reserved 6, 12, 14, 17, 18, 19, 20, 32;
   // NEXT ID: 49.
