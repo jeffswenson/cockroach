@@ -141,7 +141,7 @@ func testMergeProcessors(t *testing.T, s serverutils.ApplicationLayerInterface) 
 	defer cleanup()
 
 	bulksst.BatchKeyCount.Override(ctx, &s.ClusterSettings().SV, 1)
-	fileAllocator := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri)
+	fileAllocator := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri, s.ClusterSettings())
 	batcher := bulksst.NewUnsortedSSTBatcher(s.ClusterSettings(), fileAllocator)
 	writeSSTs(t, ctx, batcher, 11)
 	ssts := importToMerge(fileAllocator.GetFileList())

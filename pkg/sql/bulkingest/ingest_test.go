@@ -85,7 +85,7 @@ func writeSST(
 	// Create a settings object for the SST writer.
 	settings := cluster.MakeTestingClusterSettings()
 
-	allocator := bulksst.NewExternalFileAllocator(nodeStorage, nodeURI)
+	allocator := bulksst.NewExternalFileAllocator(nodeStorage, nodeURI, settings)
 
 	// Define a file allocator function.
 

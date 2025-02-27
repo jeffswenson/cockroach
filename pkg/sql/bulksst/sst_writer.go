@@ -116,7 +116,7 @@ func (s *Writer) flushBuffer(ctx context.Context) error {
 		return s.kv[i].Key.Compare(s.kv[j].Key) < 0
 	})
 	// Pick a random key to sample.
-	rowSample := s.kv[s.rowPicker.Intn(len(s.kv))].Key
+	rowSample := s.kv[s.rowPicker.Intn(len(s.kv))].Key.Clone()
 	start := s.kv[0].Key.Clone()
 	end := s.kv[len(s.kv)-1].Key.Next().Clone()
 	span := roachpb.Span{Key: start.Key, EndKey: end.Key}

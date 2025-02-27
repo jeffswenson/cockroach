@@ -8,6 +8,8 @@ package bulksst_test
 import (
 	"context"
 	"fmt"
+	math "math"
+	"sort"
 	"strings"
 	"testing"
 
@@ -40,28 +42,71 @@ func TestBulkSSTWriter(t *testing.T) {
 	const writePath = "test_gsst"
 	fs := s.StorageLayer().Engines()[0].Env()
 
-	fileAllocator := bulksst.NewVFSFileAllocator(writePath, fs)
-	// Create a new batcher
+	fileAllocator := bulksst.NewVFSFileAllocator(writePath, fs, s.ClusterSettings())
+	// Limit the size of individual SSTs to 1KB.
 	bulksst.BatchSize.Override(ctx, &s.ClusterSettings().SV, 1024)
+	// Limit the size of the row samples to be only 1KB.
+	bulksst.MaxRowSampleBytes.Override(ctx, &s.ClusterSettings().SV, 1024)
+	// Create a new batcher
 	batcher := bulksst.NewUnsortedSSTBatcher(s.ClusterSettings(), fileAllocator)
 
 	// Intentionally go in an unsorted order.
 	expectedSet := intsets.MakeFast()
+	var maxKey roachpb.Key
+	var minKey roachpb.Key
 	for i := 8192; i > 0; i-- {
+		key := roachpb.Key(encodeKey(fmt.Sprintf("key-%d", i)))
+		// Track the min and max across all SST files.
+		if len(minKey) == 0 || key.Compare(minKey) < 0 {
+			minKey = key
+		}
+		if len(maxKey) == 0 || key.Compare(maxKey) > 0 {
+			maxKey = key
+		}
 		require.NoError(t, batcher.AddMVCCKey(ctx, storage.MVCCKey{
 			Timestamp: s.Clock().Now(),
-			Key:       encodeKey(fmt.Sprintf("key-%d", i)),
+			Key:       key,
 		},
 			[]byte(fmt.Sprintf("value-%d", i))))
 		expectedSet.Add(i)
 	}
+	totalSpan := roachpb.Span{Key: minKey, EndKey: maxKey.Next()}
 	require.NoError(t, batcher.CloseWithError(ctx))
 
 	// Next validate each SST file.
 	set := intsets.MakeFast()
 	lastFileMin := -1
 	sstFiles := fileAllocator.GetFileList()
-	for idx, sstInfo := range sstFiles.SST {
+	// Sort the row samples and get spans for all the splits. We will use
+	// these spans to determine which SST file a given key belongs to.
+	sort.Slice(sstFiles.RowSamples, func(i, j int) bool {
+		return roachpb.Key(sstFiles.RowSamples[i]).Compare(roachpb.Key(sstFiles.RowSamples[j])) < 0
+	})
+	rowSampleSpans := make([]roachpb.Span, len(sstFiles.RowSamples)+1)
+	lastKey := roachpb.KeyMin
+	spanIndex := 0
+	for i, rowSample := range sstFiles.RowSamples {
+		require.True(t, totalSpan.ContainsKey(roachpb.Key(rowSample)))
+		rowSampleSpans[spanIndex] = roachpb.Span{Key: lastKey, EndKey: roachpb.Key(rowSample).Next()}
+		require.True(t, rowSampleSpans[spanIndex].Valid())
+		if i == len(sstFiles.RowSamples)-1 {
+			rowSampleSpans[spanIndex+1] = roachpb.Span{Key: roachpb.Key(rowSample), EndKey: roachpb.KeyMax}
+			require.True(t, rowSampleSpans[spanIndex+1].Valid())
+		}
+		lastKey = roachpb.Key(rowSample)
+		spanIndex += 1
+	}
+	splitFromKey := func(key roachpb.Key) int {
+		for i, rowSampleSpan := range rowSampleSpans {
+			if rowSampleSpan.ContainsKey(key) {
+				return i
+			}
+		}
+		require.Failf(t, "key not found in any row sample span", "key: %v, row sample spans: %v\n", key, rowSampleSpans)
+		return -1
+	}
+	sstSizePerSplit := make([]int, len(sstFiles.RowSamples)+1)
+	for _, sstInfo := range sstFiles.SST {
 		currFileMin := -1
 		currFileMax := -1
 		values := readKeyValuesFromSST(t, fs, sstInfo.URI)
@@ -81,14 +126,8 @@ func TestBulkSSTWriter(t *testing.T) {
 			if currFileMax == -1 || currFileMax < num {
 				currFileMax = num
 			}
+			sstSizePerSplit[splitFromKey(value.Key.Key)] += len(value.Value) + len(value.Key.Key)
 		}
-		// Validate the row sample is within the span of the SST file.
-		fileSpan := roachpb.Span{
-			Key:    roachpb.Key(sstInfo.StartKey),
-			EndKey: roachpb.Key(sstInfo.EndKey).Next(),
-		}
-		require.True(t, fileSpan.ContainsKey(roachpb.Key(sstFiles.RowSamples[idx])),
-			"row sample key should be within the span of the SST files span: %v, row sample: %v", fileSpan, sstFiles.RowSamples[idx])
 		// Ensure continuity between SSTs, where the minimum on the
 		// previous file should continue to this file.
 		if lastFileMin > 0 {
@@ -96,12 +135,59 @@ func TestBulkSSTWriter(t *testing.T) {
 		}
 		lastFileMin = currFileMin
 	}
+	// Validate the distribution of the SST splits.
+	validateSSTDistribution(t, sstSizePerSplit)
 	// Ensure we have all the inserted key / values.
 	require.Equal(t, 8192, set.Len())
-	require.Greaterf(t, len(fileAllocator.GetFileList().SST), 100, "expected multiple files")
 	require.Zero(t, expectedSet.Difference(set).Len())
 }
 
+// validateSSTDistribution validates that the split points end up being
+// normally distributed.
+func validateSSTDistribution(t *testing.T, sstSizePerSplit []int) {
+	// Validate that the distribution of SST sizes in this scenario.
+	sort.Ints(sstSizePerSplit)
+	averageSstSizePerSplit := 0
+	for _, size := range sstSizePerSplit {
+		averageSstSizePerSplit += size
+	}
+	averageSstSizePerSplit /= len(sstSizePerSplit)
+	// Calculate standard deviation
+	variance := 0.0
+	for _, size := range sstSizePerSplit {
+		diff := float64(size - averageSstSizePerSplit)
+		variance += diff * diff
+	}
+	variance /= float64(len(sstSizePerSplit))
+	stdDev := math.Sqrt(variance)
+	// Check if data follows the empirical rule for normal distribution
+	// Count data points within 1, 2, and 3 standard deviations
+	oneStdCount, twoStdCount, threeStdCount := 0, 0, 0
+	for _, size := range sstSizePerSplit {
+		diff := math.Abs(float64(size - averageSstSizePerSplit))
+		if diff <= stdDev {
+			oneStdCount++
+		}
+		if diff <= 2*stdDev {
+			twoStdCount++
+		}
+		if diff <= 3*stdDev {
+			threeStdCount++
+		}
+	}
+	// For normal distribution:
+	// ~68% of data should be within 1 standard deviation
+	// ~95% within 2 standard deviations
+	// ~99.7% within 3 standard deviations
+	totalCount := float64(len(sstSizePerSplit))
+	oneStdPct := float64(oneStdCount) / totalCount
+	twoStdPct := float64(twoStdCount) / totalCount
+	threeStdPct := float64(threeStdCount) / totalCount
+	// Allow for some deviation from perfect normal distribution
+	require.InDelta(t, 0.68, oneStdPct, 0.5, "~68%% of data should be within 1 standard deviation")
+	require.InDelta(t, 0.95, twoStdPct, 0.25, "~95%% of data should be within 2 standard deviations")
+	require.InDelta(t, 0.997, threeStdPct, 0.125, "~99.7%% of data should be within 3 standard deviations")
+}
 func readKeyValuesFromSST(t *testing.T, fs vfs.FS, filename string) []storage.MVCCKeyValue {
 	file, err := fs.Open(filename, nil)
 	require.NoError(t, err)

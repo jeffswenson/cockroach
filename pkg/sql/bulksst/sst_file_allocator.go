@@ -8,12 +8,23 @@ package bulksst
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/vfs"
+)
+
+var MaxRowSampleBytes = settings.RegisterByteSizeSetting(
+	settings.ApplicationLevel,
+	"bulkio.max_row_sample_bytes",
+	"maximum size in bytes of row samples to keep for bulk ingestion",
+	10*1024*1024, // 10MB
 )
 
 // FileAllocator is used to allocate new files for SSTs ingested via the Writer.
@@ -29,12 +40,22 @@ type FileAllocator interface {
 
 // fileAllocatorBase helps track metadata for created SST files.
 type fileAllocatorBase struct {
-	fileInfo SSTFiles
+	fileInfo       SSTFiles
+	rowSampleBytes int64
+	rand           *rand.Rand
+	settings       *cluster.Settings
 }
 
 // GetFileList gets all the files created by this file allocator.
 func (f *fileAllocatorBase) GetFileList() *SSTFiles {
 	return &f.fileInfo
+}
+
+func NewFileAllocatorBase(st *cluster.Settings) fileAllocatorBase {
+	return fileAllocatorBase{
+		rand:     rand.New(rand.NewSource(time.Now().UnixNano())),
+		settings: st,
+	}
 }
 
 // addFile helps track metadata for created SST files.
@@ -48,8 +69,28 @@ func (f *fileAllocatorBase) addFile(
 		FileSize: fileSize,
 	})
 	f.fileInfo.TotalSize += fileSize
-	// TODO(fqazi): Downsample this becomes too large.
 	f.fileInfo.RowSamples = append(f.fileInfo.RowSamples, string(rowSample))
+	f.rowSampleBytes += int64(len(rowSample))
+	f.maybeResampleRowSample()
+}
+
+// maybeResampleRowSample resamples the row sample if it becomes too large.
+func (f *fileAllocatorBase) maybeResampleRowSample() {
+	// If we haven't exceeded the limit, don't do anything.
+	if f.rowSampleBytes < MaxRowSampleBytes.Get(&f.settings.SV) {
+		return
+	}
+	// Shuffle the samples to randomly pick ones to discard.
+	f.rand.Shuffle(len(f.fileInfo.RowSamples), func(i, j int) {
+		f.fileInfo.RowSamples[i], f.fileInfo.RowSamples[j] = f.fileInfo.RowSamples[j], f.fileInfo.RowSamples[i]
+	})
+	// Disacrd 1 / 4th of the samples.
+	samplesToKeep := max((len(f.fileInfo.RowSamples)*3)/4, 1)
+	newRowSamples := f.fileInfo.RowSamples[:samplesToKeep]
+	for i := samplesToKeep; i < len(f.fileInfo.RowSamples); i++ {
+		f.rowSampleBytes -= int64(len(f.fileInfo.RowSamples[i]))
+	}
+	f.fileInfo.RowSamples = newRowSamples
 }
 
 // VFSFileAllocator allocates local files for storing SSTs.
@@ -60,11 +101,11 @@ type VFSFileAllocator struct {
 }
 
 // NewVFSFileAllocator creates a new file allocator with baseName and a VFS.
-func NewVFSFileAllocator(baseName string, storage vfs.FS) FileAllocator {
+func NewVFSFileAllocator(baseName string, storage vfs.FS, st *cluster.Settings) FileAllocator {
 	return &VFSFileAllocator{
 		baseName:          baseName,
 		storage:           storage,
-		fileAllocatorBase: fileAllocatorBase{},
+		fileAllocatorBase: NewFileAllocatorBase(st),
 	}
 }
 
@@ -89,11 +130,13 @@ type ExternalFileAllocator struct {
 	fileAllocatorBase
 }
 
-func NewExternalFileAllocator(es cloud.ExternalStorage, baseURI string) FileAllocator {
+func NewExternalFileAllocator(
+	es cloud.ExternalStorage, baseURI string, st *cluster.Settings,
+) FileAllocator {
 	return &ExternalFileAllocator{
 		es:                es,
 		baseURI:           baseURI,
-		fileAllocatorBase: fileAllocatorBase{},
+		fileAllocatorBase: NewFileAllocatorBase(st),
 	}
 }
 

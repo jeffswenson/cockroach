@@ -441,7 +441,7 @@ func ingestKvs(
 			return nil, nil, err
 		}
 		defer rowStorage.Close()
-		rowAllocator = bulksst.NewExternalFileAllocator(rowStorage, rowUri)
+		rowAllocator = bulksst.NewExternalFileAllocator(rowStorage, rowUri, flowCtx.Cfg.Settings)
 
 		indexUri := fmt.Sprintf("nodelocal://%d/import/%d/%s/", flowCtx.Cfg.NodeID.SQLInstanceID(), spec.JobID, indexAdderName)
 		indexStorage, err = flowCtx.Cfg.ExternalStorageFromURI(ctx, indexUri, spec.User())
@@ -449,7 +449,7 @@ func ingestKvs(
 			return nil, nil, err
 		}
 		defer indexStorage.Close()
-		indexAllocator = bulksst.NewExternalFileAllocator(indexStorage, indexUri)
+		indexAllocator = bulksst.NewExternalFileAllocator(indexStorage, indexUri, flowCtx.Cfg.Settings)
 	}
 
 	var pkIndexAdder kvserverbase.BulkAdder
