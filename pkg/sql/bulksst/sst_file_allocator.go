@@ -8,6 +8,7 @@ package bulksst
 import (
 	"context"
 	"fmt"
+	"path"
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -84,15 +85,21 @@ func (f *VFSFileAllocator) AddFile(
 
 // ExternalFileAllocator allocates external files for SSTs.
 type ExternalFileAllocator struct {
-	es      cloud.ExternalStorage
-	baseURI string
+	es           cloud.ExternalStorage
+	baseURI      string
+	baseFileName string
 	fileAllocatorBase
 }
 
 func NewExternalFileAllocator(es cloud.ExternalStorage, baseURI string) FileAllocator {
+	baseFileName := path.Base(baseURI)
+	if baseFileName == "/" {
+		baseFileName = ""
+	}
 	return &ExternalFileAllocator{
 		es:                es,
 		baseURI:           baseURI,
+		baseFileName:      baseFileName,
 		fileAllocatorBase: fileAllocatorBase{},
 	}
 }
@@ -101,7 +108,7 @@ func NewExternalFileAllocator(es cloud.ExternalStorage, baseURI string) FileAllo
 func (e *ExternalFileAllocator) AddFile(
 	ctx context.Context, fileIndex int, span roachpb.Span, rowSample roachpb.Key, fileSize uint64,
 ) (objstorage.Writable, func(), error) {
-	fileName := fmt.Sprintf("%d.sst", fileIndex)
+	fileName := fmt.Sprintf("%s_%d.sst", e.baseFileName, fileIndex)
 	writer, err := e.es.Writer(ctx, fileName)
 	if err != nil {
 		return nil, nil, err
