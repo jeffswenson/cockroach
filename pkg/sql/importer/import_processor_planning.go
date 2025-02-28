@@ -300,19 +300,21 @@ func distImport(
 			return nil
 		}
 
-		inputSSTs, splits := bulksst.CombineFileInfo(processorOutput)
 
-		merged, err := bulkmerge.Merge(ctx, execCtx, inputSSTs, splits, func(instanceID base.SQLInstanceID) string {
+		spans := make([]roachpb.Span, 0, len(tables))
+		for _, table := range tables {
+			spans = append(spans, execCfg.Codec.TableSpan(uint32(table.Desc.ID)))
+		}
+
+		inputSSTs, mergeSpans:= bulksst.CombineFileInfo(processorOutput, spans)
+
+		merged, err := bulkmerge.Merge(ctx, execCtx, inputSSTs, mergeSpans, func(instanceID base.SQLInstanceID) string {
 			return fmt.Sprintf("nodelocal://%d/job/%d/merge", instanceID, job.ID())
 		})
 		if err != nil {
 			return err
 		}
 
-		spans := make([]roachpb.Span, 0, len(tables))
-		for _, table := range tables {
-			spans = append(spans, execCfg.Codec.TableSpan(uint32(table.Desc.ID)))
-		}
 
 		return bulkingest.IngestFiles(ctx, execCtx, spans, merged)
 	})
