@@ -180,6 +180,13 @@ type EarlyBootExternalStorageContext struct {
 	Options         []ExternalStorageOption
 	Limiters        Limiters
 	MetricsRecorder *Metrics
+	// TODO(jeffswenson): do not merge this. This is a proof of concept. We would
+	// need to jump through hoops to make this work with the current
+	// implementation.
+	// 
+	// TODO(jeffswenson): even with this change we will need a version of ingest
+	// that works well for tenants.
+	BlobClientFactory blobs.BlobClientFactory
 }
 
 // ExternalStorageOptions rolls up the Options into a struct.

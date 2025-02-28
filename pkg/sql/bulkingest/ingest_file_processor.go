@@ -9,6 +9,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/bulkutil"
@@ -74,6 +75,11 @@ func (p *ingestFileProcessor) claimLease(ctx context.Context, span roachpb.Span)
 func (p *ingestFileProcessor) doIngest(
 	ctx context.Context, sst execinfrapb.BulkMergeSpec_SST,
 ) error {
+	// TODO(jeffswenson): explore using LinkExternalSSTableRequest_ExternalFile
+	// here
+
+	// TODO(jeffswenson): ensure nodelocal is available from
+	// `cloud.NewEarlyBootExternalStorageAccessor
 	file, err := p.cloudMux.StoreFile(ctx, sst.Uri)
 	if err != nil {
 		return err
@@ -81,6 +87,8 @@ func (p *ingestFileProcessor) doIngest(
 
 	db := p.flowCtx.Cfg.DB.KV()
 	err = func() error {
+		// TODO(jeffswenson): this should have a fast path where it tries to ingest
+		// a whole SST and if that fails, it splits it across ranges.
 		reader, _, err := file.Store.ReadFile(ctx, file.FilePath, cloud.ReadOptions{})
 		if err != nil {
 			return err
@@ -100,6 +108,39 @@ func (p *ingestFileProcessor) doIngest(
 		return errors.Wrapf(err, "failed to ingest SST (uri: %s, start: %s, end: %s)", sst.Uri, sst.StartKey, sst.EndKey)
 	}
 	return nil
+}
+
+func (p *ingestFileProcessor) linkSST(ctx context.Context, sst execinfrapb.BulkMergeSpec_SST) error {
+	db := p.flowCtx.Cfg.DB.KV()
+
+	uri, basename, err := p.cloudMux.SplitURI(sst.Uri)
+	if err != nil {
+		return err
+	}
+
+	span := roachpb.Span{
+		Key:    roachpb.Key(sst.StartKey),
+		EndKey: roachpb.Key(sst.EndKey).Next(),
+	}
+
+	// TODO(jeffswenson): continue to populate this based on `retore_online.go`
+	stats := &enginepb.MVCCStats{
+
+	}
+
+	db.LinkExternalSSTable(ctx, span, kvpb.LinkExternalSSTableRequest_ExternalFile{
+		Path: uri.String(),
+		Name: basename,
+		ApproximatePhysicalSize: 128 << 20,
+		UseSyntheticSuffix: true,
+		MVCCStats:          kvpb.MVCCStats{
+			ContainsEstimates: true,
+
+		},
+
+		// TODO(jeffswenson): populate this during the merge phase
+		BackingFileSize: 
+	})
 }
 
 func (p *ingestFileProcessor) Close(ctx context.Context) {

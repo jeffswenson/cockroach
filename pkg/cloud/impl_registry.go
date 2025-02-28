@@ -248,8 +248,8 @@ func MakeExternalStorage(
 			Options:         opts,
 			Limiters:        limiters,
 			MetricsRecorder: cloudMetrics,
+			BlobClientFactory: blobClientFactory,
 		},
-		BlobClientFactory: blobClientFactory,
 		DB:                db,
 	}
 

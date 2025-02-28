@@ -67,7 +67,7 @@ func makeLocalFileConfig(uri *url.URL) (cloudpb.ExternalStorage_LocalFileConfig,
 }
 
 func parseLocalFileURI(
-	_ cloud.ExternalStorageURIContext, uri *url.URL,
+	_ cloud.EarlyBootExternalStorageConstructor, uri *url.URL,
 ) (cloudpb.ExternalStorage, error) {
 	conf := cloudpb.ExternalStorage{}
 
@@ -103,7 +103,7 @@ func MakeLocalStorageURI(path string) string {
 }
 
 func makeLocalFileStorage(
-	ctx context.Context, args cloud.ExternalStorageContext, dest cloudpb.ExternalStorage,
+	ctx context.Context, args cloud.EarlyBootExternalStorageContext, dest cloudpb.ExternalStorage,
 ) (cloud.ExternalStorage, error) {
 	telemetry.Count("external-io.nodelocal")
 	if args.BlobClientFactory == nil {
@@ -219,8 +219,8 @@ func (*localFileStorage) Close() error {
 func init() {
 	cloud.RegisterExternalStorageProvider(cloudpb.ExternalStorageProvider_nodelocal,
 		cloud.RegisteredProvider{
-			ConstructFn:    makeLocalFileStorage,
-			ParseFn:        parseLocalFileURI,
+			EarlyBootConstructFn:    makeLocalFileStorage,
+			EarlyBootParseFn:        parseLocalFileURI,
 			RedactedParams: cloud.RedactedParams(),
 			Schemes:        []string{scheme},
 		})

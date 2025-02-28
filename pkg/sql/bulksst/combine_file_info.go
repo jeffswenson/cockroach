@@ -37,7 +37,7 @@ func CombineFileInfo(
 		return bytes.Compare(i, j)
 	})
 
-	spans := getMergeSpans(tableSpans, samples)
+	spans := getMergeSpans(tableSpans, nil)
 
 	return result, spans
 }

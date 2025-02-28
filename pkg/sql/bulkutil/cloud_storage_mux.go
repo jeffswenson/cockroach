@@ -43,7 +43,7 @@ func (c *CloudStorageMux) Close() error {
 }
 
 func (c *CloudStorageMux) StoreFile(ctx context.Context, uri string) (storageccl.StoreFile, error) {
-	prefix, filepath, err := c.splitURI(uri)
+	prefix, filepath, err := c.SplitURI(uri)
 	if err != nil {
 		return storageccl.StoreFile{}, err
 	}
@@ -62,7 +62,7 @@ func (c *CloudStorageMux) StoreFile(ctx context.Context, uri string) (storageccl
 	}, nil
 }
 
-func (c *CloudStorageMux) splitURI(uri string) (url.URL, string, error) {
+func (c *CloudStorageMux) SplitURI(uri string) (url.URL, string, error) {
 	parsed, err := url.Parse(uri)
 	if err != nil {
 		return url.URL{}, "", errors.Wrap(err, "failed to parse external storage uri")
