@@ -108,10 +108,10 @@ func (m *mergeCoordinator) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMeta
 			}
 			m.done = true
 			return m.emitResults()
-		case meta.Err != nil:
-			m.MoveToDraining(meta.Err)
-			return nil, m.DrainHelper()
 		default:
+			if meta.Err != nil {
+				m.MoveToDraining(nil)
+			}
 			// If there is non-nil meta, we pass it up the processor chain. It might
 			// be something like a trace.
 			return nil, meta

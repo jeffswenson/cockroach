@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -26,6 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/taskset"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/sstable"
 )
 
 var (
@@ -65,7 +66,7 @@ type bulkMergeProcessor struct {
 	flowCtx  *execinfra.FlowCtx
 	writer   *bulksst.MergeWriter
 	cloudMux *bulkutil.CloudStorageMux
-	iter     storage.SimpleMVCCIterator
+	iter     *pebble.Iterator
 }
 
 type mergeProcessorInput struct {
@@ -131,8 +132,8 @@ func (m *bulkMergeProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMe
 			m.MoveToDraining(nil /* err */)
 			return nil, m.DrainHelper()
 		case meta != nil && meta.Err != nil:
-			m.MoveToDraining(meta.Err)
-			return nil, m.DrainHelper()
+			m.MoveToDraining(nil)
+			return nil, meta
 		case meta != nil:
 			// If there is non-nil meta, we pass it up the processor chain. It might
 			// be something like a trace.
@@ -140,7 +141,6 @@ func (m *bulkMergeProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMe
 		case row != nil:
 			output, err := m.handleRow(row)
 			if err != nil {
-				log.Errorf(m.Ctx(), "merge processor error: %+v", err)
 				m.MoveToDraining(err)
 				return nil, m.DrainHelper()
 			}
@@ -219,48 +219,33 @@ func (m *bulkMergeProcessor) Close(ctx context.Context) {
 func (m *bulkMergeProcessor) mergeSSTs(
 	ctx context.Context, taskID taskset.TaskId,
 ) (execinfrapb.BulkMergeSpec_Output, error) {
-	cloudMux := bulkutil.NewCloudStorageMux(m.flowCtx.Cfg.ExternalStorageFromURI, username.RootUserName())
-	defer func() {
-		err := cloudMux.Close()
-		if err != nil {
-			log.Errorf(ctx, "error closing cloudMux: %+v", err)
-		}
-	}()
-
 	mergeSpan := m.spec.Spans[taskID]
 
 	// Seek the iterator if its not positioned within the current task's span.
 	// The spans are disjoint, so the only way the iterator would be contained
 	// within the span is if the previous task's span proceeded it
-	if ok, _ := m.iter.Valid(); !(ok && containsKey(mergeSpan, m.iter.UnsafeKey().Key)) {
-		// TODO(jeffswenson): Does this prevent us from constantly reading new
-		// chunks of the SSTs?
-		m.iter.SeekGE(storage.MVCCKey{Key: mergeSpan.Key})
+	m.iter.SetBounds(
+		storage.EncodeMVCCKey(storage.MVCCKey{Key: mergeSpan.Key}),
+		storage.EncodeMVCCKey(storage.MVCCKey{Key: mergeSpan.EndKey}),
+	)
+	m.iter.First()
+	for m.iter.Valid() {
+		unsafeKey := m.iter.Key()
+		mvccKey, err := storage.DecodeMVCCKey(unsafeKey)
+		if err != nil {
+			return execinfrapb.BulkMergeSpec_Output{}, err
+		}
+		if err := m.writer.PutRawMVCCValue(ctx, mvccKey, m.iter.Value()); err != nil {
+			return execinfrapb.BulkMergeSpec_Output{}, err
+		}
+		m.iter.Next()
 	}
-
-	for ; ; m.iter.NextKey() {
-		ok, err := m.iter.Valid()
-		if err != nil {
-			return execinfrapb.BulkMergeSpec_Output{}, err
-		}
-		if !ok {
-			break
-		}
-
-		key := m.iter.UnsafeKey()
-		if mergeSpan.EndKey.Compare(roachpb.Key(key.Key)) <= 0 {
-			// We've reached the end of the span.
-			break
-		}
-
-		val, err := m.iter.UnsafeValue()
-		if err != nil {
-			return execinfrapb.BulkMergeSpec_Output{}, err
-		}
-
-		if err := m.writer.PutRawMVCCValue(ctx, key, val); err != nil {
-			return execinfrapb.BulkMergeSpec_Output{}, err
-		}
+	if m.iter.Error() != nil {
+		err := errors.Wrapf(
+			m.iter.Error(),
+			"iterator error while processing span [%s, %s)",
+			mergeSpan.Key, mergeSpan.EndKey)
+		return execinfrapb.BulkMergeSpec_Output{}, err
 	}
 
 	ssts, err := m.writer.Flush(ctx)
@@ -277,35 +262,28 @@ func (m *bulkMergeProcessor) mergeSSTs(
 			Uri:      sst.URI,
 		})
 	}
+
 	return mergedSSTs, nil
 }
 
-func (m *bulkMergeProcessor) createIter(ctx context.Context) (storage.SimpleMVCCIterator, error) {
-	var storeFiles []storageccl.StoreFile
+func (m *bulkMergeProcessor) createIter(ctx context.Context) (*pebble.Iterator, error) {
+	var storeFiles [][]sstable.ReadableFile
 
 	// Find the ssts that overlap with the given task's key range.
 	for _, sst := range m.spec.Ssts {
-		file, err := m.cloudMux.StoreFile(ctx, sst.Uri)
+		file, err := m.cloudMux.Open(ctx, sst.Uri)
 		if err != nil {
 			m.MoveToDraining(err)
 		}
-		storeFiles = append(storeFiles, file)
+		storeFiles = append(storeFiles, []sstable.ReadableFile{file})
 	}
 
-	iterOpts := storage.IterOptions{
-		KeyTypes: storage.IterKeyTypePointsAndRanges,
-		// We don't really need bounds here because the merge iterator covers the
-		// entire intput data set, but the iterator has validation ensuring they
-		// are set. These bounds work because the spans are non-overlapping and
-		// sorted.
-		LowerBound: m.spec.Spans[0].Key,
-		UpperBound: m.spec.Spans[len(m.spec.Spans)-1].EndKey,
-	}
-	iter, err := storageccl.ExternalSSTReader(ctx, storeFiles, nil, iterOpts)
-	if err != nil {
-		return nil, err
-	}
-	return iter, nil
+	iter, err := pebble.NewExternalIter(storage.DefaultPebbleOptions(), &pebble.IterOptions{
+		KeyTypes:   pebble.IterKeyTypePointsOnly,
+		LowerBound: storage.EncodeMVCCKey(storage.MVCCKey{Key: m.spec.Spans[0].Key}),
+		UpperBound: storage.EncodeMVCCKey(storage.MVCCKey{Key: m.spec.Spans[len(m.spec.Spans)-1].EndKey}),
+	}, storeFiles)
+	return iter, err
 }
 
 func init() {

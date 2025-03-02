@@ -9,7 +9,10 @@ go_library(
         "//pkg/ccl/storageccl",
         "//pkg/cloud",
         "//pkg/security/username",
+        "//pkg/util/ioctx",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_pebble//sstable",
+        "@com_github_cockroachdb_pebble//vfs",
     ],
 )
 
