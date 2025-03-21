@@ -7,10 +7,12 @@ package logical
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -19,6 +21,7 @@ import (
 
 type sqlRowReader struct {
 	selectStatement statements.Statement[tree.Statement]
+	sessionOverride sessiondata.InternalExecutorOverride
 	// keyColumnIndices is the index of the datums that are part of the primary key.
 	keyColumnIndices []int
 	columns          []columnSchema
@@ -53,8 +56,12 @@ func newSQLRowReader(table catalog.TableDescriptor) (*sqlRowReader, error) {
 		return nil, err
 	}
 
+	o := ieOverrideBase
+	o.ApplicationName = fmt.Sprintf("%s-%s", catconstants.AttributedToUserInternalAppNamePrefix, "replication-read-refresh")
+
 	return &sqlRowReader{
 		selectStatement:  selectStatement,
+		sessionOverride:  o,
 		keyColumnIndices: keyColumns,
 		columns:          cols,
 	}, nil
@@ -93,7 +100,7 @@ func (r *sqlRowReader) ReadRows(
 	// This is okay since we already know the batch is small enough to fit in
 	// memory.
 	rows, err := txn.QueryBufferedEx(ctx, "replication-read-refresh", txn.KV(),
-		sessiondata.NoSessionDataOverride,
+		r.sessionOverride,
 		r.selectStatement.SQL,
 		params...,
 	)

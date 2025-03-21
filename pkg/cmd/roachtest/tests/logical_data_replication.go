@@ -778,6 +778,7 @@ func (mc *multiCluster) StartCluster(
 	sqlRunner := sqlutils.MakeSQLRunner(db)
 
 	sqlRunner.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
+	sqlRunner.Exec(t, `SET CLUSTER SETTING logical_replication.consumer.immediate_mode_writer = 'crud'`)
 
 	pgURL, err := copyPGCertsAndMakeURL(ctx, t, mc.c, node, clusterSettings.PGUrlCertsDir, addr[0])
 	require.NoError(t, err)
