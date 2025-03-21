@@ -9,6 +9,8 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 )
@@ -20,6 +22,21 @@ func getPhysicalColumns(table catalog.TableDescriptor) []catalog.Column {
 	result := make([]catalog.Column, 0, len(columns))
 	for _, col := range columns {
 		if !col.IsComputed() && !col.IsVirtual() && !col.IsSystemColumn() {
+			result = append(result, col)
+		}
+	}
+	return result
+}
+
+// getPrimaryKeyColumns returns only the physical columns that are part of the table's primary key.
+// It uses getPhysicalColumns to filter out non-physical columns first.
+func getPrimaryKeyColumns(table catalog.TableDescriptor) []catalog.Column {
+	physicalColumns := getPhysicalColumns(table)
+	pkColSet := table.GetPrimaryIndex().CollectKeyColumnIDs()
+
+	result := make([]catalog.Column, 0)
+	for _, col := range physicalColumns {
+		if pkColSet.Contains(col.GetID()) {
 			result = append(result, col)
 		}
 	}
@@ -44,7 +61,9 @@ func newTypedPlaceholder(idx int, col catalog.Column) (*tree.CastExpr, error) {
 //
 // The statement will have `n` parameters, where `n` is the number of columns
 // in the table. Parameters are ordered by column ID.
-func newInsertStatement(table catalog.TableDescriptor) (tree.Statement, error) {
+func newInsertStatement(
+	table catalog.TableDescriptor,
+) (statements.Statement[tree.Statement], error) {
 	columns := getPhysicalColumns(table)
 
 	columnNames := make(tree.NameList, len(columns))
@@ -57,7 +76,7 @@ func newInsertStatement(table catalog.TableDescriptor) (tree.Statement, error) {
 		var err error
 		parameters[i], err = newTypedPlaceholder(i+1, col)
 		if err != nil {
-			return nil, err
+			return statements.Statement[tree.Statement]{}, err
 		}
 	}
 
@@ -81,7 +100,7 @@ func newInsertStatement(table catalog.TableDescriptor) (tree.Statement, error) {
 		Returning: tree.AbsentReturningClause,
 	}
 
-	return insert, nil
+	return toParsedStatement(insert)
 }
 
 // newMatchesLastRow creates a WHERE clause for matching all columns of a row.
@@ -118,13 +137,15 @@ func newMatchesLastRow(columns []catalog.Column, startParamIdx int) (tree.Expr, 
 // and the last `n` parameters are the new values of the row.
 //
 // Parameters are ordered by column ID.
-func newUpdateStatement(table catalog.TableDescriptor) (tree.Statement, error) {
+func newUpdateStatement(
+	table catalog.TableDescriptor,
+) (statements.Statement[tree.Statement], error) {
 	columns := getPhysicalColumns(table)
 
 	// Create WHERE clause for matching the previous row values
 	whereClause, err := newMatchesLastRow(columns, 1)
 	if err != nil {
-		return nil, err
+		return statements.Statement[tree.Statement]{}, err
 	}
 
 	exprs := make(tree.UpdateExprs, len(columns))
@@ -137,7 +158,7 @@ func newUpdateStatement(table catalog.TableDescriptor) (tree.Statement, error) {
 		// are for the where clause.
 		placeholder, err := newTypedPlaceholder(len(columns)+i+1, col)
 		if err != nil {
-			return nil, err
+			return statements.Statement[tree.Statement]{}, err
 		}
 
 		exprs[i] = &tree.UpdateExpr{
@@ -157,7 +178,7 @@ func newUpdateStatement(table catalog.TableDescriptor) (tree.Statement, error) {
 		Returning: tree.AbsentReturningClause,
 	}
 
-	return update, nil
+	return toParsedStatement(update)
 }
 
 // newDeleteStatement returns a statement that can be used to delete a row from
@@ -166,13 +187,15 @@ func newUpdateStatement(table catalog.TableDescriptor) (tree.Statement, error) {
 // identify the row to delete.
 //
 // Parameters are ordered by column ID.
-func newDeleteStatement(table catalog.TableDescriptor) (tree.Statement, error) {
+func newDeleteStatement(
+	table catalog.TableDescriptor,
+) (statements.Statement[tree.Statement], error) {
 	columns := getPhysicalColumns(table)
 
 	// Create WHERE clause for matching the row to delete
 	whereClause, err := newMatchesLastRow(columns, 1)
 	if err != nil {
-		return nil, err
+		return statements.Statement[tree.Statement]{}, err
 	}
 
 	// Create the final delete statement
@@ -185,5 +208,81 @@ func newDeleteStatement(table catalog.TableDescriptor) (tree.Statement, error) {
 		Returning: tree.AbsentReturningClause,
 	}
 
-	return delete, nil
+	return toParsedStatement(delete)
+}
+
+// newSelectStatement returns a statement that can be used to select a row by
+// its primary key. The statement will have one parameter for each primary key
+// column. Parameters are ordered by column ID.
+func newSelectStatement(
+	table catalog.TableDescriptor,
+) (statements.Statement[tree.Statement], error) {
+	// Get all columns in column ID order
+	columns := getPhysicalColumns(table)
+
+	// Get just the primary key columns in column ID order
+	pkCols := getPrimaryKeyColumns(table)
+
+	// Create the selectable columns
+	selectColumns := make(tree.SelectExprs, 0, len(columns))
+	for _, col := range columns {
+		selectColumns = append(selectColumns, tree.SelectExpr{
+			Expr: &tree.ColumnItem{
+				ColumnName: tree.Name(col.GetName()),
+			},
+		})
+	}
+
+	// Create the WHERE clause for matching primary key columns
+	var whereClause tree.Expr
+	for i, col := range pkCols {
+		typedPlaceholder, err := newTypedPlaceholder(i+1, col)
+		if err != nil {
+			return statements.Statement[tree.Statement]{}, err
+		}
+
+		colExpr := &tree.ComparisonExpr{
+			Operator: treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom),
+			Left: &tree.ColumnItem{
+				ColumnName: tree.Name(col.GetName()),
+			},
+			Right: typedPlaceholder,
+		}
+
+		if whereClause == nil {
+			whereClause = colExpr
+		} else {
+			whereClause = &tree.AndExpr{
+				Left:  whereClause,
+				Right: colExpr,
+			}
+		}
+	}
+
+	// Create the main SELECT statement
+	selectStmt := &tree.Select{
+		Select: &tree.SelectClause{
+			Exprs: selectColumns,
+			From: tree.From{
+				Tables: tree.TableExprs{
+					&tree.TableRef{
+						TableID: int64(table.GetID()),
+						As:      tree.AliasClause{Alias: "replication_target"},
+					},
+				},
+			},
+			Where: &tree.Where{
+				Type: tree.AstWhere,
+				Expr: whereClause,
+			},
+		},
+	}
+
+	return toParsedStatement(selectStmt)
+}
+
+func toParsedStatement(stmt tree.Statement) (statements.Statement[tree.Statement], error) {
+	// TODO(jeffswenson): do I have to round trip through the string or can I
+	// safely construct the statement directoy?
+	return parser.ParseOne(stmt.String())
 }
