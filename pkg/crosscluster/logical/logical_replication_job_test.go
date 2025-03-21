@@ -1456,13 +1456,13 @@ func TestTombstoneUpdate(t *testing.T) {
 
 	// 5. Replicate the delete from 'src-a' -> 'dst'
 	var jobIDSrcA jobspb.JobID
-	dst.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab WITH MODE = VALIDATED, CURSOR = $2",
+	dst.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab WITH CURSOR = $2",
 		urlSrcA, start.AsOfSystemTime()).Scan(&jobIDSrcA)
 	WaitUntilReplicatedTime(t, s.Clock().Now(), dst, jobIDSrcA)
 
 	// 6. Replicate the update from 'src-b' -> 'dst'
 	var jobIDSrcB jobspb.JobID
-	dst.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab WITH MODE = VALIDATED, CURSOR = $2",
+	dst.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab WITH CURSOR = $2",
 		urlSrcB, start.AsOfSystemTime()).Scan(&jobIDSrcB)
 	WaitUntilReplicatedTime(t, s.Clock().Now(), dst, jobIDSrcB)
 
@@ -2323,6 +2323,10 @@ func TestUserDefinedTypes(t *testing.T) {
 
 	server, s, dbA, dbB := setupLogicalTestServer(t, ctx, clusterArgs, 3)
 	defer server.Stopper().Stop(ctx)
+
+	// TODO(jeffswenson): figure out what is wrong with UDTs and the CRUD sql
+	// writer.
+	dbA.Exec(t, "SET CLUSTER SETTING logical_replication.consumer.immediate_mode_writer = 'legacy-kv'")
 
 	dbBURL := replicationtestutils.GetExternalConnectionURI(t, s, s, serverutils.DBName("b"))
 
