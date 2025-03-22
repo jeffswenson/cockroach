@@ -63,7 +63,7 @@ type bulkMergeProcessor struct {
 	spec     execinfrapb.BulkMergeSpec
 	input    execinfra.RowSource
 	flowCtx  *execinfra.FlowCtx
-	writer   *bulksst.MergeWriter
+	writer   flusher
 	cloudMux *bulkutil.CloudStorageMux
 	iter     storage.SimpleMVCCIterator
 }
@@ -189,6 +189,8 @@ func containsKey(mergeSpan roachpb.Span, key roachpb.Key) bool {
 	return true
 }
 
+const useIngestFlusher = true
+
 // Start implements execinfra.RowSource.
 func (m *bulkMergeProcessor) Start(ctx context.Context) {
 	ctx = m.StartInternal(ctx, "bulkMergeProcessor")
@@ -199,10 +201,18 @@ func (m *bulkMergeProcessor) Start(ctx context.Context) {
 		return
 	}
 
-	allocator := bulksst.NewExternalFileAllocator(store, m.spec.OutputUri)
-	targetSize := targetFileSize.Get(&m.flowCtx.EvalCtx.Settings.SV)
+	if useIngestFlusher {
+		m.writer, err = newIngestFlusher(ctx, m.flowCtx)
+		if err != nil {
+			m.MoveToDraining(err)
+			return
+		}
+	} else {
+		allocator := bulksst.NewExternalFileAllocator(store, m.spec.OutputUri)
+		targetSize := targetFileSize.Get(&m.flowCtx.EvalCtx.Settings.SV)
+		m.writer = bulksst.NewInorderWriter(allocator, targetSize, m.flowCtx.EvalCtx.Settings)
+	}
 
-	m.writer = bulksst.NewInorderWriter(allocator, targetSize, m.flowCtx.EvalCtx.Settings)
 	m.cloudMux = bulkutil.NewCloudStorageMux(m.flowCtx.Cfg.ExternalStorageFromURI, username.RootUserName())
 
 	m.iter, err = m.createIter(ctx)
@@ -248,7 +258,7 @@ func (m *bulkMergeProcessor) mergeSSTs(
 		}
 
 		key := m.iter.UnsafeKey()
-		if mergeSpan.EndKey.Compare(roachpb.Key(key.Key)) <= 0 {
+		if mergeSpan.EndKey.Compare(key.Key) <= 0 {
 			// We've reached the end of the span.
 			break
 		}

@@ -34,6 +34,7 @@ func planIngest(
 
 	plan.AddNoInputStage(
 		corePlacement, execinfrapb.PostProcessSpec{}, []*types.T{}, execinfrapb.Ordering{},
+		func(p *physicalplan.PhysicalPlan) {},
 	)
 
 	sql.FinalizePlan(ctx, planCtx, plan)

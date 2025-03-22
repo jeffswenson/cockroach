@@ -47,7 +47,7 @@ func IngestFiles(
 	)
 	defer recv.Release()
 
-	execCtx.DistSQLPlanner().Run(ctx, planCtx, nil, plan, recv, execCtx.ExtendedEvalContext(), nil /* finishedSetupFn */)
+	execCtx.DistSQLPlanner().Run(ctx, planCtx, nil, plan, recv, &execCtx.ExtendedEvalContext().Context, nil /* finishedSetupFn */)
 
 	return res.Err()
 }

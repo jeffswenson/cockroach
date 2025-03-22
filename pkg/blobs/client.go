@@ -58,12 +58,12 @@ func newRemoteClient(blobClient blobspb.BlobClient) BlobClient {
 func (c *remoteClient) ReadFile(
 	ctx context.Context, file string, offset int64,
 ) (ioctx.ReadCloserCtx, int64, error) {
-	ctx, cancel := context.WithCancel(ctx)
 	// Check that file exists before reading from it and get size to return.
 	st, err := c.Stat(ctx, file)
 	if err != nil {
 		return nil, 0, err
 	}
+	ctx, cancel := context.WithCancel(ctx)
 	stream, err := c.blobClient.GetStream(ctx, &blobspb.GetRequest{
 		Filename: file,
 		Offset:   offset,

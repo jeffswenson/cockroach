@@ -109,6 +109,7 @@ func (m *mergeCoordinator) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMeta
 			m.done = true
 			return m.emitResults()
 		case meta.Err != nil:
+			m.closeLoopback()
 			m.MoveToDraining(meta.Err)
 			return nil, m.DrainHelper()
 		default:

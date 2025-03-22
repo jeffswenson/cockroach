@@ -106,7 +106,7 @@ func newBulkMergePlan(
 			TaskCount:            int64(len(spans)),
 			WorkerSqlInstanceIds: keys,
 		},
-	}, execinfrapb.PostProcessSpec{}, mergeCoordinatorOutputTypes)
+	}, execinfrapb.PostProcessSpec{}, mergeCoordinatorOutputTypes, func(p *physicalplan.PhysicalPlan) {})
 
 	plan.PlanToStreamColMap = []int{0} // Needed for FinalizePlan to populate ResultTypes
 	sql.FinalizePlan(ctx, planCtx, plan)

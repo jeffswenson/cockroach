@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/bulkingest"
 	"github.com/cockroachdb/cockroach/pkg/sql/bulkmerge"
 	"github.com/cockroachdb/cockroach/pkg/sql/bulksst"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -323,14 +322,11 @@ func distImport(
 
 		inputSSTs, mergeSpans := bulksst.CombineFileInfo(processorOutput, spans)
 
-		merged, err := bulkmerge.Merge(ctx, execCtx, inputSSTs, mergeSpans, func(instanceID base.SQLInstanceID) string {
+		// TODO(jeffswenson): set up a multi-stage merge
+		_, err := bulkmerge.Merge(ctx, execCtx, inputSSTs, mergeSpans, func(instanceID base.SQLInstanceID) string {
 			return fmt.Sprintf("nodelocal://%d/job/%d/merge/", instanceID, job.ID())
 		})
-		if err != nil {
-			return err
-		}
-
-		return bulkingest.IngestFiles(ctx, execCtx, spans, merged)
+		return err
 	})
 
 	g.GoCtx(replanChecker)

@@ -66,7 +66,7 @@ func Merge(
 		nil,
 		plan,
 		sqlReciever,
-		execCtx.ExtendedEvalContext(),
+		&execCtx.ExtendedEvalContext().Context,
 		nil,
 	)
 

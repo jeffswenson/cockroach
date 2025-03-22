@@ -186,7 +186,7 @@ func testMergeProcessors(t *testing.T, s serverutils.ApplicationLayerInterface) 
 		nil,
 		plan,
 		sqlReciever,
-		jobExecCtx.ExtendedEvalContext(),
+		&jobExecCtx.ExtendedEvalContext().Context,
 		nil,
 	)
 

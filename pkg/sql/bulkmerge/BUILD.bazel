@@ -8,6 +8,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "bulkmerge",
     srcs = [
+        "flusher.go",
         "merge.go",
         "merge_coordinator.go",
         "merge_loopback.go",
@@ -19,6 +20,7 @@ go_library(
     deps = [
         "//pkg/base",
         "//pkg/ccl/storageccl",
+        "//pkg/kv/bulk",
         "//pkg/roachpb",
         "//pkg/security/username",
         "//pkg/settings",
@@ -34,6 +36,7 @@ go_library(
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/storage",
+        "//pkg/util/hlc",
         "//pkg/util/log",
         "//pkg/util/protoutil",
         "//pkg/util/taskset",
