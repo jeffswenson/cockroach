@@ -20,6 +20,29 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+func batchSSTs(ssts []execinfrapb.BulkMergeSpec_SST, batchSize int) [][]execinfrapb.BulkMergeSpec_SST {
+	batches := make([][]execinfrapb.BulkMergeSpec_SST, 0, len(ssts)/batchSize+1)
+	for i := 0; i < len(ssts); i += batchSize {
+		end := i + batchSize
+		if end > len(ssts) {
+			end = len(ssts)
+		}
+		batches = append(batches, ssts[i:end])
+	}
+	return batches
+}
+
+func MergeIngest(
+	ctx context.Context,
+	execCtx sql.JobExecContext,
+	ssts []execinfrapb.BulkMergeSpec_SST,
+	spans []roachpb.Span,
+	scratchURI func(sqlInstance base.SQLInstanceID) string,
+) error {
+	execCfg := execCtx.ExecCfg()
+	batches := batchSSTs(ssts, 1024)
+}
+
 // Merge creates and waits on a DistSQL flow that merges the provided SSTs into
 // into the ranges defined by the input splits.
 func Merge(
