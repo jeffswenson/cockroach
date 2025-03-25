@@ -1,0 +1,13 @@
+# Set up a test table with a compound primary key
+exec
+CREATE TABLE test_table (
+    id INT,
+    name STRING,
+    value STRING,
+    PRIMARY KEY (id, name)
+);
+
+# Test the bulk read statement for the table
+bulk-read table=test_table
+----
+pq: at or near "#": syntax error
