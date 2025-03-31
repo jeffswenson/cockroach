@@ -16,12 +16,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -38,13 +38,15 @@ import (
 // A kvRowProcessor is a RowProcessor that bypasses SQL execution and directly
 // writes KV pairs for replicated events.
 type kvRowProcessor struct {
-	decoder cdcevent.Decoder
-	lastRow cdcevent.Row
-	alloc   *tree.DatumAlloc
-	cfg     *execinfra.ServerConfig
-	spec    execinfrapb.LogicalReplicationWriterSpec
-	evalCtx *eval.Context
-	sd      *sessiondata.SessionData
+	// sourceDecoder is a decoder for KVs that are emitted by the source
+	// cluster.
+	sourceDecoder cdcevent.Decoder
+	lastRow       cdcevent.Row
+	alloc         *tree.DatumAlloc
+	cfg           *execinfra.ServerConfig
+	spec          execinfrapb.LogicalReplicationWriterSpec
+	evalCtx       *eval.Context
+	sd            *sessiondata.SessionData
 
 	dstBySrc map[descpb.ID]descpb.ID
 	writers  map[descpb.ID]*kvTableWriter
@@ -64,39 +66,50 @@ func newKVRowProcessor(
 	spec execinfrapb.LogicalReplicationWriterSpec,
 	procConfigByDestID map[descpb.ID]sqlProcessorTableConfig,
 ) (*kvRowProcessor, error) {
-	cdcEventTargets := changefeedbase.Targets{}
-	srcTablesBySrcID := make(map[descpb.ID]catalog.TableDescriptor, len(procConfigByDestID))
+	sourceDescs := make([]catalog.TableDescriptor, 0, len(procConfigByDestID))
 	dstBySrc := make(map[descpb.ID]descpb.ID, len(procConfigByDestID))
-
 	for dstID, s := range procConfigByDestID {
 		dstBySrc[s.srcDesc.GetID()] = dstID
-		srcTablesBySrcID[s.srcDesc.GetID()] = s.srcDesc
-		cdcEventTargets.Add(changefeedbase.Target{
-			Type:              jobspb.ChangefeedTargetSpecification_EACH_FAMILY,
-			TableID:           s.srcDesc.GetID(),
-			StatementTimeName: changefeedbase.StatementTimeName(s.srcDesc.GetName()),
-		})
+		sourceDescs = append(sourceDescs, s.srcDesc)
 	}
 
-	prefixlessCodec := keys.SystemSQLCodec
-	rfCache, err := cdcevent.NewFixedRowFetcherCache(
-		ctx, prefixlessCodec, evalCtx.Settings, cdcEventTargets, srcTablesBySrcID,
-	)
+	decoder, err := newEventDecoder(ctx, cfg.Settings, sourceDescs)
 	if err != nil {
 		return nil, err
 	}
 
 	p := &kvRowProcessor{
-		cfg:      cfg,
-		spec:     spec,
-		evalCtx:  evalCtx,
-		sd:       sd,
-		dstBySrc: dstBySrc,
-		writers:  make(map[descpb.ID]*kvTableWriter, len(procConfigByDestID)),
-		decoder:  cdcevent.NewEventDecoderWithCache(ctx, rfCache, false, false),
-		alloc:    &tree.DatumAlloc{},
+		cfg:           cfg,
+		spec:          spec,
+		evalCtx:       evalCtx,
+		sd:            sd,
+		dstBySrc:      dstBySrc,
+		writers:       make(map[descpb.ID]*kvTableWriter, len(procConfigByDestID)),
+		sourceDecoder: decoder,
+		alloc:         &tree.DatumAlloc{},
 	}
 	return p, nil
+}
+
+func newEventDecoder(
+	ctx context.Context, settings *cluster.Settings, descs []catalog.TableDescriptor,
+) (cdcevent.Decoder, error) {
+	cdcEventTargets := changefeedbase.Targets{}
+	descsByID := make(map[descpb.ID]catalog.TableDescriptor, len(descs))
+	for _, desc := range descs {
+		descsByID[desc.GetID()] = desc
+		cdcEventTargets.Add(changefeedbase.Target{
+			Type:              jobspb.ChangefeedTargetSpecification_EACH_FAMILY,
+			TableID:           desc.GetID(),
+			StatementTimeName: changefeedbase.StatementTimeName(desc.GetName()),
+		})
+	}
+	prefixlessCodec := keys.SystemSQLCodec
+	rfCache, err := cdcevent.NewFixedRowFetcherCache(ctx, prefixlessCodec, settings, cdcEventTargets, descsByID)
+	if err != nil {
+		return nil, err
+	}
+	return cdcevent.NewEventDecoderWithCache(ctx, rfCache, false, false), nil
 }
 
 var originID1Options = &kvpb.WriteOptions{OriginID: 1}
@@ -112,7 +125,7 @@ func (p *kvRowProcessor) HandleBatch(
 		if p.spec.Discard == jobspb.LogicalReplicationDetails_DiscardAllDeletes && len(batch[0].KeyValue.Value.RawBytes) == 0 {
 			return stats, nil
 		}
-		s, err := p.processRow(ctx, nil, nil, batch[0].KeyValue, batch[0].PrevValue)
+		s, err := p.processRow(ctx, nil, batch[0].KeyValue, batch[0].PrevValue)
 		if err != nil {
 			return stats, err
 		}
@@ -140,11 +153,7 @@ func (p *kvRowProcessor) HandleBatch(
 }
 
 func (p *kvRowProcessor) processRow(
-	ctx context.Context,
-	txn isql.Txn,
-	b *kv.Batch,
-	keyValue roachpb.KeyValue,
-	prevValue roachpb.Value,
+	ctx context.Context, b *kv.Batch, keyValue roachpb.KeyValue, prevValue roachpb.Value,
 ) (batchStats, error) {
 	var err error
 	keyValue.Key, err = keys.StripTenantPrefix(keyValue.Key)
@@ -152,7 +161,7 @@ func (p *kvRowProcessor) processRow(
 		return batchStats{}, errors.Wrap(err, "stripping tenant prefix")
 	}
 
-	row, err := p.decoder.DecodeKV(ctx, keyValue, cdcevent.CurrentRow, keyValue.Value.Timestamp, false)
+	row, err := p.sourceDecoder.DecodeKV(ctx, keyValue, cdcevent.CurrentRow, keyValue.Value.Timestamp, false)
 	if err != nil {
 		p.lastRow = cdcevent.Row{}
 		return batchStats{}, errors.Wrap(err, "decoding KeyValue")
@@ -168,15 +177,11 @@ func (p *kvRowProcessor) processRow(
 		return batchStats{}, err
 	}
 
-	if txn == nil {
-		var s batchStats
-		if err := p.processOneRow(ctx, dstTableID, row, keyValue, prevValue, &s, 0); err != nil {
-			return batchStats{}, err
-		}
-		return s, nil
+	var s batchStats
+	if err := p.processOneRow(ctx, dstTableID, row, keyValue, prevValue, &s, 0); err != nil {
+		return batchStats{}, err
 	}
-
-	return batchStats{}, p.addToBatch(ctx, txn.KV(), b, dstTableID, row, keyValue, prevValue)
+	return s, nil
 }
 
 func (p *kvRowProcessor) ReportMutations(refresher *stats.Refresher) {
@@ -228,7 +233,8 @@ func (p *kvRowProcessor) processOneRow(
 	if err := p.cfg.DB.KV().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		b := makeKVBatch(useLowPriority.Get(&p.cfg.Settings.SV), txn)
 
-		if err := p.addToBatch(ctx, txn, b, dstTableID, row, k, prevValue); err != nil {
+		isLocalPrevValue := refreshCount != 0
+		if err := p.addToBatch(ctx, txn, b, dstTableID, row, k, prevValue, isLocalPrevValue); err != nil {
 			return err
 		}
 		return txn.CommitInBatch(ctx, b)
@@ -296,6 +302,7 @@ func (p *kvRowProcessor) addToBatch(
 	row cdcevent.Row,
 	keyValue roachpb.KeyValue,
 	prevValue roachpb.Value,
+	isLocalPrevValue bool,
 ) error {
 	w, err := p.getWriter(ctx, dstTableID, txn.ProvisionalCommitTimestamp())
 	if err != nil {
@@ -307,7 +314,12 @@ func (p *kvRowProcessor) addToBatch(
 		return err
 	}
 
-	prevRow, err := p.decoder.DecodeKV(ctx, roachpb.KeyValue{
+	decoder := p.sourceDecoder
+	if isLocalPrevValue {
+		decoder = w.decoder
+	}
+
+	prevRow, err := decoder.DecodeKV(ctx, roachpb.KeyValue{
 		Key:   keyValue.Key,
 		Value: prevValue,
 	}, cdcevent.PrevRow, prevValue.Timestamp, false)
@@ -394,7 +406,11 @@ func (p *kvRowProcessor) getWriter(
 // used past the expiration of the lease used to construct it, and batches that
 // it populates should commit no later than the expiration of said lease.
 type kvTableWriter struct {
-	leased           lease.LeasedDescriptor
+	leased lease.LeasedDescriptor
+	// decoder is used to decode KVs that are emitted by a cput failer. This
+	// lives on the kvTableWriter because it shares a lifetime with the leased
+	// descriptor.
+	decoder          cdcevent.Decoder
 	v                descpb.DescriptorVersion
 	newVals, oldVals []tree.Datum
 	ru               row.Updater
@@ -435,9 +451,15 @@ func newKVTableWriter(
 		return nil, err
 	}
 
+	decoder, err := newEventDecoder(ctx, evalCtx.Settings, []catalog.TableDescriptor{tableDesc})
+	if err != nil {
+		return nil, err
+	}
+
 	return &kvTableWriter{
 		leased:  leased,
 		v:       leased.Underlying().GetVersion(),
+		decoder: decoder,
 		oldVals: make([]tree.Datum, len(readCols)),
 		newVals: make([]tree.Datum, len(writeCols)),
 		ri:      ri,
