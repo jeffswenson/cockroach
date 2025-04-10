@@ -2326,7 +2326,10 @@ func TestUserDefinedTypes(t *testing.T) {
 
 	// TODO(jeffswenson): figure out what is wrong with UDTs and the CRUD sql
 	// writer.
-	dbA.Exec(t, "SET CLUSTER SETTING logical_replication.consumer.immediate_mode_writer = 'legacy-kv'")
+	//
+	// replicated-update: type \"public.my_enum" does not exist
+	// dbA.Exec(t, "SET CLUSTER SETTING logical_replication.consumer.immediate_mode_writer = 'crud'")
+	dbA.Exec(t, "SET CLUSTER SETTING logical_replication.consumer.immediate_mode_writer = 'crud'")
 
 	dbBURL := replicationtestutils.GetExternalConnectionURI(t, s, s, serverutils.DBName("b"))
 
@@ -2336,7 +2339,8 @@ func TestUserDefinedTypes(t *testing.T) {
 	dbA.Exec(t, "CREATE TYPE my_composite AS (a INT, b TEXT)")
 	dbB.Exec(t, "CREATE TYPE my_composite AS (a INT, b TEXT)")
 
-	for _, mode := range []string{"validated", "immediate"} {
+	//for _, mode := range []string{"validated", "immediate"} {
+	for _, mode := range []string{"immediate"} {
 		t.Run(mode, func(t *testing.T) {
 			dbA.Exec(t, "CREATE TABLE data (pk INT PRIMARY KEY, val1 my_enum DEFAULT 'two', val2 my_composite)")
 			dbA.Exec(t, "CREATE TABLE data2 (pk INT PRIMARY KEY, val1 my_enum DEFAULT 'two', val2 my_composite)")

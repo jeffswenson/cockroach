@@ -396,5 +396,5 @@ func newBulkSelectStatement(
 func toParsedStatement(stmt tree.Statement) (statements.Statement[tree.Statement], error) {
 	// TODO(jeffswenson): do I have to round trip through the string or can I
 	// safely construct the statement directly?
-	return parser.ParseOne(stmt.String())
+	return parser.ParseOne(tree.Serialize(stmt))
 }
