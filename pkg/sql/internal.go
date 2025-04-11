@@ -1202,7 +1202,7 @@ func (ie *InternalExecutor) execInternal(
 	// add the delegate prefix to the current app name.
 	if sd.ApplicationName == "" || sd.ApplicationName == catconstants.InternalAppNamePrefix {
 		sd.ApplicationName = catconstants.InternalAppNamePrefix + "-" + opName.StripMarkers()
-	} else if !strings.HasPrefix(sd.ApplicationName, catconstants.InternalAppNamePrefix) {
+	} else if !strings.HasPrefix(sd.ApplicationName, catconstants.InternalAppNamePrefix) && !strings.HasPrefix(sd.ApplicationName, catconstants.DelegatedAppNamePrefix) {
 		// If this is already an "internal app", don't put more prefix.
 		sd.ApplicationName = catconstants.DelegatedAppNamePrefix + sd.ApplicationName
 	}

@@ -119,16 +119,21 @@ func newInsertStatement(
 // newMatchesLastRow creates a WHERE clause for matching all columns of a row.
 // It returns a tree.Expr that compares each column to a placeholder parameter.
 // Parameters are ordered by column ID, starting from startParamIdx.
-func newMatchesLastRow(columns []catalog.Column, startParamIdx int) (tree.Expr, error) {
+func newMatchesLastRow(columns []columnSchema, startParamIdx int) (tree.Expr, error) {
 	var whereClause tree.Expr
 	for i, col := range columns {
-		placeholder, err := newTypedPlaceholder(startParamIdx+i, col)
+		cmp := treecmp.IsNotDistinctFrom
+		if col.isPrimaryKey {
+			cmp = treecmp.EQ
+		}
+
+		placeholder, err := newTypedPlaceholder(startParamIdx+i, col.column)
 		if err != nil {
 			return nil, err
 		}
 		colExpr := &tree.ComparisonExpr{
-			Operator: treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom),
-			Left:     &tree.ColumnItem{ColumnName: tree.Name(col.GetName())},
+			Operator: treecmp.MakeComparisonOperator(cmp),
+			Left:     &tree.ColumnItem{ColumnName: tree.Name(col.column.GetName())},
 			Right:    placeholder,
 		}
 
@@ -153,7 +158,7 @@ func newMatchesLastRow(columns []catalog.Column, startParamIdx int) (tree.Expr, 
 func newUpdateStatement(
 	table catalog.TableDescriptor,
 ) (statements.Statement[tree.Statement], error) {
-	columns := getPhysicalColumns(table)
+	columns := getPhysicalColumnsSchema(table)
 
 	// Create WHERE clause for matching the previous row values
 	whereClause, err := newMatchesLastRow(columns, 1)
@@ -163,13 +168,13 @@ func newUpdateStatement(
 
 	exprs := make(tree.UpdateExprs, len(columns))
 	for i, col := range columns {
-		nameNode := tree.Name(col.GetName())
+		nameNode := tree.Name(col.column.GetName())
 		names := tree.NameList{nameNode}
 
 		// Create a placeholder for the new value (len(columns)+i+1) since we
 		// use 1-indexed placeholders and the first len(columns) placeholders
 		// are for the where clause.
-		placeholder, err := newTypedPlaceholder(len(columns)+i+1, col)
+		placeholder, err := newTypedPlaceholder(len(columns)+i+1, col.column)
 		if err != nil {
 			return statements.Statement[tree.Statement]{}, err
 		}
@@ -203,7 +208,7 @@ func newUpdateStatement(
 func newDeleteStatement(
 	table catalog.TableDescriptor,
 ) (statements.Statement[tree.Statement], error) {
-	columns := getPhysicalColumns(table)
+	columns := getPhysicalColumnsSchema(table)
 
 	// Create WHERE clause for matching the row to delete
 	whereClause, err := newMatchesLastRow(columns, 1)

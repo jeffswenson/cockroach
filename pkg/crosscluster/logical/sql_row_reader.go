@@ -7,12 +7,10 @@ package logical
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -21,7 +19,7 @@ import (
 
 type sqlRowReader struct {
 	selectStatement statements.Statement[tree.Statement]
-	sessionOverride sessiondata.InternalExecutorOverride
+	sessionData     sessiondata.InternalExecutorOverride
 	// keyColumnIndices is the index of the datums that are part of the primary key.
 	keyColumnIndices []int
 	columns          []columnSchema
@@ -42,7 +40,7 @@ type priorRow struct {
 	isLocal bool
 }
 
-func newSQLRowReader(table catalog.TableDescriptor) (*sqlRowReader, error) {
+func newSQLRowReader(appName string, table catalog.TableDescriptor) (*sqlRowReader, error) {
 	cols := getPhysicalColumnsSchema(table)
 	keyColumns := make([]int, 0, len(cols))
 	for i, col := range cols {
@@ -51,17 +49,17 @@ func newSQLRowReader(table catalog.TableDescriptor) (*sqlRowReader, error) {
 		}
 	}
 
+	sessionData := ieOverrideBase
+	sessionData.ApplicationName = appName
+
 	selectStatement, err := newBulkSelectStatement(table)
 	if err != nil {
 		return nil, err
 	}
 
-	o := ieOverrideBase
-	o.ApplicationName = fmt.Sprintf("%s-%s", catconstants.AttributedToUserInternalAppNamePrefix, "replication-read-refresh")
-
 	return &sqlRowReader{
 		selectStatement:  selectStatement,
-		sessionOverride:  o,
+		sessionData:      sessionData,
 		keyColumnIndices: keyColumns,
 		columns:          cols,
 	}, nil
@@ -100,7 +98,7 @@ func (r *sqlRowReader) ReadRows(
 	// This is okay since we already know the batch is small enough to fit in
 	// memory.
 	rows, err := txn.QueryBufferedEx(ctx, "replication-read-refresh", txn.KV(),
-		r.sessionOverride,
+		r.sessionData,
 		r.selectStatement.SQL,
 		params...,
 	)

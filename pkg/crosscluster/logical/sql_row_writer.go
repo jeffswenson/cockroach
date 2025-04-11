@@ -25,9 +25,10 @@ var errStalePreviousValue = errors.New("stale previous value")
 // sqlRowWriter is configured to write rows to a specific table and descriptor
 // version.
 type sqlRowWriter struct {
-	insert statements.Statement[tree.Statement]
-	update statements.Statement[tree.Statement]
-	delete statements.Statement[tree.Statement]
+	insert  statements.Statement[tree.Statement]
+	update  statements.Statement[tree.Statement]
+	delete  statements.Statement[tree.Statement]
+	appName string
 
 	scratchDatums []any
 	columns       []string
@@ -38,6 +39,7 @@ func (s *sqlRowWriter) getExecutorOverride(
 ) sessiondata.InternalExecutorOverride {
 	session := ieOverrideBase
 	session.OriginTimestampForLogicalDataReplication = originTimestamp
+	session.ApplicationName = s.appName
 	return session
 }
 
@@ -121,7 +123,7 @@ func (s *sqlRowWriter) UpdateRow(
 	return err
 }
 
-func newSQLRowWriter(table catalog.TableDescriptor) (*sqlRowWriter, error) {
+func newSQLRowWriter(appName string, table catalog.TableDescriptor) (*sqlRowWriter, error) {
 	physicalColumns := getPhysicalColumns(table)
 	columns := make([]string, len(physicalColumns))
 	for i, col := range physicalColumns {
@@ -151,6 +153,7 @@ func newSQLRowWriter(table catalog.TableDescriptor) (*sqlRowWriter, error) {
 	}
 
 	return &sqlRowWriter{
+		appName: appName,
 		insert:  insert,
 		update:  update,
 		delete:  delete,

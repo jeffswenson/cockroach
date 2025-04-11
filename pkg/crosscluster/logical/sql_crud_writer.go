@@ -45,6 +45,7 @@ func newCrudSqlWriter(
 	sd *sessiondata.SessionData,
 	discard jobspb.LogicalReplicationDetails_Discard,
 	procConfigByDestID map[descpb.ID]sqlProcessorTableConfig,
+	jobID jobspb.JobID,
 ) (*sqlCrudWriter, error) {
 	decoder, err := newEventDecoder(ctx, cfg.DB, evalCtx.Settings, procConfigByDestID)
 	if err != nil {
@@ -54,12 +55,14 @@ func newCrudSqlWriter(
 	handlers := make(map[descpb.ID]*tableHandler)
 	for dstDescID := range procConfigByDestID {
 		handler, err := newTableHandler(
+			ctx,
 			dstDescID,
 			cfg.DB,
 			cfg.Codec,
 			sd,
 			cfg.LeaseManager.(*lease.Manager),
 			evalCtx.Settings,
+			jobID,
 		)
 		if err != nil {
 			return nil, err

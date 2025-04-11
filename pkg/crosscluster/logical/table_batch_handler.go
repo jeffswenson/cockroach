@@ -7,14 +7,18 @@ package logical
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/errors"
@@ -26,6 +30,8 @@ type tableHandler struct {
 	sqlReader        *sqlRowReader
 	sqlWriter        *sqlRowWriter
 	db               descs.DB
+	ie               isql.Executor
+	sd               *sessiondata.SessionData
 	tombstoneUpdater *tombstoneUpdater
 }
 
@@ -65,12 +71,14 @@ func (t *tableBatchStats) Add(o tableBatchStats) {
 // newTableHandler creates a new tableHandler for the given table descriptor ID.
 // It internally constructs the sqlReader and sqlWriter components.
 func newTableHandler(
+	ctx context.Context,
 	tableID descpb.ID,
 	db descs.DB,
 	codec keys.SQLCodec,
 	sd *sessiondata.SessionData,
 	leaseMgr *lease.Manager,
 	settings *cluster.Settings,
+	jobID jobspb.JobID,
 ) (*tableHandler, error) {
 	var table catalog.TableDescriptor
 
@@ -86,22 +94,30 @@ func newTableHandler(
 		return nil, err
 	}
 
-	reader, err := newSQLRowReader(table)
+	appName := fmt.Sprintf("%s-%s-%d", catconstants.AttributedToUserInternalAppNamePrefix, "logical-data-replication", jobID)
+
+	reader, err := newSQLRowReader(appName, table)
 	if err != nil {
 		return nil, err
 	}
 
-	writer, err := newSQLRowWriter(table)
+	writer, err := newSQLRowWriter(appName, table)
 	if err != nil {
 		return nil, err
 	}
 
 	tombstoneUpdater := newTombstoneUpdater(codec, db.KV(), leaseMgr, tableID, sd, settings)
 
+	ie := db.Executor(isql.WithSessionData(
+		sql.NewInternalSessionData(ctx, settings, ""),
+	))
+
 	return &tableHandler{
 		sqlReader:        reader,
 		sqlWriter:        writer,
 		db:               db,
+		ie:               ie,
+		sd:               sd,
 		tombstoneUpdater: tombstoneUpdater,
 	}, nil
 }
@@ -170,7 +186,7 @@ func (t *tableHandler) attemptBatch(
 			}
 		}
 		return nil
-	})
+	}, isql.WithSessionData(t.sd))
 	if err != nil {
 		return tableBatchStats{}, err
 	}

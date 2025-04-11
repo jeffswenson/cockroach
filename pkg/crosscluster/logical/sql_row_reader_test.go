@@ -52,12 +52,12 @@ func TestSQLRowReader(t *testing.T) {
 
 	// Create sqlRowReader for source table
 	srcDesc := desctestutils.TestingGetPublicTableDescriptor(s.DB(), s.Codec(), "a", "tab")
-	srcReader, err := newSQLRowReader(srcDesc)
+	srcReader, err := newSQLRowReader("", srcDesc)
 	require.NoError(t, err)
 
 	// Create sqlRowReader for destination table
 	dstDesc := desctestutils.TestingGetPublicTableDescriptor(s.DB(), s.Codec(), "b", "tab")
-	dstReader, err := newSQLRowReader(dstDesc)
+	dstReader, err := newSQLRowReader("", dstDesc)
 	require.NoError(t, err)
 
 	// Create test rows to look up
