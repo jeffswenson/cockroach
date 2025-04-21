@@ -740,6 +740,9 @@ message LocalOnlySessionData {
   // HoistJoinProjectLeft normalization rule hoists more kinds of projections
   // above joins.
   bool optimizer_use_improved_hoist_join_project = 186;
+  // UseSwapMutations, when true, enables use of the update swap and delete swap
+  // operators.
+  bool use_swap_mutations = 187;
 
   ///////////////////////////////////////////////////////////////////////////
   // WARNING: consider whether a session parameter you're adding needs to  //
