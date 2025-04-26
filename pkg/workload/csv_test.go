@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
 	"github.com/cockroachdb/cockroach/pkg/workload/tpcc"
+	"github.com/stretchr/testify/require"
 )
 
 func TestHandleCSV(t *testing.T) {
@@ -65,6 +66,45 @@ func TestHandleCSV(t *testing.T) {
 			if d, e := strings.TrimSpace(string(data)), strings.TrimSpace(test.expected); d != e {
 				t.Errorf("got [\n%s\n] expected [\n%s\n]", d, e)
 			}
+		})
+	}
+}
+
+func TestHandleCSVTpcc(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	tests := []struct {
+		params, expected string
+	}{
+		{
+			`?rows=1`, `
+0,8,17,13,11,SF,640911111,0.0806,300000`,
+		},
+		{
+			`?rows=5&row-start=1&row-end=3`, `
+1,9,19,20,19,NP,640911111,0.1908,300000
+2,10,20,13,12,KJ,223011111,0.1988,300000`,
+		},
+	}
+
+	// assertions depend on this seed
+	tpcc.RandomSeed.Set(1)
+	meta := tpcc.FromWarehouses(1).Meta()
+	for _, test := range tests {
+		t.Run(test.params, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.NoError(t, workload.HandleCSV(w, r, `/tpcc/`, meta))
+			}))
+			defer ts.Close()
+
+			res, err := httputil.Get(context.Background(), ts.URL+`/tpcc/warehouse`+test.params)
+			require.NoError(t, err)
+
+			data, err := io.ReadAll(res.Body)
+			res.Body.Close()
+			require.NoError(t, err)
+
+			require.Equal(t, strings.TrimSpace(test.expected), strings.TrimSpace(string(data)))
 		})
 	}
 }
