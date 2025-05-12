@@ -59,6 +59,7 @@ func (t *TracePutter) Put(key, value interface{}) {
 }
 func (t *TracePutter) InitPut(key, value interface{}, failOnTombstones bool) {
 	log.VEventfDepth(t.Ctx, 1, 2, "InitPut %v -> %v", key, value)
+	// TODO(jeffswenson): isn't this a horable bug? Should be calling InitPut.
 	t.Putter.Put(key, value)
 
 }
