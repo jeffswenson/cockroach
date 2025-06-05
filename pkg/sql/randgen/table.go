@@ -1,3 +1,8 @@
+// Copyright 2025 The Cockroach Authors.
+//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
 package randgen
 
 import (
@@ -13,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/randident"
+	"github.com/cockroachdb/cockroach/pkg/util/randident/randidentcfg"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
@@ -35,15 +41,16 @@ func RandCreateTableWithColumnIndexNumberGenerator(
 		name = fmt.Sprintf("%s%d", prefix, tableIdx)
 	}
 	return randTableWithIndexes(
-		ctx, rng, name, tableIdx, opts, generateColumnIndexSuffix,
+		ctx, rng, name, tableIdx, options, generateColumnIndexSuffix,
 	)
 }
 
 func RandCreateTableWithName(
 	ctx context.Context, rng *rand.Rand, tableName string, tableIdx int, opts []TableOption,
 ) *tree.CreateTable {
+	options := applyOptions(opts)
 	return randTableWithIndexes(
-		ctx, rng, tableName, tableIdx, opts, nil, /* generateColumnIndexSuffix */
+		ctx, rng, tableName, tableIdx, options, nil, /* generateColumnIndexSuffix */
 	)
 }
 
@@ -52,17 +59,9 @@ func randTableWithIndexes(
 	rng *rand.Rand,
 	tableName string,
 	tableIdx int,
-	opts []TableOption,
+	options tableOptions,
 	generateColumnIndexSuffix func() string,
 ) *tree.CreateTable {
-	options := applyOptions(opts)
-	// columnDefs contains the list of Columns we'll add to our table.
-	nColumns := randutil.RandIntInRange(rng, 1, 20)
-	columnDefs := make([]*tree.ColumnTableDef, 0, nColumns)
-	// defs contains the list of Columns and other attributes (indexes, column
-	// families, etc) we'll add to our table.
-	defs := make(tree.TableDefs, 0, len(columnDefs))
-
 	// colIdx generates numbers that are incorporated into column names.
 	colSuffix := func(ordinal int) string {
 		if generateColumnIndexSuffix != nil {
@@ -71,58 +70,38 @@ func randTableWithIndexes(
 		return strconv.Itoa(ordinal)
 	}
 
-	// Make new defs from scratch.
-	nComputedColumns := randutil.RandIntInRange(rng, 0, (nColumns+1)/2)
-	nNormalColumns := nColumns - nComputedColumns
-	for i := 0; i < nNormalColumns; i++ {
-		columnDef := randColumnTableDef(rng, tableIdx, colSuffix(i), opts)
-		columnDefs = append(columnDefs, columnDef)
-		defs = append(defs, columnDef)
-	}
-
-	// Make defs for computed columns.
-	normalColDefs := columnDefs
-	for i := nNormalColumns; i < nColumns; i++ {
-		columnDef := randComputedColumnTableDef(rng, normalColDefs, tableIdx, colSuffix(i), opts)
-		columnDefs = append(columnDefs, columnDef)
-		defs = append(defs, columnDef)
-	}
-
-	// Make a random primary key with high likelihood.
+	// Generate the columns in the table and the primary key.
+	var columnDefs []*tree.ColumnTableDef
 	var pk *tree.IndexTableDef
-	if options.primaryIndexRequired || (rng.Intn(8) != 0) {
-		for {
-			indexDef, ok := randIndexTableDefFromCols(ctx, rng, columnDefs, tableName, true /* isPrimaryIndex */, opts)
-			canUseIndex := ok && indexDef.Type.CanBePrimary()
-			if canUseIndex {
-				// Although not necessary for Cockroach to function correctly,
-				// but for ease of use for any code that introspects on the
-				// AST data structure (instead of the descriptor which doesn't
-				// exist yet), explicitly set all PK cols as NOT NULL.
-				for _, col := range columnDefs {
-					for _, elem := range indexDef.Columns {
-						if col.Name == elem.Column {
-							col.Nullable.Nullability = tree.NotNull
-						}
-					}
-				}
-				pk = &indexDef
-				defs = append(defs, &tree.UniqueConstraintTableDef{
-					PrimaryKey:    true,
-					IndexTableDef: indexDef,
-				})
-			}
-			if canUseIndex || !options.primaryIndexRequired {
+	generatePrimaryKey := rng.Int()%8 != 0 || options.primaryIndexRequired
+	for {
+		// NOTE: we retry generating the columnDefs because some columns have no valid
+		// primary key (e.g. PGVECTOR).
+		columnDefs = randColumnDefs(rng, tableIdx, colSuffix, options)
+		if generatePrimaryKey {
+			var ok bool
+			pk, ok = randomPrimaryKey(ctx, rng, tableName, options, columnDefs)
+			if ok && (options.primaryIndexFilter == nil || options.primaryIndexFilter(pk)) {
 				break
 			}
 		}
+	}
+	defs := make(tree.TableDefs, 0, len(columnDefs))
+	for _, columnDef := range columnDefs {
+		defs = append(defs, columnDef)
+	}
+	if pk != nil {
+		defs = append(defs, &tree.UniqueConstraintTableDef{
+			PrimaryKey:    true,
+			IndexTableDef: *pk,
+		})
 	}
 
 	// Make indexes.
 	nIdxs := rng.Intn(10)
 	for i := 0; i < nIdxs; i++ {
-		indexDef, ok := randIndexTableDefFromCols(ctx, rng, columnDefs, tableName, false /* isPrimaryIndex */, opts)
-		if !ok {
+		indexDef, ok := randIndexTableDefFromCols(ctx, rng, columnDefs, tableName, false /* isPrimaryIndex */, options)
+		if !ok || (options.indexFilter == nil || options.indexFilter(indexDef)) {
 			continue
 		}
 		if !indexDef.Type.CanBePrimary() && pk != nil {
@@ -182,12 +161,36 @@ func randTableWithIndexes(
 	return res[0].(*tree.CreateTable)
 }
 
+func randColumnDefs(
+	rng *rand.Rand, tableIdx int, columnSuffix func(int) string, options tableOptions,
+) []*tree.ColumnTableDef {
+	// TODO(jeffswenson): test that we sometimes observe computed columns.
+	nColumns := randutil.RandIntInRange(rng, 1, 20)
+	columnDefs := make([]*tree.ColumnTableDef, 0, nColumns)
+	for len(columnDefs) < nColumns {
+		columnDef := randColumnTableDef(rng, tableIdx, columnSuffix(len(columnDefs)), options)
+		useComputedColumn := randutil.RandIntInRange(rng, 0, 2) == 0 || len(columnDefs) != 0
+		if useComputedColumn {
+			columnDef = randComputedColumnTableDef(rng, columnDefs, tableIdx, columnSuffix(len(columnDefs)), options)
+		}
+		if options.columnFilter == nil || options.columnFilter(columnDef) {
+			columnDefs = append(columnDefs, columnDef)
+		}
+	}
+	return columnDefs
+}
+
+var nameGenCfg = func() randidentcfg.Config {
+	cfg := randident.DefaultNameGeneratorConfig()
+	cfg.Finalize()
+	return cfg
+}()
+
 // randColumnTableDef produces a random ColumnTableDef for a non-computed
 // column, with a random type and nullability.
 func randColumnTableDef(
-	rng *rand.Rand, tableIdx int, colSuffix string, opts []TableOption,
+	rng *rand.Rand, tableIdx int, colSuffix string, options tableOptions,
 ) *tree.ColumnTableDef {
-	options := applyOptions(opts)
 	var colName tree.Name
 	if options.crazyNames {
 		g := randident.NewNameGenerator(&nameGenCfg, rng, fmt.Sprintf("col%d", tableIdx))
@@ -216,6 +219,31 @@ func randColumnTableDef(
 	return columnDef
 }
 
+func randomPrimaryKey(
+	ctx context.Context,
+	rng *rand.Rand,
+	tableName string,
+	options tableOptions,
+	columnDefs []*tree.ColumnTableDef,
+) (*tree.IndexTableDef, bool) {
+	indexDef, ok := randIndexTableDefFromCols(ctx, rng, columnDefs, tableName, true /* isPrimaryIndex */, options)
+	if !ok || !indexDef.Type.CanBePrimary() {
+		return nil, false
+	}
+	// Although not necessary for Cockroach to function correctly,
+	// but for ease of use for any code that introspects on the
+	// AST data structure (instead of the descriptor which doesn't
+	// exist yet), explicitly set all PK cols as NOT NULL.
+	for _, col := range columnDefs {
+		for _, elem := range indexDef.Columns {
+			if col.Name == elem.Column {
+				col.Nullable.Nullability = tree.NotNull
+			}
+		}
+	}
+	return &indexDef, true
+}
+
 // randComputedColumnTableDef produces a random ColumnTableDef for a computed
 // column (either STORED or VIRTUAL). The computed expressions refer to columns
 // in normalColDefs.
@@ -224,9 +252,9 @@ func randComputedColumnTableDef(
 	normalColDefs []*tree.ColumnTableDef,
 	tableIdx int,
 	colSuffix string,
-	opts []TableOption,
+	options tableOptions,
 ) *tree.ColumnTableDef {
-	newDef := randColumnTableDef(rng, tableIdx, colSuffix, opts)
+	newDef := randColumnTableDef(rng, tableIdx, colSuffix, options)
 	newDef.Computed.Computed = true
 	newDef.Computed.Virtual = rng.Intn(2) == 0
 
@@ -247,9 +275,8 @@ func randIndexTableDefFromCols(
 	columnTableDefs []*tree.ColumnTableDef,
 	tableName string,
 	isPrimaryIndex bool,
-	opts []TableOption,
+	options tableOptions,
 ) (def tree.IndexTableDef, ok bool) {
-	options := applyOptions(opts)
 	cpy := make([]*tree.ColumnTableDef, len(columnTableDefs))
 	copy(cpy, columnTableDefs)
 	rng.Shuffle(len(cpy), func(i, j int) { cpy[i], cpy[j] = cpy[j], cpy[i] })
