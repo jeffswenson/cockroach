@@ -4404,6 +4404,7 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
+	// CockroachDB extension.
 	`optimizer_use_improved_hoist_join_project`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_improved_hoist_join_project`),
 		Set: func(_ context.Context, m sessionmutator.SessionDataMutator, s string) error {
@@ -4421,7 +4422,6 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: globalTrue,
 	},
-
 	`optimizer_clamp_low_histogram_selectivity`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_clamp_low_histogram_selectivity`),
 		Set: func(_ context.Context, m sessionmutator.SessionDataMutator, s string) error {
@@ -4491,6 +4491,22 @@ var varGen = map[string]sessionVar{
 		GlobalDefault: func(sv *settings.Values) string {
 			return sessiondatapb.CanaryStatsModeAuto.String()
 		},
+	},
+	// CockroachDB extension.
+	`use_swap_mutations`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`use_swap_mutations`),
+		Set: func(_ context.Context, m sessionmutator.SessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("use_swap_mutations", s)
+			if err != nil {
+				return err
+			}
+			m.SetUseSwapMutations(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().UseSwapMutations), nil
+		},
+		GlobalDefault: globalTrue,
 	},
 }
 
