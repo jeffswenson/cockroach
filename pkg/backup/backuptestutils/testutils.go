@@ -8,14 +8,17 @@ package backuptestutils
 import (
 	"context"
 	gosql "database/sql"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/cockroachdb/cockroach/pkg/backup/backupbase" // imported for cluster settings.
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -23,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
@@ -305,4 +309,97 @@ func CheckForInvalidDescriptors(t testing.TB, sqlDB *gosql.DB) {
 		t.Fatalf("the following descriptor ids are invalid\n%v", invalidIDs)
 	}
 	t.Log("no Invalid Descriptors")
+}
+
+// waitForJobToSucceed waits for a job to reach the succeeded state.
+func waitForJobToSucceed(ctx context.Context, sqlDB *gosql.DB, jobID jobspb.JobID) error {
+	const maxWait = 2 * time.Minute
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	start := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "context canceled while waiting for job to succeed")
+		case <-ticker.C:
+			if time.Since(start) > maxWait {
+				return errors.Newf("job %d did not succeed within %s", jobID, maxWait)
+			}
+
+			var status string
+			if err := sqlDB.QueryRowContext(ctx, "SELECT status FROM system.jobs WHERE id = $1", jobID).Scan(&status); err != nil {
+				return errors.Wrap(err, "failed to query job status")
+			}
+
+			switch jobs.State(status) {
+			case jobs.StateSucceeded:
+				return nil
+			case jobs.StateFailed:
+				return errors.Newf("job %d failed with status: %s", jobID, status)
+			case jobs.StateCanceled:
+				return errors.Newf("job %d was canceled", jobID)
+			case jobs.StateRevertFailed:
+				return errors.Newf("job %d failed during revert", jobID)
+			case jobs.StatePaused:
+				return errors.Newf("job %d was paused", jobID)
+			default:
+				// Job is still running, continue waiting
+			}
+		}
+	}
+}
+
+// CompactLatestChain reads the latest backup chain in the URI and runs
+// compaction on it.
+func CompactLatestChain(ctx context.Context, sqlDB *gosql.DB, uri string) error {
+	var latest string
+	row := sqlDB.QueryRowContext(ctx, `
+		WITH directories AS (
+			SHOW BACKUPS IN $1
+		)
+		SELECT MAX(path) FROM directories
+	`, uri)
+	if err := row.Scan(&latest); err != nil {
+		return errors.Wrap(err, "failed to scan latest backup")
+	}
+
+	var start, end time.Time
+	rows := sqlDB.QueryRowContext(ctx, `WITH backups AS (
+		SHOW BACKUP FROM $1 IN $2
+	) SELECT MIN(end_time), MAX(end_time) FROM backups
+	`, latest, uri)
+	if err := rows.Scan(&start, &end); err != nil {
+		return errors.Wrap(err, "failed to scan start and end times")
+	}
+
+	stmt := fmt.Sprintf("BACKUP INTO ''%s'' IN ''%s''", latest, uri)
+
+	startHlc := hlc.Timestamp{
+		WallTime: start.UnixNano(),
+	}
+	endHlc := hlc.Timestamp{
+		WallTime: end.UnixNano(),
+	}
+
+	var jobID jobspb.JobID
+	row = sqlDB.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT crdb_internal.backup_compaction(
+			0,
+			'%s',
+			'%s',
+			'%s'::DECIMAL,
+			'%s'::DECIMAL
+		)
+	`, stmt, latest, startHlc.AsOfSystemTime(), endHlc.AsOfSystemTime()))
+
+	if err := row.Scan(&jobID); err != nil {
+		return errors.Wrap(err, "failed to scan job ID")
+	}
+
+	if err := waitForJobToSucceed(ctx, sqlDB, jobID); err != nil {
+		return errors.Wrap(err, "failed waiting for backup compaction job to finish")
+	}
+
+	return nil
 }

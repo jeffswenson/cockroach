@@ -269,6 +269,21 @@ func (t Timestamp) FloorPrev() Timestamp {
 	panic("cannot take the previous value to a zero timestamp")
 }
 
+// RoundUpToMicroSecond rounds up to the nearest microsecond timestamp. This is
+// used in cases where the timestamp must be >= now() and be compatible with
+// the postgres datetime, which only supports microsecond precision.
+func (t Timestamp) RoundUpToMicroSecond() Timestamp {
+	walltime := time.Unix(0, t.WallTime)
+	rounded := walltime.Truncate(time.Microsecond)
+	if rounded.Before(walltime) || t.Logical != 0 {
+		rounded = rounded.Add(time.Microsecond)
+	}
+	return Timestamp{
+		WallTime: rounded.UnixNano(),
+		Logical:  0,
+	}
+}
+
 // WallNext adds 1 to the WallTime and resets Logical.
 func (t Timestamp) WallNext() Timestamp {
 	return Timestamp{
