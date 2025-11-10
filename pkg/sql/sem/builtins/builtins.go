@@ -4679,7 +4679,10 @@ value if you rely on the HLC for accuracy.`,
 			txn := evalCtx.Txn
 			// or something... todo on rollback/abort
 			txn.AddCommitTrigger(func(ctx context.Context) {
-				qr.ConfirmReceipt(ctx)
+				if err := qr.ConfirmReceipt(ctx); err != nil {
+					// TODO(jeffswenson): hook into the sql commit instead of the kv commit
+					log.Dev.Errorf(ctx, "unable to ack receipt: %+v", err)
+				}
 			})
 
 			ret := tree.NewDArray(types.Json)
@@ -4697,7 +4700,9 @@ value if you rely on the HLC for accuracy.`,
 					}
 					obj.Add(fmt.Sprintf("f%d", i+1), j)
 				}
-				ret.Append(tree.NewDJSON(obj.Build()))
+				if err := ret.Append(tree.NewDJSON(obj.Build())); err != nil {
+					return nil, err
+				}
 			}
 			return ret, nil
 		},

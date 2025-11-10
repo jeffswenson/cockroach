@@ -102,7 +102,6 @@ func (r *Reader) setupRangefeed(ctx context.Context) {
 		fmt.Sprintf("queuefeed.reader.name=%s", r.name), initialTS, onValue, opts...,
 	)
 	defer rf.Close()
-
 }
 
 // - [x] setup rangefeed on data
