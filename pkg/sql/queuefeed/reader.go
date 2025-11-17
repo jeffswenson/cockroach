@@ -3,33 +3,20 @@ package queuefeed
 import (
 	"context"
 	"fmt"
-	"slices"
-	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/queuefeed/queuebase"
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 )
-
-const maxBufSize = 1000
 
 type readerState int
 
@@ -40,15 +27,13 @@ const (
 	readerStateDead
 )
 
-// bufferedEvent represents either a data row or a checkpoint timestamp
-// in the reader's buffer. Exactly one of row or resolved will be set.
-type bufferedEvent struct {
-	// row is set for data events. nil for checkpoint events.
-	row tree.Datums
-	// resolved is set for checkpoint events. Empty for data events.
-	resolved hlc.Timestamp
-}
-
+// - [x] setup rangefeed on data
+// - [X] handle only watching my partitions
+// - [X] after each batch, ask mgr if i need to  assignments
+// - [X] buffer rows in the background before being asked for them
+// - [ ] checkpoint frontier if our frontier has advanced and we confirmed receipt
+// - [X] gonna need some way to clean stuff up on conn_executor.close()
+//
 // has rangefeed on data. reads from it. handles handoff
 // state machine around handing out batches and handing stuff off
 type Reader struct {
@@ -64,21 +49,11 @@ type Reader struct {
 
 	mu struct {
 		syncutil.Mutex
-		state          readerState
-		buf            []bufferedEvent
 		inflightBuffer []bufferedEvent
-		poppedWakeup   *sync.Cond
-		pushedWakeup   *sync.Cond
 	}
 
-	// TODO: handle the case where an assignment can change.
-	session    Session
 	assignment *Assignment
-	rangefeed  *rangefeed.RangeFeed
-
-	cancel     context.CancelCauseFunc
-	goroCtx    context.Context
-	isShutdown atomic.Bool
+	tablefeed  *tableFeed
 }
 
 func NewReader(
@@ -87,6 +62,7 @@ func NewReader(
 	mgr *Manager,
 	rff *rangefeed.Factory,
 	codec keys.SQLCodec,
+	table descpb.ID,
 	leaseMgr *lease.Manager,
 	session Session,
 	assigner *PartitionAssignments,
@@ -102,29 +78,16 @@ func NewReader(
 		// stored so we can use it in methods using a different context than the main goro ie GetRows and ConfirmReceipt
 		goroCtx:  ctx,
 		assigner: assigner,
-		session:  session,
-	}
-	r.mu.state = readerStateBatching
-	r.mu.buf = make([]bufferedEvent, 0, maxBufSize)
-	r.mu.poppedWakeup = sync.NewCond(&r.mu.Mutex)
-	r.mu.pushedWakeup = sync.NewCond(&r.mu.Mutex)
-
-	ctx, cancel := context.WithCancelCause(ctx)
-	r.cancel = func(cause error) {
-		fmt.Printf("canceling with cause: %+v\n", cause)
-		cancel(cause)
-		r.mu.poppedWakeup.Broadcast()
-		r.mu.pushedWakeup.Broadcast()
 	}
 
 	assignment, err := r.waitForAssignment(ctx, session)
 	if err != nil {
 		return nil, errors.Wrap(err, "waiting for assignment")
 	}
-	if err := r.setupRangefeed(ctx, assignment); err != nil {
+	if err := r.setupTablefeed(ctx, assignment); err != nil {
 		return nil, errors.Wrap(err, "setting up rangefeed")
 	}
-	go r.run(ctx)
+
 	return r, nil
 }
 
@@ -155,69 +118,16 @@ func (r *Reader) waitForAssignment(ctx context.Context, session Session) (*Assig
 	}
 }
 
-func (r *Reader) setupRangefeed(ctx context.Context, assignment *Assignment) error {
-	defer func() {
-		fmt.Println("setupRangefeed done")
-	}()
-
+func (r *Reader) setupTablefeed(ctx context.Context, assignment *Assignment) error {
 	// TODO: handle the case where there are no partitions in the assignment. In
 	// that case we should poll `RefreshAssignment` until we get one. This would
 	// only occur if every assignment was handed out already.
+	//
+	// This case is pretty uncommon since we wait for an assignment with at least
+	// one on construction, but it could happen if a race occurs and all of a
+	// reader's partitions are stolen.
 	if len(assignment.Partitions) == 0 {
 		return errors.Wrap(ErrNoPartitionsAssigned, "setting up rangefeed")
-	}
-
-	onValue := func(ctx context.Context, value *kvpb.RangeFeedValue) {
-		fmt.Printf("onValue: %+v\n", value)
-		r.mu.Lock()
-		defer r.mu.Unlock()
-
-		// wait for rows to be read before adding more, if necessary
-		for ctx.Err() == nil && len(r.mu.buf) > maxBufSize {
-			r.mu.poppedWakeup.Wait()
-		}
-
-		if !value.Value.IsPresent() {
-			// not handling diffs/deletes rn
-			return
-		}
-		datums, err := r.decodeRangefeedValue(ctx, value)
-		if err != nil {
-			r.cancel(errors.Wrapf(err, "decoding rangefeed value: %+v", value))
-			return
-		}
-		r.mu.buf = append(r.mu.buf, bufferedEvent{row: datums})
-		r.mu.pushedWakeup.Broadcast()
-		fmt.Printf("onValue done with buf len: %d\n", len(r.mu.buf))
-	}
-	// setup rangefeed on data
-	opts := []rangefeed.Option{
-		rangefeed.WithPProfLabel("queuefeed.reader", fmt.Sprintf("name=%s", r.name)),
-		// rangefeed.WithMemoryMonitor(w.mon),
-		rangefeed.WithOnCheckpoint(func(ctx context.Context, checkpoint *kvpb.RangeFeedCheckpoint) {
-			// This can happen when done catching up; ignore it.
-			if checkpoint.ResolvedTS.IsEmpty() {
-				return
-			}
-
-			r.mu.Lock()
-			defer r.mu.Unlock()
-
-			// Wait for rows to be read before adding more, if necessary.
-			for ctx.Err() == nil && len(r.mu.buf) > maxBufSize {
-				r.mu.poppedWakeup.Wait()
-			}
-
-			if ctx.Err() != nil {
-				return
-			}
-
-			r.mu.buf = append(r.mu.buf, bufferedEvent{resolved: checkpoint.ResolvedTS})
-		}),
-		rangefeed.WithOnInternalError(func(ctx context.Context, err error) { r.cancel(err) }),
-		rangefeed.WithConsumerID(42),
-		rangefeed.WithInvoker(func(fn func() error) error { return fn() }),
-		rangefeed.WithFiltering(false),
 	}
 
 	frontier, err := span.MakeFrontier(assignment.Spans()...)
@@ -244,44 +154,46 @@ func (r *Reader) setupRangefeed(ctx context.Context, assignment *Assignment) err
 		return errors.New("frontier is empty")
 	}
 
-	rf := r.rff.New(
-		fmt.Sprintf("queuefeed.reader.name=%s", r.name), frontier.Frontier(), onValue, opts...,
+	rf, err := newTableFeed(
+		ctx,
+		fmt.Sprintf("queue=%s", r.name),
+		r.tablefeed.tableID,
+		frontier,
+		r.rff,
+		r.leaseMgr,
+		&r.codec,
 	)
-
-	if err := rf.StartFromFrontier(ctx, frontier); err != nil {
-		return errors.Wrap(err, "starting rangefeed")
+	if err != nil {
+		return errors.Wrap(err, "creating tablefeed")
 	}
 
-	r.rangefeed = rf
+	r.tablefeed = rf
 	r.assignment = assignment
+
 	return nil
-}
-
-// - [x] setup rangefeed on data
-// - [X] handle only watching my partitions
-// - [X] after each batch, ask mgr if i need to  assignments
-// - [X] buffer rows in the background before being asked for them
-// - [ ] checkpoint frontier if our frontier has advanced and we confirmed receipt
-// - [X] gonna need some way to clean stuff up on conn_executor.close()
-
-// TODO: this loop isnt doing much anymore. if we dont need it for anything else, let's remove it
-func (r *Reader) run(ctx context.Context) {
-	defer func() {
-		fmt.Println("run done")
-		r.isShutdown.Store(true)
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Printf("run: ctx done: %s; cause: %s\n", ctx.Err(), context.Cause(ctx))
-			return
-		}
-	}
 }
 
 func (r *Reader) GetRows(ctx context.Context, limit int) ([]tree.Datums, error) {
 	fmt.Printf("GetRows start\n")
+	for {
+		datums, err := func() ([]tree.Datums, error) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+
+			if len(r.mu.inflightBuffer) == 0 {
+				var err error
+				r.mu.inflightBuffer, err = r.mu.ReadBufferedEvents(r.mu.inflightBuffer)
+				if err != nil {
+					return nil, errors.Wrap(err, "queuefeed reading from tablefeed")
+				}
+				// If we have an in-flight batch, hand these rows out first
+			}
+
+			if len(r.mu.inflightBuffer) != 0 {
+				// TODO convert to datums and return these to the user
+			}
+		}()
+	}
 
 	if r.isShutdown.Load() {
 		return nil, errors.New("reader is shutting down")
@@ -488,142 +400,4 @@ func (r *Reader) checkForReassignment(ctx context.Context) error {
 	return nil
 }
 
-func (r *Reader) decodeRangefeedValue(
-	ctx context.Context, rfv *kvpb.RangeFeedValue,
-) (tree.Datums, error) {
-	partialKey := rfv.Key
-	partialKey, err := r.codec.StripTenantPrefix(partialKey)
-	if err != nil {
-		return nil, errors.Wrapf(err, "stripping tenant prefix: %s", keys.PrettyPrint(nil, partialKey))
-	}
-
-	_, tableID, _, err := rowenc.DecodePartialTableIDIndexID(partialKey)
-	if err != nil {
-		return nil, errors.Wrapf(err, "decoding partial table id index id: %s", keys.PrettyPrint(nil, partialKey))
-	}
-
-	familyID, err := keys.DecodeFamilyKey(partialKey)
-	if err != nil {
-		return nil, errors.Wrapf(err, "decoding family key: %s", keys.PrettyPrint(nil, partialKey))
-	}
-
-	tableDesc, err := r.fetchTableDesc(ctx, tableID, rfv.Value.Timestamp)
-	if err != nil {
-		return nil, errors.Wrapf(err, "fetching table descriptor: %s", keys.PrettyPrint(nil, partialKey))
-	}
-	familyDesc, err := catalog.MustFindFamilyByID(tableDesc, descpb.FamilyID(familyID))
-	if err != nil {
-		return nil, errors.Wrapf(err, "fetching family descriptor: %s", keys.PrettyPrint(nil, partialKey))
-	}
-	cols, err := getRelevantColumnsForFamily(tableDesc, familyDesc)
-	if err != nil {
-		return nil, errors.Wrapf(err, "getting relevant columns for family: %s", keys.PrettyPrint(nil, partialKey))
-	}
-
-	var spec fetchpb.IndexFetchSpec
-	if err := rowenc.InitIndexFetchSpec(&spec, r.codec, tableDesc, tableDesc.GetPrimaryIndex(), cols); err != nil {
-		return nil, errors.Wrapf(err, "initializing index fetch spec: %s", keys.PrettyPrint(nil, partialKey))
-	}
-	rf := row.Fetcher{}
-	if err := rf.Init(ctx, row.FetcherInitArgs{
-		Spec:              &spec,
-		WillUseKVProvider: true,
-		TraceKV:           true,
-		TraceKVEvery:      &util.EveryN{N: 1},
-	}); err != nil {
-		return nil, errors.Wrapf(err, "initializing row fetcher: %s", keys.PrettyPrint(nil, partialKey))
-	}
-	kvProvider := row.KVProvider{KVs: []roachpb.KeyValue{{Key: rfv.Key, Value: rfv.Value}}}
-	if err := rf.ConsumeKVProvider(ctx, &kvProvider); err != nil {
-		return nil, errors.Wrapf(err, "consuming kv provider: %s", keys.PrettyPrint(nil, partialKey))
-	}
-	encDatums, _, err := rf.NextRow(ctx)
-	if err != nil {
-		return nil, errors.Wrapf(err, "fetching next row: %s", keys.PrettyPrint(nil, partialKey))
-	}
-	_ = encDatums
-
-	datums := make(tree.Datums, len(cols))
-	for i, colID := range cols {
-		col, err := catalog.MustFindColumnByID(tableDesc, colID)
-		if err != nil {
-			return nil, errors.Wrapf(err, "finding column by id: %d", colID)
-		}
-		ed := encDatums[i]
-		if err := ed.EnsureDecoded(col.ColumnDesc().Type, &tree.DatumAlloc{}); err != nil {
-			return nil, errors.Wrapf(err, "error decoding column %q as type %s", col.ColumnDesc().Name, col.ColumnDesc().Type.String())
-		}
-		datums[i] = ed.Datum
-	}
-	return datums, nil
-}
-
-func (r *Reader) fetchTableDesc(
-	ctx context.Context, tableID descpb.ID, ts hlc.Timestamp,
-) (catalog.TableDescriptor, error) {
-	// Retrieve the target TableDescriptor from the lease manager. No caching
-	// is attempted because the lease manager does its own caching.
-	desc, err := r.leaseMgr.Acquire(ctx, lease.TimestampToReadTimestamp(ts), tableID)
-	if err != nil {
-		// Manager can return all kinds of errors during chaos, but based on
-		// its usage, none of them should ever be terminal.
-		return nil, changefeedbase.MarkRetryableError(err)
-	}
-	tableDesc := desc.Underlying().(catalog.TableDescriptor)
-	// Immediately release the lease, since we only need it for the exact
-	// timestamp requested.
-	desc.Release(ctx)
-	if tableDesc.MaybeRequiresTypeHydration() {
-		return nil, errors.AssertionFailedf("type hydration not supported yet")
-	}
-	return tableDesc, nil
-}
-
 var _ queuebase.Reader = &Reader{}
-
-func getRelevantColumnsForFamily(
-	tableDesc catalog.TableDescriptor, familyDesc *descpb.ColumnFamilyDescriptor,
-) ([]descpb.ColumnID, error) {
-	cols := tableDesc.GetPrimaryIndex().CollectKeyColumnIDs()
-	for _, colID := range familyDesc.ColumnIDs {
-		cols.Add(colID)
-	}
-
-	// Maintain the ordering of tableDesc.PublicColumns(), which is
-	// matches the order of columns in the SQL table.
-	idx := 0
-	result := make([]descpb.ColumnID, cols.Len())
-	visibleColumns := tableDesc.PublicColumns()
-	if tableDesc.GetDeclarativeSchemaChangerState() != nil {
-		hasMergedIndex := catalog.HasDeclarativeMergedPrimaryIndex(tableDesc)
-		visibleColumns = make([]catalog.Column, 0, cols.Len())
-		for _, col := range tableDesc.AllColumns() {
-			if col.Adding() {
-				continue
-			}
-			if tableDesc.GetDeclarativeSchemaChangerState() == nil && !col.Public() {
-				continue
-			}
-			if col.Dropped() && (!col.WriteAndDeleteOnly() || hasMergedIndex) {
-				continue
-			}
-			visibleColumns = append(visibleColumns, col)
-		}
-		// Recover the order of the original columns.
-		slices.SortStableFunc(visibleColumns, func(a, b catalog.Column) int {
-			return int(a.GetPGAttributeNum()) - int(b.GetPGAttributeNum())
-		})
-	}
-	for _, col := range visibleColumns {
-		colID := col.GetID()
-		if cols.Contains(colID) {
-			result[idx] = colID
-			idx++
-		}
-	}
-
-	// Some columns in familyDesc.ColumnIDs may not be public, so
-	// result may contain fewer columns than cols.
-	result = result[:idx]
-	return result, nil
-}
