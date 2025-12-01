@@ -52,6 +52,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/util/besteffort"
 	bulkutil "github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -419,20 +420,22 @@ func getTableStatsForBackup(
 	for i := range descs {
 		if tbl, _, _, _, _ := descpb.GetDescriptors(&descs[i]); tbl != nil {
 			tableDesc := tabledesc.NewBuilder(tbl).BuildImmutableTable()
-			tableStatisticsAcc, err := stats.GetTableStatsProtosFromDB(ctx, tableDesc, executor)
-			if err != nil {
-				log.Dev.Warningf(
-					ctx, "failed to collect stats for table: %s, table ID: %d during a backup: %s",
-					tableDesc.GetName(), tableDesc.GetID(), err,
-				)
-				continue
-			}
+			besteffort.Warning(ctx, "backup_table_stats", func(ctx context.Context) error {
+				tableStatisticsAcc, err := stats.GetTableStatsProtosFromDB(ctx, tableDesc, executor)
 
-			for _, stat := range tableStatisticsAcc {
-				if statShouldBeIncludedInBackupRestore(stat) {
-					tableStatistics = append(tableStatistics, stat)
+				if err != nil {
+					return errors.Wrapf(err, "failed to collect stats for table: %s, table ID: %d during a backup",
+						tableDesc.GetName(), tableDesc.GetID())
 				}
-			}
+
+				for _, stat := range tableStatisticsAcc {
+					if statShouldBeIncludedInBackupRestore(stat) {
+						tableStatistics = append(tableStatistics, stat)
+					}
+				}
+
+				return nil
+			})
 		}
 	}
 	return backuppb.StatsTable{
@@ -692,6 +695,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		if reloadBackupErr != nil {
 			return errors.Wrap(reloadBackupErr, "could not reload backup manifest when retrying")
 		}
+
 		// Re-load the job in order to update our progress object, which
 		// may have been updated since the flow started.
 		reloadedJob, reloadErr := p.ExecCfg().JobRegistry.LoadClaimedJob(ctx, b.job.ID())
@@ -732,15 +736,14 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	}
 
 	if details.ProtectedTimestampRecord != nil && !b.testingKnobs.ignoreProtectedTimestamps {
-		if err := p.ExecCfg().InternalDB.Txn(ctx, func(
-			ctx context.Context, txn isql.Txn,
-		) error {
-			details := b.job.Details().(jobspb.BackupDetails)
-			pts := p.ExecCfg().ProtectedTimestampProvider.WithTxn(txn)
-			return releaseProtectedTimestamp(ctx, pts, details.ProtectedTimestampRecord)
-		}); err != nil {
-			log.Dev.Errorf(ctx, "failed to release protected timestamp: %v", err)
-		}
+		besteffort.Error(ctx, "release_backup_pts", func(ctx context.Context) error {
+			err := p.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+				details := b.job.Details().(jobspb.BackupDetails)
+				pts := p.ExecCfg().ProtectedTimestampProvider.WithTxn(txn)
+				return releaseProtectedTimestamp(ctx, pts, details.ProtectedTimestampRecord)
+			})
+			return errors.Wrap(err, "failed to release protected timestamp")
+		})
 	}
 
 	// If this is a full backup that was automatically nested in a collection of
@@ -1788,11 +1791,10 @@ func (b *backupResumer) processScheduledBackupCompletion(
 	}
 
 	if scheduleID != 0 && jobState == jobs.StateSucceeded {
-		if _, err := maybeStartCompactionJob(
-			ctx, execCtx.ExecCfg(), execCtx.User(), details,
-		); err != nil {
-			log.Dev.Warningf(ctx, "failed to trigger backup compaction for schedule %d: %v", scheduleID, err)
-		}
+		besteffort.Warning(ctx, "start_backup_compaction", func(ctx context.Context) error {
+			_, err := maybeStartCompactionJob(ctx, execCtx.ExecCfg(), execCtx.User(), details)
+			return errors.Wrapf(err, "failed to trigger backup compaction for schedule %d", scheduleID)
+		})
 	}
 	return nil
 }
@@ -1810,7 +1812,9 @@ func (b *backupResumer) OnFailOrCancel(
 	cfg := p.ExecCfg()
 	details := b.job.Details().(jobspb.BackupDetails)
 
-	b.deleteCheckpoint(ctx, cfg, p.User())
+	besteffort.Warning(ctx, "delete_backup_checkpoint", func(ctx context.Context) error {
+		return b.deleteCheckpoint(ctx, cfg, p.User())
+	})
 	if err := cfg.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		pts := cfg.ProtectedTimestampProvider.WithTxn(txn)
 		return releaseProtectedTimestamp(ctx, pts, details.ProtectedTimestampRecord)
@@ -1857,25 +1861,27 @@ func (b *backupResumer) CollectProfile(ctx context.Context, execCtx interface{})
 
 func (b *backupResumer) deleteCheckpoint(
 	ctx context.Context, cfg *sql.ExecutorConfig, user username.SQLUsername,
-) {
-	// Attempt to delete BACKUP-CHECKPOINT(s) in /progress directory.
-	if err := func() error {
-		details := b.job.Details().(jobspb.BackupDetails)
-		// For all backups, partitioned or not, the main BACKUP manifest is stored at
-		// details.URI.
-		exportStore, err := cfg.DistSQLSrv.ExternalStorageFromURI(ctx, details.URI, user)
-		if err != nil {
-			return err
-		}
-		defer exportStore.Close()
-		// Delete will not delete a nonempty directory, so we have to go through
-		// all files and delete each file one by one.
-		return exportStore.List(ctx, backupinfo.BackupProgressDirectory, "", func(p string) error {
-			return exportStore.Delete(ctx, backupinfo.BackupProgressDirectory+p)
-		})
-	}(); err != nil {
-		log.Dev.Warningf(ctx, "unable to delete checkpointed backup descriptor file in progress directory: %+v", err)
+) error {
+	details := b.job.Details().(jobspb.BackupDetails)
+
+	// The OnFailOrCancel hook may be called before a URI was resolved for the
+	// backup.
+	if details.URI == "" {
+		return nil
 	}
+
+	// For all backups, partitioned or not, the main BACKUP manifest is stored at
+	// details.URI.
+	exportStore, err := cfg.DistSQLSrv.ExternalStorageFromURI(ctx, details.URI, user)
+	if err != nil {
+		return err
+	}
+	defer exportStore.Close()
+	// Delete will not delete a nonempty directory, so we have to go through
+	// all files and delete each file one by one.
+	return exportStore.List(ctx, backupinfo.BackupProgressDirectory, "", func(p string) error {
+		return exportStore.Delete(ctx, backupinfo.BackupProgressDirectory+p)
+	})
 }
 
 // maybeWriteBackupLock attempts to write a backup lock for the given jobID, if
