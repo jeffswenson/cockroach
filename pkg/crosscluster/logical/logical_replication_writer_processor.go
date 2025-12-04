@@ -864,7 +864,10 @@ func (lrw *logicalReplicationWriterProcessor) flushBuffer(
 	// rather than starting new ones for each flush.
 	chunks := make(chan []streampb.StreamEvent_KV)
 
-	g := ctxgroup.WithContext(ctx)
+	// Create a detached context to avoid tracing every sql op.
+	// TODO(jeffswenson): figure out how to apply these
+	workerCtx := tracing.ContextWithSpan(ctx, nil)
+	g := ctxgroup.WithContext(workerCtx)
 	for worker := range lrw.bh[:requiredWorkers] {
 		w := worker
 		lrw.bhStats[w] = flushStats{}
