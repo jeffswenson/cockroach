@@ -2548,7 +2548,7 @@ func (ex *connExecutor) rollbackSQLTransaction(
 	}
 	if isKVTxnOpen {
 		if err := ex.state.mu.txn.Rollback(ctx); err != nil {
-			log.Dev.Warningf(ctx, "txn rollback failed: %s", err)
+			log.Dev.Fatalf(ctx, "txn rollback failed: %s", err)
 		}
 	}
 	if err := ex.reportSessionDataChanges(func() error {
