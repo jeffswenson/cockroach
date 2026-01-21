@@ -32,6 +32,7 @@ func TestGenerateLDRTable(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, "CREATE DATABASE a")
 	sqlDB.Exec(t, "CREATE DATABASE b")
+	sqlDB.Exec(t, "SET CLUSTER SETTING logical_replication.consumer.immediate_mode_writer = 'crud'")
 
 	_, err := server.SystemLayer().SQLConn(t).Exec("SET CLUSTER SETTING kv.rangefeed.enabled = true")
 	require.NoError(t, err)
@@ -43,7 +44,7 @@ func TestGenerateLDRTable(t *testing.T) {
 	rndSrc, _ := randutil.NewTestRand()
 	rndSrc.Seed(time.Now().UnixNano())
 
-	stmt := GenerateLDRTable(ctx, rndSrc, "test_writer", true)
+	stmt := GenerateLDRTable(ctx, rndSrc, "test_writer")
 	t.Logf("creating table: %s", stmt)
 	dbA.Exec(t, tree.AsStringWithFlags(stmt, tree.FmtParsable))
 

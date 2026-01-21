@@ -136,7 +136,7 @@ func TestTombstoneUpdaterRandomTables(t *testing.T) {
 	rng, _ := randutil.NewPseudoRand()
 	tableName := "rand_table"
 
-	stmt := tree.SerializeForDisplay(ldrrandgen.GenerateLDRTable(ctx, rng, tableName, true))
+	stmt := tree.SerializeForDisplay(ldrrandgen.GenerateLDRTable(ctx, rng, tableName))
 	t.Logf("Creating table with schema: %s", stmt)
 	runner.Exec(t, stmt)
 

@@ -39,9 +39,7 @@ func isSupportedType(t *types.T) bool {
 	}
 }
 
-func GenerateLDRTable(
-	ctx context.Context, rng *rand.Rand, tableName string, supportKVWriter bool,
-) *tree.CreateTable {
+func GenerateLDRTable(ctx context.Context, rng *rand.Rand, tableName string) *tree.CreateTable {
 	columnByName := func(name tree.Name, columnDefs []*tree.ColumnTableDef) *tree.ColumnTableDef {
 		for _, col := range columnDefs {
 			if col.Name == name {
@@ -72,14 +70,10 @@ func GenerateLDRTable(
 					return false
 				}
 			}
-			if supportKVWriter && indexDef.Sharded != nil {
-				// The KV writer does not support hash sharded indexes.
-				return false
-			}
 			return true
 		}),
 		randgen.WithIndexFilter(func(indexDef tree.TableDef, columnDefs []*tree.ColumnTableDef) bool {
-			switch indexDef := indexDef.(type) {
+			switch indexDef.(type) {
 			case *tree.UniqueConstraintTableDef:
 				// Do not allow unique indexes. The random data may cause
 				// spurious unique constraint violations.
@@ -87,26 +81,6 @@ func GenerateLDRTable(
 				// that can randomly generate exclusively unique values for each row. E.g. UUIDs could be unique, but
 				// BOOLs are too limiting.
 				return false
-			case *tree.IndexTableDef:
-				for _, col := range indexDef.Columns {
-					if supportKVWriter && col.Expr != nil {
-						// Do not allow expression indexes. These cause SQL to generate a hidden computed column, which is not
-						// supported by the kv writer.
-						if col.Expr != nil {
-							return false
-						}
-					}
-					columnDef := columnByName(col.Column, columnDefs)
-					if columnDef.IsVirtual() {
-						// Virtual computed columns are not supported in indexes by the classic sql writer or the kv writer.
-						// TODO(jeffswenson): remove this restriction once the crud writer is the only writer.
-						return false
-					}
-				}
-				if supportKVWriter && indexDef.Sharded != nil {
-					// The KV writer does not support hash sharded indexes.
-					return false
-				}
 			}
 			return true
 		}),

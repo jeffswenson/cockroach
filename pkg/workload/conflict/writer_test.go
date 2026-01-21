@@ -71,7 +71,7 @@ func TestWriterRandom(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
 	rndSrc, _ := randutil.NewTestRand()
-	stmt := ldrrandgen.GenerateLDRTable(ctx, rndSrc, "test_writer", true)
+	stmt := ldrrandgen.GenerateLDRTable(ctx, rndSrc, "test_writer")
 
 	sqlDB.Exec(t, tree.AsStringWithFlags(stmt, tree.FmtParsable))
 
@@ -92,17 +92,9 @@ func TestWriterRandom(t *testing.T) {
 	// (e.g. a + b). It's tricky to fix randgen so that it only generates values
 	// that do not overflow.
 	shouldRetryUpdate := func(err error, table workloadrand.Table) bool {
-		hasComputedColumns := false
-		for _, col := range table.Cols {
-			if col.IsComputed {
-				hasComputedColumns = true
-				break
-			}
-		}
-
 		// Ignore "pq: integer out of range" errors if the table has computed columns
 		// since randgen doesn't know to constrain columns based on computed expressions
-		if hasComputedColumns && strings.Contains(err.Error(), "pq: integer out of range") {
+		if strings.Contains(err.Error(), "pq: integer out of range") {
 			return true
 		}
 
@@ -138,18 +130,22 @@ func TestWriterRandom(t *testing.T) {
 		return err == nil
 	}, 5*time.Second, 100*time.Millisecond, "failed to mutate row after retries")
 
-	// check there is one row in the table
+	rows:= sqlDB.QueryStr(t, `SELECT * FROM test_writer`)
+	require.Len(t, rows, 1, "expected one row after mutation, got %+v", rows)
+
 	sqlDB.CheckQueryResults(t,
-		`SELECT count(*) FROM test_writer`,
+		`SELECT COUNT(*) FROM test_writer`,
 		[][]string{{"1"}},
 	)
 
 	t.Logf("deleting row: %+v", row)
 	require.NoError(t, writer.deleteRow(ctx, row))
 
-	rows := sqlDB.QueryStr(t, `SELECT * FROM test_writer`)
-	if len(rows) != 0 {
-		t.Fatalf("expected 0 rows, got %d", len(rows))
-	}
-	require.Equal(t, rows, [][]string{}, "failed to delete row (%+v)", row)
+	rows = sqlDB.QueryStr(t, `SELECT * FROM test_writer`)
+	require.Empty(t, rows, "failed to delete row (%+v)", row)
+
+	sqlDB.CheckQueryResults(t,
+		`SELECT COUNT(*) FROM test_writer`,
+		[][]string{{"0"}},
+	)
 }

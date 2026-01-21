@@ -72,7 +72,7 @@ func (w *conflict) Hooks() workload.Hooks {
 func (w *conflict) Tables() []workload.Table {
 	rng := rand.New(rand.NewSource(RandomSeed.Seed()))
 
-	statement := ldrrandgen.GenerateLDRTable(context.TODO(), rng, "fonflict", true)
+	statement := ldrrandgen.GenerateLDRTable(context.TODO(), rng, "fonflict")
 	ctx := tree.NewFmtCtx(tree.FmtParsable)
 	statement.FormatBody(ctx)
 	table := workload.Table{
