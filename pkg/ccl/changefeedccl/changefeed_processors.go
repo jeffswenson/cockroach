@@ -1739,6 +1739,7 @@ func (cf *changeFrontier) noteAggregatorProgress(ctx context.Context, d rowenc.E
 
 	cf.maybeMarkJobIdle(resolvedSpans.Stats.RecentKvCount)
 
+	log.Changefeed.Infof(ctx, "processing %d resolved spans from aggregator", len(resolvedSpans.ResolvedSpans))
 	for _, resolved := range resolvedSpans.ResolvedSpans {
 		// Inserting a timestamp less than the one the changefeed flow started at
 		// could potentially regress the job progress. This is not expected, but it
@@ -1757,6 +1758,7 @@ func (cf *changeFrontier) noteAggregatorProgress(ctx context.Context, d rowenc.E
 			return err
 		}
 	}
+	log.Changefeed.Info(ctx, "completed processing resolved spans from aggregator")
 
 	cf.updateProgressSkewMetrics()
 
@@ -1888,6 +1890,9 @@ func (cf *changeFrontier) checkpointJobProgress(
 		if err := cf.js.job.DebugNameNoTxn(changefeedJobProgressTxnName).Update(cf.Ctx(), func(
 			txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
 		) error {
+			log.Changefeed.Infof(ctx, "checkpointing job progress: highwater=%s checkpoint=%s",
+				frontier, spanLevelCheckpoint)
+
 			var err error
 			if err = md.CheckRunningOrReverting(); err != nil {
 				return err
@@ -1918,15 +1923,14 @@ func (cf *changeFrontier) checkpointJobProgress(
 
 			return nil
 		}); err != nil {
+			log.Changefeed.Warningf(ctx, "error checkpointing job progress: %v", err)
 			return err
 		}
 		if ptsUpdated {
 			cf.lastProtectedTimestampUpdate = timeutil.Now()
 		}
-		if log.V(2) {
 			log.Changefeed.Infof(cf.Ctx(), "change frontier persisted highwater=%s and checkpoint=%s",
 				frontier, spanLevelCheckpoint)
-		}
 	}
 
 	cf.localState.SetHighwater(frontier)

@@ -82,6 +82,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/goroutinedump"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/listenerutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/pgurlutils"
@@ -8868,13 +8869,16 @@ func TestChangefeedHandlesRollingRestart(t *testing.T) {
 // advance its resolved timestamp after a rolling restart. At the lowest level,
 // the test ensures that lease acquisitions required to advance the closed
 // timestamp of the constituent changefeed ranges is fast.
+//
+// This test uses mux rangefeeds (the default and only implementation).
 func TestChangefeedTimelyResolvedTimestampUpdatePostRollingRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
+	logScope := log.Scope(t)
+	defer logScope.Close(t)
 
 	// Add verbose logging to help debug future failures.
-	testutils.SetVModule(t, "changefeed_processors=1,replica_rangefeed=2,"+
-		"replica_range_lease=3,raft=3")
+	// testutils.SetVModule(t, "changefeed_processors=1,replica_rangefeed=2,"+
+	// 	"replica_range_lease=3,raft=3")
 
 	// This test requires many range splits, which can be slow under certain test
 	// conditions. Skip potentially slow tests.
@@ -8894,6 +8898,12 @@ func TestChangefeedTimelyResolvedTimestampUpdatePostRollingRestart(t *testing.T)
 
 	perServerKnobs := make(map[int]base.TestServerArgs, numNodes)
 	for i := 0; i < numNodes; i++ {
+		// Create per-node log directory so each node has its own logs.
+		nodeDir, err := log.CreateNodeLogDir(logScope.GetDirectory(), i+1)
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		perServerKnobs[i] = base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				DistSQL: &execinfra.TestingKnobs{
@@ -8904,8 +8914,10 @@ func TestChangefeedTimelyResolvedTimestampUpdatePostRollingRestart(t *testing.T)
 					StickyVFSRegistry: stickyVFSRegistry,
 				},
 			},
-			ExternalIODir: opts.externalIODir,
-			UseDatabase:   "d",
+			ExternalIODir:         opts.externalIODir,
+			UseDatabase:           "d",
+			LogDir:                nodeDir,
+			EnableLogFileRollover: true,
 		}
 	}
 
@@ -8913,6 +8925,7 @@ func TestChangefeedTimelyResolvedTimestampUpdatePostRollingRestart(t *testing.T)
 		base.TestClusterArgs{
 			ServerArgsPerNode: perServerKnobs,
 			ServerArgs: base.TestServerArgs{
+				DefaultDRPCOption: base.TestDRPCDisabled,
 				DefaultTestTenant: base.TestDoesNotWorkWithSecondaryTenantsButWeDontKnowWhyYet(142799),
 			},
 			ReusableListenerReg: listenerReg,
@@ -8953,8 +8966,28 @@ func TestChangefeedTimelyResolvedTimestampUpdatePostRollingRestart(t *testing.T)
 	var tsLogical string
 	sqlDB.QueryRow(t, `SELECT cluster_logical_timestamp()`).Scan(&tsLogical)
 
+	// Log fortification state before the rolling restart.
+	t.Logf("Fortification state before rolling restart:")
+	logLeaseFortificationState(t, tc)
+
 	// Perform the rolling restart.
-	require.NoError(t, tc.Restart())
+	for i := 0; i < numNodes; i++ {
+		t.Logf("shutting down node %d for rolling restart", i)
+		tc.StopServer(i)
+		t.Logf("restarting node %d", i)
+		require.NoError(t, tc.RestartServer(i))
+
+		// Wait for the node to be healthy by verifying it can serve queries.
+		testutils.SucceedsSoon(t, func() error {
+			var result int
+			return tc.ServerConn(i).QueryRow("SELECT 1").Scan(&result)
+		})
+		t.Logf("node %d is healthy", i)
+	}
+
+	// Log fortification state after the rolling restart.
+	t.Logf("Fortification state after rolling restart:")
+	logLeaseFortificationState(t, tc)
 
 	// For validation, the test requires an enterprise feed.
 	feedTestEnterpriseSinks(&opts)
@@ -8964,17 +8997,33 @@ func TestChangefeedTimelyResolvedTimestampUpdatePostRollingRestart(t *testing.T)
 	// The end time is captured post restart. The changefeed spans from before the
 	// restart to after.
 	endTime := tc.Server(0).Clock().Now().AddDuration(5 * time.Second)
+
+	// Log fortification state before starting the changefeed.
+	t.Logf("Fortification state before starting changefeed:")
+	logLeaseFortificationState(t, tc)
+
 	testFeed := feed(t, f, `CREATE CHANGEFEED FOR d.foo WITH cursor=$1, end_time=$2`,
 		tsLogical, eval.TimestampToDecimalDatum(endTime).String())
 	defer closeFeed(t, testFeed)
 
 	defer DiscardMessages(testFeed)()
 
+	// Schedule a goroutine dump if the changefeed takes too long to unpause.
+	dumpTimer := time.AfterFunc(45*time.Second, func() {
+		t.Logf("Changefeed taking too long to complete - logging fortification state:")
+		logLeaseFortificationState(t, tc)
+		goroutinedump.CaptureDump(t, logScope.GetDirectory(), "changefeed_slow_unpause")
+		captureLockTableDump(t, tc, logScope.GetDirectory(), "changefeed_slow_unpause")
+	})
+	defer dumpTimer.Stop()
+
 	// Ensure the changefeed is able to complete in a reasonable amount of time.
-	require.NoError(t, testFeed.(cdctest.EnterpriseTestFeed).WaitDurationForState(time.Minute, func(s jobs.State) bool {
+	err := testFeed.(cdctest.EnterpriseTestFeed).WaitDurationForState(time.Minute, func(s jobs.State) bool {
 		require.NoError(t, testFeed.(cdctest.EnterpriseTestFeed).FetchTerminalJobErr())
 		return s == jobs.StateSucceeded
-	}))
+	})
+
+	require.NoError(t, err)
 }
 
 func TestChangefeedPropagatesTerminalError(t *testing.T) {

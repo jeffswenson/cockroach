@@ -159,7 +159,7 @@ func newLogScope(t tShim, mostlyInline bool) (sc *TestLogScope) {
 
 		// Obtain the standard test configuration, with the configured
 		// destination directory.
-		cfg := getTestConfig(&sc.logDir, mostlyInline)
+		cfg := GetTestConfig(&sc.logDir, mostlyInline)
 
 		// Switch to the new configuration. We use ApplyConfigForReconfig to
 		// atomically reset the active flag and apply the new configuration,
@@ -183,13 +183,13 @@ func newLogScope(t tShim, mostlyInline bool) (sc *TestLogScope) {
 	return sc
 }
 
-// getTestConfig initialize the logging configuration to parameters
+// GetTestConfig initializes the logging configuration to parameters
 // suitable for use in tests.
 //
 // fileDir is nil when the function is called without an output
 // directory, to construct the default log config upon init().
 // mostlyInline is true when -show-logs is specified.
-func getTestConfig(fileDir *string, mostlyInline bool) (testConfig logconfig.Config) {
+func GetTestConfig(fileDir *string, mostlyInline bool) (testConfig logconfig.Config) {
 	testConfig = logconfig.DefaultConfig()
 
 	forcePanicsToStderr := func(c *logconfig.Config) {
@@ -377,6 +377,20 @@ func (l *TestLogScope) printableLogDirectory() string {
 // GetDirectory retrieves the log directory for this scope.
 func (l *TestLogScope) GetDirectory() string {
 	return l.logDir
+}
+
+// CreateNodeLogDir creates a node-specific log directory under the given base directory.
+// The directory will be named "node<nodeID>" (e.g., "node1", "node2"). This function
+// creates the directory structure but does not configure logging - that should be handled
+// by the caller (typically via server configuration).
+//
+// Returns the path to the created node directory.
+func CreateNodeLogDir(baseDir string, nodeID int) (string, error) {
+	nodeDir := fmt.Sprintf("%s/node%d", baseDir, nodeID)
+	if err := os.MkdirAll(nodeDir, 0755); err != nil {
+		return "", errors.Wrapf(err, "failed to create node log directory %s", nodeDir)
+	}
+	return nodeDir, nil
 }
 
 // Rotate closes the current log files so that the next log call will

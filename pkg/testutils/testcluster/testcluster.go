@@ -78,6 +78,10 @@ type TestCluster struct {
 	mu      struct {
 		syncutil.Mutex
 		serverStoppers []*stop.Stopper
+		// logCleanupFn is the cleanup function returned by the last call to
+		// log.ApplyConfigForReconfig. It's called before reconfiguring logging
+		// for a new server restart to prevent goroutine leaks.
+		logCleanupFn func()
 	}
 	serverArgs  []base.TestServerArgs
 	clusterArgs base.TestClusterArgs
@@ -230,6 +234,12 @@ func (tc *TestCluster) stopServers(ctx context.Context) {
 	// checks that panic on failure, and ideally we'd run them all before starting
 	// the next test.
 	runtime.GC()
+
+	// Clean up the logging configuration to prevent goroutine leaks.
+	if tc.mu.logCleanupFn != nil {
+		tc.mu.logCleanupFn()
+		tc.mu.logCleanupFn = nil
+	}
 }
 
 // StopServer stops an individual server in the cluster.
@@ -1959,6 +1969,7 @@ func (tc *TestCluster) Restart() error {
 	return nil
 }
 
+
 // RestartServer uses the cached ServerArgs to restart a Server specified by
 // the passed index.
 func (tc *TestCluster) RestartServer(idx int) error {
@@ -1977,6 +1988,43 @@ func (tc *TestCluster) RestartServerWithInspect(
 		return errors.Errorf("server %d must be stopped before attempting to restart", idx)
 	}
 	serverArgs := tc.serverArgs[idx]
+
+	// If this server has per-node logging configured, reconfigure logging for
+	// this node's directory before restarting. This ensures logs from the restart
+	// go to the correct node-specific directory.
+	if serverArgs.LogDir != "" {
+		// Flush current logs to ensure all data is written.
+		log.FlushFiles()
+
+		// Clean up the previous logging configuration to prevent goroutine leaks.
+		// This also closes all file handles, which allows the logging system to
+		// rotate log files when we reconfigure.
+		func() {
+			tc.mu.Lock()
+			defer tc.mu.Unlock()
+			if tc.mu.logCleanupFn != nil {
+				tc.mu.logCleanupFn()
+			}
+		}()
+
+		// Reconfigure logging to use this node's log directory.
+		// Note: This is process-wide, but in a rolling restart scenario, only one
+		// server is restarting at a time, so this is safe.
+		// When EnableLogFileRollover is true and we reconfigure to the same directory,
+		// CockroachDB's logging system will handle rotating the old log files.
+		cfg := log.GetTestConfig(&serverArgs.LogDir, false /* mostlyInline */)
+		cleanupFn, err := log.ApplyConfigForReconfig(cfg, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
+		if err != nil {
+			return errors.Wrapf(err, "failed to reconfigure logging for server %d", idx)
+		}
+
+		// Save the cleanup function for the next reconfiguration or cluster shutdown.
+		func() {
+			tc.mu.Lock()
+			defer tc.mu.Unlock()
+			tc.mu.logCleanupFn = cleanupFn
+		}()
+	}
 
 	if ln := tc.reusableListeners[idx]; ln != nil {
 		serverArgs.Listener = ln

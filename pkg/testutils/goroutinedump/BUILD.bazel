@@ -1,0 +1,12 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "goroutinedump",
+    srcs = ["dump.go"],
+    importpath = "github.com/cockroachdb/cockroach/pkg/testutils/goroutinedump",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/util/allstacks",
+        "//pkg/util/timeutil",
+    ],
+)

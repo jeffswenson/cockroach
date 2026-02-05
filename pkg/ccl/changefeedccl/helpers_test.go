@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"sort"
@@ -38,6 +39,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	slpb "github.com/cockroachdb/cockroach/pkg/kv/kvserver/storeliveness/storelivenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -2194,4 +2197,236 @@ func runWithAndWithoutRegression141453(
 
 			runTestFn(t, testFn)
 		})
+}
+
+// logLeaseFortificationState logs the lease fortification state for all stores
+// in the test cluster. For each store pair, it logs:
+// - Whether store A supports store B (and the expiration time)
+// - Whether store B supports store A (and the expiration time)
+// - The last time each side withdrew support from the other
+//
+// This is useful for debugging lease-related issues where fortification state
+// may affect lease acquisition or resolved timestamp advancement.
+func logLeaseFortificationState(t *testing.T, tc serverutils.TestClusterInterface) {
+	t.Helper()
+
+	numServers := tc.NumServers()
+
+	// Get the current HLC time from the cluster.
+	now := tc.Server(0).Clock().Now()
+
+	// Collect all support state from all stores.
+	type storeState struct {
+		storeID     roachpb.StoreID
+		supportFrom []slpb.SupportState
+		supportFor  []slpb.InspectSupportForState
+	}
+
+	states := make([]storeState, 0, numServers)
+
+	for i := 0; i < numServers; i++ {
+		store, err := tc.Server(i).GetStores().(*kvserver.Stores).GetStore(tc.Server(i).GetFirstStoreID())
+		if err != nil {
+			t.Logf("failed to get store for node %d: %v", i, err)
+			continue
+		}
+
+		sm := store.TestingStoreLivenessSupportManager()
+		supportFromData := sm.InspectSupportFrom()
+		supportForData := sm.InspectSupportFor()
+
+		states = append(states, storeState{
+			storeID:     supportFromData.StoreID.StoreID,
+			supportFrom: supportFromData.SupportFromStates,
+			supportFor:  supportForData.SupportForStates,
+		})
+	}
+
+	t.Logf("=== Lease Fortification State (now=%s) ===", now)
+
+	// Log support relationships in a matrix format.
+	for i, state := range states {
+		t.Logf("Store s%d:", state.storeID)
+
+		// Log support FROM other stores (support received).
+		if len(state.supportFrom) > 0 {
+			t.Logf("  Receives support from:")
+			for _, sf := range state.supportFrom {
+				if sf.Expiration.IsEmpty() {
+					t.Logf("    s%d: epoch=%d, no_expiration", sf.Target.StoreID, sf.Epoch)
+				} else {
+					diff := sf.Expiration.GoTime().Sub(now.GoTime())
+					if diff > 0 {
+						t.Logf("    s%d: epoch=%d, expires_in=%s", sf.Target.StoreID, sf.Epoch, diff)
+					} else {
+						t.Logf("    s%d: epoch=%d, expired=%s_ago", sf.Target.StoreID, sf.Epoch, -diff)
+					}
+				}
+			}
+		} else {
+			t.Logf("  Receives support from: (none)")
+		}
+
+		// Log support FOR other stores (support provided).
+		if len(state.supportFor) > 0 {
+			t.Logf("  Provides support to:")
+			for _, sf := range state.supportFor {
+				var expStr string
+				if sf.Expiration.IsEmpty() {
+					expStr = "no_expiration"
+				} else {
+					diff := sf.Expiration.GoTime().Sub(now.GoTime())
+					if diff > 0 {
+						expStr = fmt.Sprintf("expires_in=%s", diff)
+					} else {
+						expStr = fmt.Sprintf("expired=%s_ago", -diff)
+					}
+				}
+
+				var withdrawnStr string
+				if sf.LastSupportWithdrawnTime.IsEmpty() {
+					withdrawnStr = "never_withdrawn"
+				} else {
+					diff := now.GoTime().Sub(sf.LastSupportWithdrawnTime.GoTime())
+					withdrawnStr = fmt.Sprintf("withdrawn=%s_ago", diff)
+				}
+
+				t.Logf("    s%d: epoch=%d, %s, %s",
+					sf.Target.StoreID, sf.Epoch, expStr, withdrawnStr)
+			}
+		} else {
+			t.Logf("  Provides support to: (none)")
+		}
+
+		if i < len(states)-1 {
+			t.Logf("")
+		}
+	}
+
+	t.Logf("=== End Fortification State ===")
+}
+
+// captureLockTableDump captures the current state of the lock table and saves it
+// to a file. This is useful for debugging when tests time out or fail, as it
+// shows what locks are held and any contention that may be blocking progress.
+//
+// The file is saved to the specified directory (typically the test's log directory).
+// The namePrefix is used to create a descriptive filename along with a timestamp.
+func captureLockTableDump(
+	t *testing.T, tc serverutils.TestClusterInterface, dir, namePrefix string,
+) {
+	t.Helper()
+
+	db := tc.ServerConn(0)
+	rows, err := db.Query(`
+		SELECT
+			range_id,
+			table_id,
+			database_name,
+			schema_name,
+			table_name,
+			index_name,
+			lock_key_pretty,
+			txn_id,
+			ts,
+			lock_strength,
+			durability,
+			granted,
+			contended,
+			duration,
+			isolation_level
+		FROM crdb_internal.cluster_locks
+		ORDER BY contended DESC, duration DESC NULLS LAST, range_id, lock_key_pretty
+	`)
+	if err != nil {
+		t.Logf("Failed to query lock table: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	filename := fmt.Sprintf("%s_lock_table_dump_%s.txt",
+		namePrefix, timeutil.Now().Format("20060102_150405"))
+	path := filepath.Join(dir, filename)
+
+	file, err := os.Create(path)
+	if err != nil {
+		t.Logf("Failed to create lock table dump file: %v", err)
+		return
+	}
+	defer file.Close()
+
+	fmt.Fprintf(file, "=== Lock Table Dump ===\n")
+	fmt.Fprintf(file, "Generated at: %s\n\n", timeutil.Now().Format(time.RFC3339))
+
+	lockCount := 0
+	for rows.Next() {
+		var (
+			rangeID       int64
+			tableID       int64
+			databaseName  string
+			schemaName    string
+			tableName     string
+			indexName     gosql.NullString
+			lockKeyPretty string
+			txnID         gosql.NullString
+			ts            gosql.NullTime
+			lockStrength  gosql.NullString
+			durability    gosql.NullString
+			granted       gosql.NullBool
+			contended     bool
+			duration      gosql.NullString
+			isolationLvl  gosql.NullString
+		)
+
+		if err := rows.Scan(
+			&rangeID, &tableID, &databaseName, &schemaName, &tableName,
+			&indexName, &lockKeyPretty, &txnID, &ts, &lockStrength,
+			&durability, &granted, &contended, &duration, &isolationLvl,
+		); err != nil {
+			t.Logf("Failed to scan lock row: %v", err)
+			continue
+		}
+
+		lockCount++
+		fmt.Fprintf(file, "Lock #%d:\n", lockCount)
+		fmt.Fprintf(file, "  Range ID: %d\n", rangeID)
+		fmt.Fprintf(file, "  Table: %s.%s.%s (ID: %d)\n", databaseName, schemaName, tableName, tableID)
+		if indexName.Valid {
+			fmt.Fprintf(file, "  Index: %s\n", indexName.String)
+		}
+		fmt.Fprintf(file, "  Lock Key: %s\n", lockKeyPretty)
+
+		if txnID.Valid {
+			fmt.Fprintf(file, "  Transaction ID: %s\n", txnID.String)
+		}
+		if ts.Valid {
+			fmt.Fprintf(file, "  Timestamp: %s\n", ts.Time.Format(time.RFC3339))
+		}
+		if lockStrength.Valid {
+			fmt.Fprintf(file, "  Lock Strength: %s\n", lockStrength.String)
+		}
+		if durability.Valid {
+			fmt.Fprintf(file, "  Durability: %s\n", durability.String)
+		}
+		if granted.Valid {
+			fmt.Fprintf(file, "  Granted: %t\n", granted.Bool)
+		}
+		fmt.Fprintf(file, "  Contended: %t\n", contended)
+		if duration.Valid {
+			fmt.Fprintf(file, "  Duration: %s\n", duration.String)
+		}
+		if isolationLvl.Valid {
+			fmt.Fprintf(file, "  Isolation Level: %s\n", isolationLvl.String)
+		}
+		fmt.Fprintf(file, "\n")
+	}
+
+	if err := rows.Err(); err != nil {
+		t.Logf("Error iterating lock rows: %v", err)
+	}
+
+	fmt.Fprintf(file, "=== End Lock Table Dump ===\n")
+	fmt.Fprintf(file, "Total locks: %d\n", lockCount)
+
+	t.Logf("Wrote lock table dump (%d locks) to %s", lockCount, path)
 }

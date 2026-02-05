@@ -2652,6 +2652,7 @@ GO_TARGETS = [
     "//pkg/testutils/fingerprintutils:fingerprintutils_test",
     "//pkg/testutils/floatcmp:floatcmp",
     "//pkg/testutils/floatcmp:floatcmp_test",
+    "//pkg/testutils/goroutinedump:goroutinedump",
     "//pkg/testutils/gossiputil:gossiputil",
     "//pkg/testutils/grpcutils:grpcutils",
     "//pkg/testutils/jobutils:jobutils",

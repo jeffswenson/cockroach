@@ -158,6 +158,15 @@ type TestServerArgs struct {
 	// If set, a TraceDir is initialized at the provided path.
 	TraceDir string
 
+	// LogDir specifies a custom log directory for this server.
+	// If set, the server's logs will be written to this directory instead of
+	// the default test-wide log directory.
+	LogDir string
+
+	// EnableLogFileRollover controls whether to create new log files when
+	// the server restarts. Only effective when LogDir is set.
+	EnableLogFileRollover bool
+
 	// DefaultTestTenant determines whether a test's application
 	// workload will be redirected to a virtual cluster (secondary
 	// tenant) automatically.
