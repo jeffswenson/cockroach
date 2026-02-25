@@ -8,6 +8,7 @@ package txnlock
 import (
 	"context"
 	"encoding/binary"
+	"hash"
 	"hash/fnv"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -26,72 +27,81 @@ const (
 	uniqueIndexLock lockKind = 2
 )
 
-func tableMixin(tableID descpb.ID) (uint64, error) {
+func tableMixin(tableID descpb.ID) ([8]byte, error) {
 	h := fnv.New64a()
 	if _, err := h.Write([]byte{byte(primaryKeyLock)}); err != nil {
-		return 0, errors.Wrap(err, "hashing table mixin")
+		return [8]byte{}, errors.Wrap(err, "hashing table mixin")
 	}
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], uint32(tableID))
 	if _, err := h.Write(buf[:]); err != nil {
-		return 0, errors.Wrap(err, "hashing table mixin")
+		return [8]byte{}, errors.Wrap(err, "hashing table mixin")
 	}
-	return h.Sum64(), nil
+	var result [8]byte
+	binary.BigEndian.PutUint64(result[:], h.Sum64())
+	return result, nil
 }
 
-func uniqueIndexMixin(tableID descpb.ID, ucID descpb.IndexID) (uint64, error) {
+func uniqueIndexMixin(tableID descpb.ID, ucID descpb.IndexID) ([8]byte, error) {
 	h := fnv.New64a()
 	if _, err := h.Write([]byte{byte(uniqueIndexLock)}); err != nil {
-		return 0, errors.Wrap(err, "hashing unique index mixin")
+		return [8]byte{}, errors.Wrap(err, "hashing unique index mixin")
 	}
 	var buf [8]byte
 	binary.BigEndian.PutUint32(buf[:4], uint32(tableID))
 	binary.BigEndian.PutUint32(buf[4:], uint32(ucID))
 	if _, err := h.Write(buf[:]); err != nil {
-		return 0, errors.Wrap(err, "hashing unique index mixin")
+		return [8]byte{}, errors.Wrap(err, "hashing unique index mixin")
 	}
-	return h.Sum64(), nil
+	var result [8]byte
+	binary.BigEndian.PutUint64(result[:], h.Sum64())
+	return result, nil
 }
 
 // A columnSet is a collection of columns that are relevant for an individual
-// constraint.
+// constraint. It also holds reusable hashing state to avoid per-call
+// allocations.
 type columnSet struct {
 	columns []int32
-	// mixin is an integer that is combined with the hash. It is used to ensure
-	// different tables or unique constraints produce different hashes.
-	mixin uint64
+	// mixin is a byte prefix combined with the hash to ensure different tables
+	// or unique constraints produce different hashes. Stored as [8]byte so it
+	// can be passed to Write without a stack-to-heap escape.
+	mixin [8]byte
+	// Reusable hashing state, initialized once and reset between uses.
+	hasher         hash.Hash64
+	datumAlloc     tree.DatumAlloc
+	fingerprintBuf []byte
 }
 
 // hash computes the hash that is used as the lock. hash(rowA) != hash(rowB)
 // implies !equal(rowA, rowB).
 func (c *columnSet) hash(ctx context.Context, row tree.Datums) (uint64, error) {
-	h := fnv.New64a()
-	// Include the prefix in the hash to ensure different tables/constraints
+	c.hasher.Reset()
+	// Include the mixin in the hash to ensure different tables/constraints
 	// produce different hashes even with the same column values.
-	var prefixBytes [8]byte
-	binary.BigEndian.PutUint64(prefixBytes[:], c.mixin)
-	if _, err := h.Write(prefixBytes[:]); err != nil {
+	if _, err := c.hasher.Write(c.mixin[:]); err != nil {
 		return 0, errors.Wrap(err, "hashing mixin for lock derivation")
 	}
 	for _, idx := range c.columns {
 		datum := row[idx]
-		// Encode the datum for consistent hashing
 		ed := rowenc.EncDatum{Datum: datum}
-		encoded, err := ed.Fingerprint(
+		var err error
+		c.fingerprintBuf, err = ed.Fingerprint(
 			ctx,
 			datum.ResolvedType(),
-			&tree.DatumAlloc{},
-			nil, /* appendTo */
+			&c.datumAlloc,
+			c.fingerprintBuf[:0],
 			nil, /* acc */
 		)
 		if err != nil {
 			return 0, errors.Wrap(err, "hashing datum for lock derivation")
 		}
-		if _, err := h.Write(encoded); err != nil {
-			return 0, errors.Wrap(err, "hashing encoded datum for lock derivation")
+		if _, err := c.hasher.Write(c.fingerprintBuf); err != nil {
+			return 0,
+				errors.Wrap(err, "hashing encoded datum for lock derivation")
 		}
 	}
-	return h.Sum64(), nil
+	return c.hasher.Sum64(), nil
 }
 
 // null returns true if any of the columns are null.
@@ -112,15 +122,14 @@ func (c *columnSet) null(row tree.Datums) bool {
 func (c *columnSet) equal(
 	ctx context.Context, evalCtx *eval.Context, rowA, rowB tree.Datums,
 ) (bool, error) {
-	// if either is null return false
 	if c.null(rowA) || c.null(rowB) {
 		return false, nil
 	}
-	// compare each column in the set
 	for _, idx := range c.columns {
 		cmp, err := rowA[idx].Compare(ctx, evalCtx, rowB[idx])
 		if err != nil {
-			return false, errors.Wrap(err, "comparing datums for lock derivation")
+			return false,
+				errors.Wrap(err, "comparing datums for lock derivation")
 		}
 		if cmp != 0 {
 			return false, nil

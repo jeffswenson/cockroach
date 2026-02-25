@@ -7,6 +7,7 @@ package txnlock
 
 import (
 	"context"
+	"hash/fnv"
 	"math/rand"
 	"testing"
 
@@ -41,6 +42,7 @@ func TestColumnSet(t *testing.T) {
 		evalCtx := eval.Context{}
 		colSet := columnSet{
 			columns: make([]int32, len(types)),
+			hasher:  fnv.New64a(),
 		}
 		for i := range len(types) {
 			colSet.columns[i] = int32(i)

@@ -7,6 +7,7 @@ package txnlock
 
 import (
 	"context"
+	"hash/fnv"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -50,8 +51,14 @@ func TestNewTableConstraints(t *testing.T) {
 			`,
 			tableName: "test1",
 			want: &tableConstraints{
-				PrimaryKey:        columnSet{columns: []int32{0}},     // column "a" at index 0
-				UniqueConstraints: []columnSet{{columns: []int32{1}}}, // unique "b" at index 1
+				PrimaryKey: columnSet{
+					columns: []int32{0},
+					hasher:  fnv.New64a(),
+				},
+				UniqueConstraints: []columnSet{{
+					columns: []int32{1},
+					hasher:  fnv.New64a(),
+				}},
 			},
 		},
 		{
@@ -68,8 +75,14 @@ func TestNewTableConstraints(t *testing.T) {
 			`,
 			tableName: "test2",
 			want: &tableConstraints{
-				PrimaryKey:        columnSet{columns: []int32{0, 1}},     // columns "a", "b" at indices 0, 1
-				UniqueConstraints: []columnSet{{columns: []int32{2, 3}}}, // unique (c,d)
+				PrimaryKey: columnSet{
+					columns: []int32{0, 1},
+					hasher:  fnv.New64a(),
+				},
+				UniqueConstraints: []columnSet{{
+					columns: []int32{2, 3},
+					hasher:  fnv.New64a(),
+				}},
 			},
 		},
 		{
@@ -84,8 +97,14 @@ func TestNewTableConstraints(t *testing.T) {
 			`,
 			tableName: "test3",
 			want: &tableConstraints{
-				PrimaryKey:        columnSet{columns: []int32{0}},                            // column "id" at index 0
-				UniqueConstraints: []columnSet{{columns: []int32{1}}, {columns: []int32{2}}}, // unique "email", "username"
+				PrimaryKey: columnSet{
+					columns: []int32{0},
+					hasher:  fnv.New64a(),
+				},
+				UniqueConstraints: []columnSet{
+					{columns: []int32{1}, hasher: fnv.New64a()},
+					{columns: []int32{2}, hasher: fnv.New64a()},
+				},
 			},
 		},
 	}
@@ -117,7 +136,9 @@ func TestNewTableConstraints(t *testing.T) {
 			idx := 0
 			for _, uc := range tableDesc.EnforcedUniqueConstraintsWithIndex() {
 				if uc.GetID() != primaryIndex.GetID() {
-					ucMixin, err := uniqueIndexMixin(tableDesc.GetID(), uc.GetID())
+					ucMixin, err := uniqueIndexMixin(
+						tableDesc.GetID(), uc.GetID(),
+					)
 					require.NoError(t, err)
 					tc.want.UniqueConstraints[idx].mixin = ucMixin
 					idx++

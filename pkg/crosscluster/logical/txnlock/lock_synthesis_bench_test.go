@@ -8,6 +8,7 @@ package txnlock
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/ldrdecoder"
@@ -64,10 +65,12 @@ func BenchmarkDeriveLocks(b *testing.B) {
 				PrimaryKey: columnSet{
 					columns: []int32{0},
 					mixin:   pkMixin,
+					hasher:  fnv.New64a(),
 				},
 				UniqueConstraints: []columnSet{{
 					columns: []int32{1},
 					mixin:   ucMixin,
+					hasher:  fnv.New64a(),
 				}},
 			},
 		},
@@ -76,6 +79,7 @@ func BenchmarkDeriveLocks(b *testing.B) {
 	for _, n := range []int{2, 10, 50} {
 		rows := makeBenchRows(tableID, n)
 		b.Run(fmt.Sprintf("rows=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
 			ctx := context.Background()
 			for i := 0; i < b.N; i++ {
 				if _, err := ls.DeriveLocks(ctx, rows); err != nil {

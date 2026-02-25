@@ -7,6 +7,7 @@ package txnlock
 
 import (
 	"context"
+	"hash/fnv"
 
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/ldrdecoder"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/sqlwriter"
@@ -35,7 +36,7 @@ func newTableConstraints(
 
 	tc := &tableConstraints{evalCtx: evalCtx}
 
-	// Extract primary key columns
+	// Extract primary key columns.
 	primaryIndex := table.GetPrimaryIndex()
 	pkMixin, err := tableMixin(table.GetID())
 	if err != nil {
@@ -44,13 +45,14 @@ func newTableConstraints(
 	tc.PrimaryKey = columnSet{
 		columns: make([]int32, primaryIndex.NumKeyColumns()),
 		mixin:   pkMixin,
+		hasher:  fnv.New64a(),
 	}
 	for i := 0; i < primaryIndex.NumKeyColumns(); i++ {
 		colID := primaryIndex.GetKeyColumnID(i)
 		tc.PrimaryKey.columns[i] = colIDToIndex[colID]
 	}
 
-	// Extract unique constraints with indexes (excluding primary key)
+	// Extract unique constraints with indexes (excluding primary key).
 	for _, uc := range table.EnforcedUniqueConstraintsWithIndex() {
 		if uc.GetID() == primaryIndex.GetID() {
 			continue
@@ -67,10 +69,11 @@ func newTableConstraints(
 		tc.UniqueConstraints = append(tc.UniqueConstraints, columnSet{
 			columns: cols,
 			mixin:   ucMixin,
+			hasher:  fnv.New64a(),
 		})
 	}
 
-	// Extract unique constraints without indexes
+	// Extract unique constraints without indexes.
 	for _, uc := range table.EnforcedUniqueConstraintsWithoutIndex() {
 		colIDs := uc.CollectKeyColumnIDs().Ordered()
 		cols := make([]int32, len(colIDs))
@@ -87,6 +90,7 @@ func newTableConstraints(
 		tc.UniqueConstraints = append(tc.UniqueConstraints, columnSet{
 			columns: cols,
 			mixin:   ucMixin,
+			hasher:  fnv.New64a(),
 		})
 	}
 
@@ -100,10 +104,9 @@ func (t *tableConstraints) deriveLocks(
 	if err != nil {
 		return nil, err
 	}
-	locks = append(locks, Lock{
-		Hash: pkHash,
-	})
-	for _, uc := range t.UniqueConstraints {
+	locks = append(locks, Lock{Hash: pkHash})
+	for i := range t.UniqueConstraints {
+		uc := &t.UniqueConstraints[i]
 		if uc.null(row.Row) && uc.null(row.PrevRow) {
 			continue
 		}
@@ -119,20 +122,14 @@ func (t *tableConstraints) deriveLocks(
 			if err != nil {
 				return nil, err
 			}
-			locks = append(locks, Lock{
-				Hash: h,
-				Read: false,
-			})
+			locks = append(locks, Lock{Hash: h})
 		}
 		if !uc.null(row.PrevRow) {
 			h, err := uc.hash(ctx, row.PrevRow)
 			if err != nil {
 				return nil, err
 			}
-			locks = append(locks, Lock{
-				Hash: h,
-				Read: false,
-			})
+			locks = append(locks, Lock{Hash: h})
 		}
 	}
 	return locks, nil
@@ -147,7 +144,8 @@ func (t *tableConstraints) DependsOn(
 	if len(t.UniqueConstraints) == 0 {
 		return false, nil
 	}
-	for _, uc := range t.UniqueConstraints {
+	for i := range t.UniqueConstraints {
+		uc := &t.UniqueConstraints[i]
 		eq, err := uc.equal(ctx, t.evalCtx, a.Row, b.PrevRow)
 		if err != nil {
 			return false, err

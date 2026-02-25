@@ -7,7 +7,6 @@ package txnlock
 
 import (
 	"context"
-	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/ldrdecoder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -18,6 +17,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// Lock represents a lock that must be acquired before applying a row mutation.
 type Lock struct {
 	Hash uint64
 	// TODO(jeffswenson): Read will be set to true for foreign key locks that
@@ -25,15 +25,40 @@ type Lock struct {
 	Read bool
 }
 
+// LockSet contains the set of locks and the topologically sorted rows for a
+// transaction.
 type LockSet struct {
 	Locks      []Lock
 	SortedRows []ldrdecoder.DecodedRow
 }
 
-type LockSynthesizer struct {
-	tableConstraints map[descpb.ID]*tableConstraints
+// deriveScratch holds reusable buffers that are reset between DeriveLocks
+// calls. This avoids per-call allocations for all intermediate state, so that
+// the only steady-state allocations are the two output slices (Locks and
+// SortedRows).
+type deriveScratch struct {
+	// lockBuf is a flat buffer holding all locks for all rows. Row i's locks
+	// are lockBuf[lockOffsets[i]:lockOffsets[i+1]].
+	lockBuf     []Lock
+	lockOffsets []int
+
+	// lockMap maps lock hashes to indices in lockEntries.
+	lockMap     map[uint64]int
+	lockEntries []lockWithRows
+
+	// sortStatus tracks visit state during topological sort.
+	sortStatus []sortStatus
 }
 
+// LockSynthesizer derives locks and topological ordering for transaction rows.
+// It is not safe for concurrent use; each goroutine must have its own instance.
+type LockSynthesizer struct {
+	tableConstraints map[descpb.ID]*tableConstraints
+	scratch          deriveScratch
+}
+
+// NewLockSynthesizer creates a LockSynthesizer by acquiring leases for all
+// destination tables and building their constraint metadata.
 func NewLockSynthesizer(
 	ctx context.Context,
 	evalCtx *eval.Context,
@@ -42,10 +67,11 @@ func NewLockSynthesizer(
 	tableMappings []ldrdecoder.TableMapping,
 ) (*LockSynthesizer, error) {
 	ls := &LockSynthesizer{
-		tableConstraints: make(map[descpb.ID]*tableConstraints, len(tableMappings)),
+		tableConstraints: make(
+			map[descpb.ID]*tableConstraints, len(tableMappings),
+		),
 	}
 
-	// Acquire leases for all destination tables and build their constraints
 	timestamp := lease.TimestampToReadTimestamp(clock.Now())
 	for _, mapping := range tableMappings {
 		leasedDesc, err := lm.Acquire(ctx, timestamp, mapping.DestID)
@@ -53,7 +79,6 @@ func NewLockSynthesizer(
 			return nil, err
 		}
 
-		// Build table constraints from the destination descriptor
 		tableDesc, ok := leasedDesc.Underlying().(catalog.TableDescriptor)
 		if !ok {
 			leasedDesc.Release(ctx)
@@ -75,86 +100,96 @@ func NewLockSynthesizer(
 	return ls, nil
 }
 
+// lockWithRows tracks which rows share a particular lock hash.
 type lockWithRows struct {
 	rows    []int32
 	scratch [8]int32
 	isRead  bool
 }
 
-var lockWithRowsPool = sync.Pool{
-	New: func() interface{} {
-		return &lockWithRows{}
-	},
-}
-
+// DeriveLocks computes the locks required for a set of transaction rows and
+// returns them in topologically sorted order. The only steady-state
+// allocations are the two output slices (Locks and SortedRows).
 func (ls *LockSynthesizer) DeriveLocks(
 	ctx context.Context, rows []ldrdecoder.DecodedRow,
 ) (LockSet, error) {
-	// We build a table of locks for two reasons:
-	// 1. We use it to eliminate duplicate locks for the same row.
-	// 2. We need to topologically sort the rows to get an apply order and
-	//    we can use the set of lock conflicts to identify possible dependencies.
-	locks := map[uint64]*lockWithRows{}
-	rowLocks := make([][]Lock, len(rows))
+	s := &ls.scratch
+
+	// Reset scratch buffers.
+	s.lockBuf = s.lockBuf[:0]
+	s.lockEntries = s.lockEntries[:0]
+	if s.lockMap == nil {
+		s.lockMap = make(map[uint64]int)
+	} else {
+		clear(s.lockMap)
+	}
+
+	// Grow lockOffsets to len(rows)+1.
+	if cap(s.lockOffsets) < len(rows)+1 {
+		s.lockOffsets = make([]int, len(rows)+1)
+	} else {
+		s.lockOffsets = s.lockOffsets[:len(rows)+1]
+	}
+	s.lockOffsets[0] = 0
 
 	for i, row := range rows {
 		var err error
-		rowLocks[i], err = ls.deriveLocks(ctx, row, nil)
+		s.lockBuf, err = ls.appendLocks(ctx, row, s.lockBuf)
 		if err != nil {
 			return LockSet{}, err
 		}
-		for _, lock := range rowLocks[i] {
-			lr, ok := locks[lock.Hash]
+		s.lockOffsets[i+1] = len(s.lockBuf)
+
+		for j := s.lockOffsets[i]; j < s.lockOffsets[i+1]; j++ {
+			lock := s.lockBuf[j]
+			idx, ok := s.lockMap[lock.Hash]
 			if !ok {
-				lr = lockWithRowsPool.Get().(*lockWithRows)
-				lr.rows = lr.scratch[:0]
-				lr.rows = append(lr.rows, int32(i))
-				lr.isRead = lock.Read
-				locks[lock.Hash] = lr
+				idx = len(s.lockEntries)
+				s.lockEntries = append(s.lockEntries, lockWithRows{
+					isRead: lock.Read,
+				})
+				entry := &s.lockEntries[idx]
+				entry.rows = entry.scratch[:0]
+				entry.rows = append(entry.rows, int32(i))
+				s.lockMap[lock.Hash] = idx
 				continue
 			}
-
+			lr := &s.lockEntries[idx]
 			if !lock.Read && lr.isRead {
 				lr.isRead = false
 			}
-
 			if lr.rows[len(lr.rows)-1] != int32(i) {
 				lr.rows = append(lr.rows, int32(i))
 			}
 		}
 	}
 
-	sorted, err := ls.sort(ctx, rows, rowLocks, locks)
+	sorted, err := ls.sort(ctx, rows)
 	if err != nil {
-		for _, lr := range locks {
-			lockWithRowsPool.Put(lr)
-		}
 		return LockSet{}, err
 	}
 
 	lockSet := LockSet{
 		SortedRows: sorted,
-		Locks:      make([]Lock, 0, len(locks)),
+		Locks:      make([]Lock, 0, len(s.lockMap)),
 	}
-
-	for hash, lr := range locks {
+	for hash, idx := range s.lockMap {
 		lockSet.Locks = append(lockSet.Locks, Lock{
 			Hash: hash,
-			Read: lr.isRead,
+			Read: s.lockEntries[idx].isRead,
 		})
-		lockWithRowsPool.Put(lr)
 	}
 
 	return lockSet, nil
 }
 
-func (ls *LockSynthesizer) deriveLocks(
+// appendLocks appends the locks for a single row to the provided slice.
+func (ls *LockSynthesizer) appendLocks(
 	ctx context.Context, row ldrdecoder.DecodedRow, locks []Lock,
 ) ([]Lock, error) {
 	tc, ok := ls.tableConstraints[row.TableID]
 	if !ok {
-		// No constraints for this table, return empty lock set
-		return nil, nil
+		return locks, nil
 	}
 	return tc.deriveLocks(ctx, row, locks)
 }
@@ -163,17 +198,12 @@ func (ls *LockSynthesizer) deriveLocks(
 func (ls *LockSynthesizer) dependsOn(
 	ctx context.Context, a, b ldrdecoder.DecodedRow,
 ) (bool, error) {
-	// If rows are from different tables, no ordering constraint
 	if a.TableID != b.TableID {
 		return false, nil
 	}
-
-	// Look up the table constraints
 	tc, ok := ls.tableConstraints[a.TableID]
 	if !ok {
-		// No constraints for this table
 		return false, nil
 	}
-
 	return tc.DependsOn(ctx, a, b)
 }
