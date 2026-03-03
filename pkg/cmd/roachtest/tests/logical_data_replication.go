@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -77,6 +78,9 @@ type LDRWorkload struct {
 	manualSchemaSetup bool
 	dbName            string
 	tableNames        []string
+	// skipDLQCheck skips DLQ table validation. Transactional mode does not
+	// create DLQ tables.
+	skipDLQCheck bool
 }
 
 func registerLogicalDataReplicationTests(r registry.Registry) {
@@ -241,6 +245,28 @@ func registerLogicalDataReplicationTests(r registry.Registry) {
 			run: TestLDRCreateTablesTPCC,
 		},
 		{
+			name: "ldr/transactional/create/tpcc",
+			clusterSpec: multiClusterSpec{
+				leftNodes:  3,
+				rightNodes: 3,
+				clusterOpts: []spec.Option{
+					spec.CPU(8),
+					spec.WorkloadNode(),
+					spec.WorkloadNodeCPU(8),
+					spec.VolumeSize(100),
+				},
+			},
+			ldrConfig: ldrConfig{
+				initialScanTimeout: 10 * time.Minute,
+				createTables:       true,
+				mode:               ModeTransactional,
+				workloadDuration:   15 * time.Minute,
+			},
+			// Transactional mode is new in v26.3 and won't work on older binaries.
+			mixedVersionMinimum: clusterversion.V26_3,
+			run:                 TestLDRCreateTablesTPCCTxn,
+		},
+		{
 			name: "ldr/conflict",
 			clusterSpec: multiClusterSpec{
 				leftNodes:  3,
@@ -255,6 +281,132 @@ func registerLogicalDataReplicationTests(r registry.Registry) {
 			ldrConfig: ldrConfig{
 				createTables: true,
 			},
+			requiresDeprecatedWorkload: true,
+			run:                        TestLDRConflict,
+		},
+		{
+			name: "ldr/transactional/kv0/basic",
+			clusterSpec: multiClusterSpec{
+				leftNodes:  3,
+				rightNodes: 3,
+				clusterOpts: []spec.Option{
+					spec.CPU(8),
+					spec.WorkloadNode(),
+					spec.WorkloadNodeCPU(8),
+					spec.VolumeSize(100),
+				},
+			},
+			ldrConfig: ldrConfig{mode: ModeTransactional},
+			// Transactional mode is new in v26.3 and won't work on older binaries.
+			mixedVersionMinimum: clusterversion.V26_3,
+			run:                 TestLDRBasic,
+		},
+		{
+			name: "ldr/transactional/kv0/update_heavy",
+			clusterSpec: multiClusterSpec{
+				leftNodes:  3,
+				rightNodes: 3,
+				clusterOpts: []spec.Option{
+					spec.CPU(8),
+					spec.WorkloadNode(),
+					spec.WorkloadNodeCPU(8),
+					spec.VolumeSize(100),
+				},
+			},
+			ldrConfig: ldrConfig{mode: ModeTransactional},
+			// Transactional mode is new in v26.3 and won't work on older binaries.
+			mixedVersionMinimum: clusterversion.V26_3,
+			run:                 TestLDRUpdateHeavy,
+		},
+		{
+			name: "ldr/transactional/kv0/shutdown_node",
+			clusterSpec: multiClusterSpec{
+				leftNodes:  3,
+				rightNodes: 3,
+				clusterOpts: []spec.Option{
+					spec.CPU(8),
+					spec.WorkloadNode(),
+					spec.WorkloadNodeCPU(8),
+					spec.VolumeSize(100),
+				},
+			},
+			ldrConfig: ldrConfig{mode: ModeTransactional},
+			// Transactional mode is new in v26.3 and won't work on older binaries.
+			mixedVersionMinimum: clusterversion.V26_3,
+			run:                 TestLDROnNodeShutdown,
+		},
+		{
+			name: "ldr/transactional/kv0/network_partition",
+			clusterSpec: multiClusterSpec{
+				leftNodes:  3,
+				rightNodes: 3,
+				clusterOpts: []spec.Option{
+					spec.CPU(8),
+					spec.WorkloadNode(),
+					spec.WorkloadNodeCPU(8),
+					spec.VolumeSize(100),
+				},
+			},
+			ldrConfig: ldrConfig{mode: ModeTransactional},
+			// Transactional mode is new in v26.3 and won't work on older binaries.
+			mixedVersionMinimum: clusterversion.V26_3,
+			run:                 TestLDROnNetworkPartition,
+		},
+		{
+			name: "ldr/transactional/kv0/schema_change",
+			clusterSpec: multiClusterSpec{
+				leftNodes:  3,
+				rightNodes: 3,
+				clusterOpts: []spec.Option{
+					spec.CPU(8),
+					spec.WorkloadNode(),
+					spec.WorkloadNodeCPU(8),
+					spec.VolumeSize(100),
+				},
+			},
+			ldrConfig: ldrConfig{mode: ModeTransactional},
+			// Transactional mode is new in v26.3 and won't work on older binaries.
+			mixedVersionMinimum: clusterversion.V26_3,
+			run:                 TestLDRSchemaChange,
+		},
+		{
+			name: "ldr/transactional/tpcc",
+			clusterSpec: multiClusterSpec{
+				leftNodes:  3,
+				rightNodes: 3,
+				clusterOpts: []spec.Option{
+					spec.CPU(8),
+					spec.WorkloadNode(),
+					spec.WorkloadNodeCPU(8),
+					spec.VolumeSize(100),
+				},
+			},
+			ldrConfig: ldrConfig{
+				initialScanTimeout: 30 * time.Minute,
+				mode:               ModeTransactional,
+			},
+			// Transactional mode is new in v26.3 and won't work on older binaries.
+			mixedVersionMinimum: clusterversion.V26_3,
+			run:                 TestLDRTPCC,
+		},
+		{
+			name: "ldr/transactional/conflict",
+			clusterSpec: multiClusterSpec{
+				leftNodes:  3,
+				rightNodes: 3,
+				clusterOpts: []spec.Option{
+					spec.CPU(4),
+					spec.WorkloadNode(),
+					spec.WorkloadNodeCPU(4),
+					spec.VolumeSize(100),
+				},
+			},
+			ldrConfig: ldrConfig{
+				createTables: true,
+				mode:         ModeTransactional,
+			},
+			// Transactional mode is new in v26.3 and won't work on older binaries.
+			mixedVersionMinimum:        clusterversion.V26_3,
 			requiresDeprecatedWorkload: true,
 			run:                        TestLDRConflict,
 		},
@@ -310,8 +462,9 @@ func TestLDRBasic(
 			initWithSplitAndScatter: !c.IsLocal(),
 			uniform:                 true,
 		},
-		dbName:     "kv",
-		tableNames: []string{"kv"},
+		dbName:       "kv",
+		tableNames:   []string{"kv"},
+		skipDLQCheck: ldrConfig.mode.SkipDLQCheck(),
 	}
 
 	leftJobID, rightJobID := setupLDR(ctx, t, c, setup, ldrWorkload, ldrConfig)
@@ -347,8 +500,9 @@ func TestLDRSchemaChange(
 			tolerateErrors:          true,
 			uniform:                 true,
 		},
-		dbName:     "kv",
-		tableNames: []string{"kv"},
+		dbName:       "kv",
+		tableNames:   []string{"kv"},
+		skipDLQCheck: ldrConfig.mode.SkipDLQCheck(),
 	}
 
 	leftJobID, rightJobID := setupLDR(ctx, t, c, setup, ldrWorkload, ldrConfig)
@@ -402,6 +556,7 @@ func TestLDRTPCC(
 		dbName:            "tpcc",
 		manualSchemaSetup: true,
 		tableNames:        []string{"customer", "district", "history", "item", "new_order", "order_line", "order", "stock", "warehouse"},
+		skipDLQCheck:      ldrConfig.mode.SkipDLQCheck(),
 	}
 
 	// Init the clusters manually, so the left has 10 warehouses and the right has
@@ -459,11 +614,15 @@ func TestLDRConflict(
 	c.Run(ctx, option.WithNodes(setup.workloadNode), "./workload", "init", "conflict", leftURL)
 
 	t.Status("creating bidirectional replication job")
-	setup.right.sysSQL.QueryRow(t, `
+	modeOpt := ""
+	if ldrConfig.mode != Default {
+		modeOpt = fmt.Sprintf(", MODE = '%s'", ldrConfig.mode)
+	}
+	setup.right.sysSQL.QueryRow(t, fmt.Sprintf(`
 	CREATE LOGICALLY REPLICATED TABLE conflict.conflict FROM TABLE conflict.conflict
 		ON 'external://left'
-		WITH BIDIRECTIONAL ON 'external://right'
-	`).Scan(&rightJobID)
+		WITH BIDIRECTIONAL ON 'external://right'%s
+	`, modeOpt)).Scan(&rightJobID)
 
 	t.Status("waiting for right job to start up")
 	waitForReplicatedTime(t, rightJobID, setup.right.db, getLogicalDataReplicationJobInfo, 2*time.Minute)
@@ -494,7 +653,7 @@ func TestLDRConflict(
 		leftURL)
 
 	t.Status("verifying results")
-	verifyConflictCorrectness(ctx, t, setup, leftJobID, rightJobID)
+	verifyConflictCorrectness(ctx, t, setup, leftJobID, rightJobID, ldrConfig.mode.SkipDLQCheck())
 }
 
 // verifyConflictCorrectness waits for replication to catch up, checks DLQs,
@@ -505,14 +664,22 @@ func TestLDRConflict(
 // on both sides, the test passes. Otherwise, the test fails and prints the
 // diffs.
 func verifyConflictCorrectness(
-	ctx context.Context, t test.Test, setup multiClusterSetup, leftJobID, rightJobID int,
+	ctx context.Context,
+	t test.Test,
+	setup multiClusterSetup,
+	leftJobID, rightJobID int,
+	skipDLQCheck bool,
 ) {
 	now := timeutil.Now()
 	t.Status("waiting for replicated times to catchup")
 	waitForReplicatedTimeToReachTimestamp(t, leftJobID, setup.left.db, getLogicalDataReplicationJobInfo, 2*time.Minute, now)
-	require.NoError(t, replicationtestutils.CheckEmptyDLQs(ctx, setup.left.db, "conflict"))
+	if !skipDLQCheck {
+		require.NoError(t, replicationtestutils.CheckEmptyDLQs(ctx, setup.left.db, "conflict"))
+	}
 	waitForReplicatedTimeToReachTimestamp(t, rightJobID, setup.right.db, getLogicalDataReplicationJobInfo, 2*time.Minute, now)
-	require.NoError(t, replicationtestutils.CheckEmptyDLQs(ctx, setup.right.db, "conflict"))
+	if !skipDLQCheck {
+		require.NoError(t, replicationtestutils.CheckEmptyDLQs(ctx, setup.right.db, "conflict"))
+	}
 
 	t.Status("comparing fingerprints")
 	fpQuery := "SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE conflict.conflict"
@@ -585,6 +752,7 @@ func TestLDRCreateTablesTPCC(
 		dbName:            "tpcc",
 		manualSchemaSetup: true,
 		tableNames:        []string{"customer", "district", "history", "item", "new_order", "order_line", "order", "stock", "warehouse"},
+		skipDLQCheck:      ldrConfig.mode.SkipDLQCheck(),
 	}
 
 	setup.right.sysSQL.Exec(t, "CREATE DATABASE tpcc")
@@ -619,6 +787,53 @@ func TestLDRCreateTablesTPCC(
 	VerifyCorrectness(ctx, c, t, setup, 0 /* leftJobID */, rightJobID, 2*time.Minute, workload)
 }
 
+// TestLDRCreateTablesTPCCTxn is a variant of TestLDRCreateTablesTPCC that uses
+// MODE = 'transactional' for the LDR stream.
+func TestLDRCreateTablesTPCCTxn(
+	ctx context.Context, t test.Test, c cluster.Cluster, setup multiClusterSetup, ldrConfig ldrConfig,
+) {
+	duration := ldrConfig.workloadDuration
+	schemaWarehouses, workloadWarehouses := 750, 750
+	if c.IsLocal() {
+		duration = 3 * time.Minute
+		schemaWarehouses, workloadWarehouses = 10, 10
+	}
+
+	workload := LDRWorkload{
+		workload: replicateTPCC{
+			warehouses:     workloadWarehouses,
+			duration:       duration,
+			repairOrderIDs: true,
+		},
+		dbName:            "tpcc",
+		manualSchemaSetup: true,
+		tableNames:        []string{"customer", "district", "history", "item", "new_order", "order_line", "order", "stock", "warehouse"},
+		skipDLQCheck:      ldrConfig.mode.SkipDLQCheck(),
+	}
+
+	setup.right.sysSQL.Exec(t, "CREATE DATABASE tpcc")
+	c.Run(ctx,
+		option.WithNodes(setup.workloadNode),
+		fmt.Sprintf("./cockroach workload init tpcc --warehouses=%d --fks=false {pgurl:%d:system}", schemaWarehouses, setup.left.nodes[0]))
+
+	workloadDoneCh := make(chan struct{})
+	monitor := c.NewDeprecatedMonitor(ctx, setup.CRDBNodes())
+	monitor.Go(func(ctx context.Context) error {
+		defer close(workloadDoneCh)
+		return c.RunE(ctx, option.WithNodes(setup.workloadNode), workload.workload.sourceRunCmd("system", setup.left.nodes))
+	})
+
+	_, rightJobID := setupLDR(ctx, t, c, setup, workload, ldrConfig)
+
+	maxExpectedLatency := 3 * time.Minute
+	validateLatency := setupLatencyVerifiers(ctx, t, c, monitor, 0 /* leftJobID */, rightJobID, setup, workloadDoneCh, maxExpectedLatency)
+
+	monitor.Wait()
+	validateLatency()
+
+	VerifyCorrectness(ctx, c, t, setup, 0 /* leftJobID */, rightJobID, 2*time.Minute, workload)
+}
+
 func TestLDRUpdateHeavy(
 	ctx context.Context, t test.Test, c cluster.Cluster, setup multiClusterSetup, ldrConfig ldrConfig,
 ) {
@@ -635,8 +850,9 @@ func TestLDRUpdateHeavy(
 			initRows:         1000,
 			initSplits:       1000,
 		},
-		dbName:     "ycsb",
-		tableNames: []string{"usertable"},
+		dbName:       "ycsb",
+		tableNames:   []string{"usertable"},
+		skipDLQCheck: ldrConfig.mode.SkipDLQCheck(),
 	}
 
 	leftJobID, rightJobID := setupLDR(ctx, t, c, setup, ldrWorkload, ldrConfig)
@@ -675,8 +891,9 @@ func TestLDROnNodeShutdown(
 			initWithSplitAndScatter: true,
 			uniform:                 true,
 		},
-		dbName:     "kv",
-		tableNames: []string{"kv"},
+		dbName:       "kv",
+		tableNames:   []string{"kv"},
+		skipDLQCheck: ldrConfig.mode.SkipDLQCheck(),
 	}
 
 	leftJobID, rightJobID := setupLDR(ctx, t, c, setup, ldrWorkload, ldrConfig)
@@ -795,8 +1012,9 @@ func TestLDROnNetworkPartition(
 			initWithSplitAndScatter: true,
 			uniform:                 true,
 		},
-		dbName:     "kv",
-		tableNames: []string{"kv"},
+		dbName:       "kv",
+		tableNames:   []string{"kv"},
+		skipDLQCheck: ldrConfig.mode.SkipDLQCheck(),
 	}
 
 	leftJobID, rightJobID := setupLDR(ctx, t, c, setup, ldrWorkload, ldrConfig)
@@ -879,15 +1097,24 @@ func (m mode) String() string {
 		return "immediate"
 	case ModeValidated:
 		return "validated"
+	case ModeTransactional:
+		return "transactional"
 	default:
 		return "default"
 	}
+}
+
+// SkipDLQCheck returns true if DLQ table validation should be skipped
+// for this mode. Transactional mode does not create DLQ tables.
+func (m mode) SkipDLQCheck() bool {
+	return m == ModeTransactional
 }
 
 const (
 	Default = iota
 	ModeImmediate
 	ModeValidated
+	ModeTransactional
 )
 
 type multiClusterSpec struct {
@@ -960,6 +1187,11 @@ func (mc *multiCluster) StartCluster(
 	sqlRunner := sqlutils.MakeSQLRunner(db)
 
 	sqlRunner.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
+	sqlRunner.Exec(t, `SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '200ms'`)
+	sqlRunner.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
+	sqlRunner.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '50ms'`)
+	sqlRunner.Exec(t, `SET CLUSTER SETTING physical_replication.producer.timestamp_granularity = '100ms'`)
+	sqlRunner.Exec(t, `SET CLUSTER SETTING physical_replication.producer.min_checkpoint_frequency='100ms'`)
 
 	cleanup := func() {
 		if t.Failed() {
@@ -1049,6 +1281,9 @@ type ldrConfig struct {
 	mode               mode
 	initialScanTimeout time.Duration
 	createTables       bool
+	// workloadDuration overrides the default workload duration for the test.
+	// If zero, the test uses its own default.
+	workloadDuration time.Duration
 }
 
 func setupLDR(
@@ -1086,14 +1321,28 @@ func setupLDR(
 
 	startLDR := func(targetDB *sqlutils.SQLRunner, sourceURL string) int {
 
-		options := ""
+		var optParts []string
 		if ldrConfig.mode != Default {
-			options = fmt.Sprintf("WITH mode='%s'", ldrConfig.mode)
+			optParts = append(optParts, fmt.Sprintf("MODE = '%s'", ldrConfig.mode))
 		}
 		targetDB.Exec(t, fmt.Sprintf("USE %s", dbName))
-		ldrCmd := fmt.Sprintf("CREATE LOGICAL REPLICATION STREAM FROM TABLES %s ON $1 INTO TABLES %s %s", tableNamesStr, tableNamesStr, options)
+
+		var ldrCmd string
 		if ldrConfig.createTables {
-			ldrCmd = fmt.Sprintf("CREATE LOGICALLY REPLICATED TABLES %s FROM TABLES %s ON $1 %s WITH UNIDIRECTIONAL", tableNamesStr, tableNamesStr, options)
+			optParts = append(optParts, "UNIDIRECTIONAL")
+			options := ""
+			if len(optParts) > 0 {
+				options = "WITH " + strings.Join(optParts, ", ")
+			}
+			ldrCmd = fmt.Sprintf("CREATE LOGICALLY REPLICATED TABLES %s FROM TABLES %s ON $1 %s",
+				tableNamesStr, tableNamesStr, options)
+		} else {
+			options := ""
+			if len(optParts) > 0 {
+				options = "WITH " + strings.Join(optParts, ", ")
+			}
+			ldrCmd = fmt.Sprintf("CREATE LOGICAL REPLICATION STREAM FROM TABLES %s ON $1 INTO TABLES %s %s",
+				tableNamesStr, tableNamesStr, options)
 		}
 		r := targetDB.QueryRow(t,
 			ldrCmd,
@@ -1209,10 +1458,14 @@ func VerifyCorrectness(
 	t.Status("waiting for replicated times to catchup before verifying left and right clusters")
 	if leftJobID != 0 {
 		waitForReplicatedTimeToReachTimestamp(t, leftJobID, setup.left.db, getLogicalDataReplicationJobInfo, waitTime, now)
-		require.NoError(t, replicationtestutils.CheckEmptyDLQs(ctx, setup.left.db, ldrWorkload.dbName))
+		if !ldrWorkload.skipDLQCheck {
+			require.NoError(t, replicationtestutils.CheckEmptyDLQs(ctx, setup.left.db, ldrWorkload.dbName))
+		}
 	}
 	waitForReplicatedTimeToReachTimestamp(t, rightJobID, setup.right.db, getLogicalDataReplicationJobInfo, waitTime, now)
-	require.NoError(t, replicationtestutils.CheckEmptyDLQs(ctx, setup.right.db, ldrWorkload.dbName))
+	if !ldrWorkload.skipDLQCheck {
+		require.NoError(t, replicationtestutils.CheckEmptyDLQs(ctx, setup.right.db, ldrWorkload.dbName))
+	}
 
 	t.Status("verifying equality of left and right clusters")
 
