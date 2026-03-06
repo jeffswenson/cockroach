@@ -212,6 +212,7 @@ type datadogWriter struct {
 	threshold         int
 	uploadTime        time.Time
 	storeToNodeMap    map[string]string
+	nodeToRegionMap   map[string]string
 	metricTypeMap     map[string]string
 	noOfUploadWorkers int
 	// isPartialUploadOfFailedRequests indicates whether are we retrying failed requests
@@ -294,6 +295,7 @@ func makeDatadogWriter(
 		threshold:                       threshold,
 		uploadTime:                      currentTime,
 		storeToNodeMap:                  make(map[string]string),
+		nodeToRegionMap:                 make(map[string]string),
 		metricTypeMap:                   metricTypeMap,
 		noOfUploadWorkers:               noOfUploadWorkers,
 		isPartialUploadOfFailedRequests: isPartialUploadOfFailedRequests,
@@ -432,12 +434,14 @@ func (d *datadogWriter) dump(kv *roachpb.KeyValue) (*datadogV2.MetricSeries, err
 	}
 
 	sl := reCrStoreNode.FindStringSubmatch(name)
+	var resolvedNodeID string
 	if len(sl) >= 3 {
 		key := sl[1]
 		series.Metric = sl[2]
 
 		switch key {
 		case "node":
+			resolvedNodeID = source
 			if shouldAddTag(nodeKey) {
 				appendTag(series, nodeKey, source)
 			}
@@ -446,8 +450,11 @@ func (d *datadogWriter) dump(kv *roachpb.KeyValue) (*datadogV2.MetricSeries, err
 				appendTag(series, key, source)
 			}
 			// Add node_id from store-to-node mapping if available
-			if nodeID, ok := d.storeToNodeMap[source]; ok && shouldAddTag(nodeKey) {
-				appendTag(series, nodeKey, nodeID)
+			if nodeID, ok := d.storeToNodeMap[source]; ok {
+				resolvedNodeID = nodeID
+				if shouldAddTag(nodeKey) {
+					appendTag(series, nodeKey, nodeID)
+				}
 			}
 		default:
 			if shouldAddTag(key) {
@@ -457,6 +464,13 @@ func (d *datadogWriter) dump(kv *roachpb.KeyValue) (*datadogV2.MetricSeries, err
 	} else if shouldAddTag(nodeKey) {
 		// No regex match - add default node_id:0
 		appendTag(series, nodeKey, "0")
+	}
+
+	// Add anonymized region tag based on the resolved node ID.
+	if resolvedNodeID != "" && len(d.nodeToRegionMap) > 0 {
+		if region, ok := d.nodeToRegionMap[resolvedNodeID]; ok {
+			appendTag(series, "region", region)
+		}
 	}
 
 	// Convert metric name to Prometheus format and lookup in metricsNameMap
@@ -831,6 +845,9 @@ func (d *datadogWriter) upload(fileName string) error {
 	embeddedMetadata, metadataErr := tsdumpmeta.Read(dec)
 	if metadataErr == nil && embeddedMetadata != nil {
 		d.storeToNodeMap = embeddedMetadata.StoreToNodeMap
+		if embeddedMetadata.NodeToRegionMap != nil {
+			d.nodeToRegionMap = embeddedMetadata.NodeToRegionMap
+		}
 		fmt.Printf("Using embedded store-to-node mapping with %d entries\n", len(d.storeToNodeMap))
 	} else {
 		// Reset the reader since we tried to read metadata. Close the file and

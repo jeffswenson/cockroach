@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -295,11 +296,19 @@ will then convert it to the --format requested in the current invocation.
 					return err
 				}
 
+				// Get node-to-region mapping for metadata. Non-fatal if unavailable.
+				nodeToRegionMap, err := getNodeToRegionMapping(ctx, statusClient)
+				if err != nil {
+					fmt.Fprintf(os.Stderr,
+						"Warning: could not get region mapping: %v\n", err)
+				}
+
 				// Create metadata header
 				metadata := tsdumpmeta.Metadata{
-					Version:        build.BinaryVersion(),
-					StoreToNodeMap: storeToNodeMap,
-					CreatedAt:      timeutil.Now(),
+					Version:         build.BinaryVersion(),
+					StoreToNodeMap:  storeToNodeMap,
+					NodeToRegionMap: nodeToRegionMap,
+					CreatedAt:       timeutil.Now(),
 				}
 
 				stream, err := tsClient.DumpRaw(context.Background(), req)
@@ -648,6 +657,62 @@ func getStoreToNodeMapping(ctx context.Context) (map[string]string, error) {
 		}
 	}
 	return mapping, nil
+}
+
+// getNodeToRegionMapping queries the cluster's node localities and returns a
+// mapping from node ID to an anonymized region label. Unique regions are sorted
+// alphabetically and assigned labels "region-1", "region-2", etc. Nodes without
+// a "region" locality tier are omitted from the map.
+func getNodeToRegionMapping(
+	ctx context.Context, statusClient serverpb.RPCStatusClient,
+) (map[string]string, error) {
+	resp, err := statusClient.Nodes(ctx, &serverpb.NodesRequest{})
+	if err != nil {
+		return nil, err
+	}
+
+	// Collect unique region values across all nodes.
+	regionSet := make(map[string]struct{})
+	type nodeRegion struct {
+		nodeID string
+		region string
+	}
+	var nodeRegions []nodeRegion
+
+	for _, status := range resp.Nodes {
+		region, ok := status.Desc.Locality.Find("region")
+		if !ok {
+			continue
+		}
+		regionSet[region] = struct{}{}
+		nodeRegions = append(nodeRegions, nodeRegion{
+			nodeID: fmt.Sprintf("%d", status.Desc.NodeID),
+			region: region,
+		})
+	}
+
+	if len(regionSet) == 0 {
+		return nil, nil
+	}
+
+	// Sort unique regions alphabetically to assign stable anonymized labels.
+	regions := make([]string, 0, len(regionSet))
+	for r := range regionSet {
+		regions = append(regions, r)
+	}
+	sort.Strings(regions)
+
+	regionToLabel := make(map[string]string, len(regions))
+	for i, r := range regions {
+		regionToLabel[r] = fmt.Sprintf("region-%d", i+1)
+	}
+
+	// Build the node-to-anonymized-region map.
+	result := make(map[string]string, len(nodeRegions))
+	for _, nr := range nodeRegions {
+		result[nr.nodeID] = regionToLabel[nr.region]
+	}
+	return result, nil
 }
 
 func makeOpenMetricsWriter(out io.Writer) *openMetricsWriter {

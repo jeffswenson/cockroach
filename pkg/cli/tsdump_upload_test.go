@@ -314,6 +314,11 @@ func TestTSDumpUploadWithEmbeddedMetadataDataDriven(t *testing.T) {
 			dumpFilePath = generateMockTSDumpFromCSV(t, d.Input)
 			// No extraFlag needed - this tests normal upload without any mapping
 
+		case "upload-datadog-embedded-with-regions":
+			// Embedded metadata with region mapping
+			// This tests that metrics get anonymized region tags from embedded node-to-region mapping
+			dumpFilePath = generateMockTSDumpFromCSV(t, d.Input, withEmbeddedMetadataAndRegions())
+
 		default:
 			t.Fatalf("unknown command: %s", d.Cmd)
 			return ""
@@ -358,6 +363,26 @@ func withEmbeddedMetadata() mockTSDumpOption {
 				"1": "1",
 				"2": "1",
 				"3": "2",
+			},
+			CreatedAt: timeutil.Unix(1609459200, 0),
+		}
+	}
+}
+
+// withEmbeddedMetadataAndRegions adds embedded metadata with both store-to-node
+// and node-to-region mappings to the tsdump file.
+func withEmbeddedMetadataAndRegions() mockTSDumpOption {
+	return func(c *mockTSDumpConfig) {
+		c.metadata = &tsdumpmeta.Metadata{
+			Version: "v23.1.0",
+			StoreToNodeMap: map[string]string{
+				"1": "1",
+				"2": "1",
+				"3": "2",
+			},
+			NodeToRegionMap: map[string]string{
+				"1": "region-1",
+				"2": "region-2",
 			},
 			CreatedAt: timeutil.Unix(1609459200, 0),
 		}
