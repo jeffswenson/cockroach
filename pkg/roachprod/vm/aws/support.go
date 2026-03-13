@@ -186,20 +186,20 @@ func writeStartupScript(
 }
 
 // runCommand is used to invoke an AWS command.
-func (p *Provider) runCommand(l *logger.Logger, args []string) ([]byte, error) {
-	return p.runCommandWithContext(context.Background(), l, args)
+func (c *Client) runCommand(l *logger.Logger, args []string) ([]byte, error) {
+	return c.runCommandWithContext(context.Background(), l, args)
 }
 
-// runCommand is used to invoke an AWS command.
-func (p *Provider) runCommandWithContext(
+// runCommandWithContext is used to invoke an AWS command.
+func (c *Client) runCommandWithContext(
 	ctx context.Context, l *logger.Logger, args []string,
 ) ([]byte, error) {
 
-	if p.Profile != "" {
-		args = append(args[:len(args):len(args)], "--profile", p.Profile)
+	if c.provider.Profile != "" {
+		args = append(args[:len(args):len(args)], "--profile", c.provider.Profile)
 	}
 
-	credentialsEnv, err := p.getEnvironmentAWSCredentials()
+	credentialsEnv, err := c.getEnvironmentAWSCredentials()
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get AWS credentials")
 	}
@@ -220,17 +220,17 @@ func (p *Provider) runCommandWithContext(
 }
 
 // runJSONCommand invokes an aws command and parses the json output.
-func (p *Provider) runJSONCommand(l *logger.Logger, args []string, parsed interface{}) error {
-	return p.runJSONCommandWithContext(context.Background(), l, args, parsed)
+func (c *Client) runJSONCommand(l *logger.Logger, args []string, parsed interface{}) error {
+	return c.runJSONCommandWithContext(context.Background(), l, args, parsed)
 }
 
 // runJSONCommandWithContext invokes an aws command and parses the json output.
-func (p *Provider) runJSONCommandWithContext(
+func (c *Client) runJSONCommandWithContext(
 	ctx context.Context, l *logger.Logger, args []string, parsed interface{},
 ) error {
 	// Force json output in case the user has overridden the default behavior.
 	args = append(args[:len(args):len(args)], "--output", "json")
-	rawJSON, err := p.runCommandWithContext(ctx, l, args)
+	rawJSON, err := c.runCommandWithContext(ctx, l, args)
 	if err != nil {
 		return err
 	}

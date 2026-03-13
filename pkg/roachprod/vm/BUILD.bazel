@@ -13,6 +13,7 @@ go_library(
     deps = [
         "//pkg/roachprod/config",
         "//pkg/roachprod/logger",
+        "//pkg/util/syncutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_spf13_pflag//:pflag",
         "@org_golang_x_sync//errgroup",

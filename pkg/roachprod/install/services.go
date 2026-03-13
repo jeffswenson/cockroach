@@ -178,8 +178,8 @@ func (c *SyncedCluster) discoverServices(
 func (c *SyncedCluster) ListLoadBalancers(l *logger.Logger) ([]vm.ServiceAddress, error) {
 	lock := syncutil.Mutex{}
 	allAddresses := make([]vm.ServiceAddress, 0)
-	err := vm.FanOut(c.VMs, func(provider vm.Provider, vms vm.List) error {
-		addresses, listErr := provider.ListLoadBalancers(l, vms)
+	err := vm.Providers.FanOut(c.VMs, func(client vm.ProviderClient, vms vm.List) error {
+		addresses, listErr := client.ListLoadBalancers(l, vms)
 		if listErr != nil {
 			return listErr
 		}

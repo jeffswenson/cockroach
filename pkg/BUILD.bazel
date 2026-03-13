@@ -1922,7 +1922,6 @@ GO_TARGETS = [
     "//pkg/roachprod/vm/aws:aws_test",
     "//pkg/roachprod/vm/azure:azure",
     "//pkg/roachprod/vm/azure:azure_test",
-    "//pkg/roachprod/vm/flagstub:flagstub",
     "//pkg/roachprod/vm/gce/gcedb:gcedb",
     "//pkg/roachprod/vm/gce/gcedb:gcedb_test",
     "//pkg/roachprod/vm/gce/testutils:testutils",

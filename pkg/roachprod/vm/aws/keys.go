@@ -18,7 +18,7 @@ import (
 )
 
 // sshKeyExists checks to see if there is a an SSH key with the given name in the given region.
-func (p *Provider) sshKeyExists(l *logger.Logger, keyName, region string) (bool, error) {
+func (c *Client) sshKeyExists(l *logger.Logger, keyName, region string) (bool, error) {
 	var data struct {
 		KeyPairs []struct {
 			KeyName string
@@ -28,7 +28,7 @@ func (p *Provider) sshKeyExists(l *logger.Logger, keyName, region string) (bool,
 		"ec2", "describe-key-pairs",
 		"--region", region,
 	}
-	err := p.runJSONCommand(l, args, &data)
+	err := c.runJSONCommand(l, args, &data)
 	if err != nil {
 		return false, err
 	}
@@ -42,7 +42,7 @@ func (p *Provider) sshKeyExists(l *logger.Logger, keyName, region string) (bool,
 
 // sshKeyImport takes the user's local, public SSH key and imports it into the ec2 region so that
 // we can create new hosts with it.
-func (p *Provider) sshKeyImport(l *logger.Logger, keyName, region string) error {
+func (c *Client) sshKeyImport(l *logger.Logger, keyName, region string) error {
 	sshPublicKeyPath, err := config.SSHPublicKeyPath()
 	if err != nil {
 		return err
@@ -53,7 +53,7 @@ func (p *Provider) sshKeyImport(l *logger.Logger, keyName, region string) error 
 	}
 	_ = data.KeyName // silence unused warning
 
-	user, err := p.FindActiveAccount(l)
+	user, err := c.FindActiveAccount(l)
 	if err != nil {
 		return err
 	}
@@ -72,7 +72,7 @@ func (p *Provider) sshKeyImport(l *logger.Logger, keyName, region string) error 
 		"--public-key-material", fmt.Sprintf("fileb://%s", sshPublicKeyPath),
 		"--tag-specifications", tagSpecs,
 	}
-	err = p.runJSONCommand(l, args, &data)
+	err = c.runJSONCommand(l, args, &data)
 	// If two roachprod instances run at the same time with the same key, they may
 	// race to upload the key pair.
 	if err == nil || strings.Contains(err.Error(), "InvalidKeyPair.Duplicate") {
@@ -82,8 +82,8 @@ func (p *Provider) sshKeyImport(l *logger.Logger, keyName, region string) error 
 }
 
 // sshKeyName computes the name of the ec2 ssh key that we'll store the local user's public key in
-func (p *Provider) sshKeyName(l *logger.Logger) (string, error) {
-	user, err := p.FindActiveAccount(l)
+func (c *Client) sshKeyName(l *logger.Logger) (string, error) {
+	user, err := c.FindActiveAccount(l)
 	if err != nil {
 		return "", err
 	}

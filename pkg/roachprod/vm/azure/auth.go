@@ -27,12 +27,12 @@ var hasEnvAuth = os.Getenv("AZURE_TENANT_ID") != "" &&
 // It would be possible to implement an OAuth2 flow, avoiding the need
 // to install the Azure CLI.
 //
-// The Authorizer is memoized in the Provider.
-func (p *Provider) getAuthorizer() (autorest.Authorizer, error) {
+// The Authorizer is memoized in the Client.
+func (c *Client) getAuthorizer() (autorest.Authorizer, error) {
 	var authorizer autorest.Authorizer
-	p.mu.Lock()
-	authorizer = p.mu.authorizer
-	p.mu.Unlock()
+	c.mu.Lock()
+	authorizer = c.mu.authorizer
+	c.mu.Unlock()
 
 	if authorizer != nil {
 		// Return the memoized authorizer if isn't soon to or already expired.
@@ -58,9 +58,9 @@ func (p *Provider) getAuthorizer() (autorest.Authorizer, error) {
 		return nil, errors.Wrap(err, "could not get Azure auth token")
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.mu.authorizer = authorizer
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mu.authorizer = authorizer
 
 	return authorizer, err
 }
@@ -87,8 +87,8 @@ func shouldRefreshAuth(authorizer autorest.Authorizer) (bool, error) {
 }
 
 // getAuthToken extracts the JWT token from the active Authorizer.
-func (p *Provider) getAuthToken() (string, error) {
-	authorizer, err := p.getAuthorizer()
+func (c *Client) getAuthToken() (string, error) {
+	authorizer, err := c.getAuthorizer()
 	if err != nil {
 		return "", err
 	}

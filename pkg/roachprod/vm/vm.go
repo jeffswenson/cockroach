@@ -13,11 +13,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 	"golang.org/x/sync/errgroup"
@@ -289,9 +291,9 @@ func (vm *VM) ZoneEntry() (string, error) {
 
 func (vm *VM) AttachVolume(l *logger.Logger, v Volume) (deviceName string, _ error) {
 	vm.NonBootAttachedVolumes = append(vm.NonBootAttachedVolumes, v)
-	if err := ForProvider(vm.Provider, func(provider Provider) error {
+	if err := ForProvider(vm.Provider, func(client ProviderClient) error {
 		var err error
-		deviceName, err = provider.AttachVolume(l, v, vm)
+		deviceName, err = client.AttachVolume(l, v, vm)
 		return err
 	}); err != nil {
 		return "", err
@@ -551,26 +553,42 @@ type ServiceAddress struct {
 	Port int
 }
 
-// A Provider is a source of virtual machines running on some hosting platform.
+// Provider exposes cheap provider metadata available without
+// triggering expensive initialization. Expensive operations (SDK
+// auth, CLI checks) are accessed via Providers.Client(name).
 type Provider interface {
-	// ConfigureProviderFlags is used to specify flags that apply to the provider
-	// instance and should be used for all clusters managed by the provider.
+	Name() string
+	// ProjectActive returns true if the given project is currently
+	// active in the provider.
+	ProjectActive(project string) bool
+	// ConfigureProviderFlags is used to specify flags that apply to
+	// the provider instance and should be used for all clusters
+	// managed by the provider.
 	ConfigureProviderFlags(*pflag.FlagSet, MultipleProjectsOption)
-
-	// ConfigureClusterCleanupFlags configures a FlagSet with any options
-	// relevant to commands (`gc`)
+	// ConfigureClusterCleanupFlags configures a FlagSet with options
+	// relevant to cleanup commands (gc).
 	ConfigureClusterCleanupFlags(*pflag.FlagSet)
-
 	CreateProviderOpts() ProviderOpts
-	CleanSSH(l *logger.Logger) error
-
-	// IsCentralizedProvider returns true if the provider is a centralized provider.
-	// This is used to determine if this provider will pull its state from a centralized
-	// service and trigger actions remotely, or if all will be managed locally.
+	// IsCentralizedProvider returns true if the provider pulls its
+	// state from a centralized service and triggers actions remotely,
+	// rather than managing everything locally.
 	IsCentralizedProvider() bool
+	// SupportsSpotVMs returns whether the provider supports spot VMs.
+	SupportsSpotVMs() bool
+	// NewClient performs expensive provider initialization and returns
+	// a ProviderClient. Most callers should use Providers.Client(name)
+	// instead, which caches the result.
+	NewClient() (ProviderClient, error)
+	String() string
+}
 
-	// ConfigSSH takes a list of zones and configures SSH for machines in those
-	// zones for the given provider.
+// ProviderClient contains operational methods that require initialized
+// SDK/auth. Each provider's NewClient() returns a separate Client
+// struct that holds a pointer back to the registered Provider for
+// flag-bound configuration.
+type ProviderClient interface {
+	CleanSSH(l *logger.Logger) error
+	// ConfigSSH configures SSH for machines in the given zones.
 	ConfigSSH(l *logger.Logger, zones []string) error
 	Create(l *logger.Logger, names []string, opts CreateOpts, providerOpts ProviderOpts) (List, error)
 	Grow(l *logger.Logger, vms List, clusterName string, names []string) (List, error)
@@ -578,74 +596,58 @@ type Provider interface {
 	Reset(l *logger.Logger, vms List) error
 	Delete(l *logger.Logger, vms List) error
 	Extend(l *logger.Logger, vms List, lifetime time.Duration) error
-	// Return the account name associated with the provider
+	// FindActiveAccount returns the account name associated with the
+	// provider.
 	FindActiveAccount(l *logger.Logger) (string, error)
 	List(ctx context.Context, l *logger.Logger, opts ListOptions) (List, error)
-	// AddLabels adds (or updates) the given labels to the given VMs.
-	// N.B. If a VM contains a label with the same key, its value will be updated.
+	// AddLabels adds or updates labels. If a VM already has the key,
+	// its value is updated.
 	AddLabels(l *logger.Logger, vms List, labels map[string]string) error
 	RemoveLabels(l *logger.Logger, vms List, labels []string) error
-	// The name of the Provider, which will also surface in the top-level Providers map.
-	Name() string
 
-	// Active returns true if the provider is properly installed and capable of
-	// operating, false if it's just a stub. This allows one to test whether a
-	// particular provider is functioning properly by calling, for example,
-	// Providers[gce.ProviderName].Active. Note that just looking at
-	// Providers[gce.ProviderName] != nil doesn't work because
-	// Providers[gce.ProviderName] can be a stub.
-	Active() bool
-
-	// ProjectActive returns true if the given project is currently active in the
-	// provider.
-	ProjectActive(project string) bool
-
-	// Volume and volume snapshot related APIs.
+	// Volume and snapshot APIs.
 
 	// CreateVolume creates a new volume using the given options.
 	CreateVolume(l *logger.Logger, vco VolumeCreateOpts) (Volume, error)
 	// ListVolumes lists all volumes already attached to the given VM.
 	ListVolumes(l *logger.Logger, vm *VM) ([]Volume, error)
-	// DeleteVolume detaches and deletes the given volume from the given VM.
+	// DeleteVolume detaches and deletes the given volume from the
+	// given VM.
 	DeleteVolume(l *logger.Logger, volume Volume, vm *VM) error
 	// AttachVolume attaches the given volume to the given VM.
 	AttachVolume(l *logger.Logger, volume Volume, vm *VM) (string, error)
-	// CreateVolumeSnapshot creates a snapshot of the given volume, using the
-	// given options.
+	// CreateVolumeSnapshot creates a snapshot of the given volume.
 	CreateVolumeSnapshot(l *logger.Logger, volume Volume, vsco VolumeSnapshotCreateOpts) (VolumeSnapshot, error)
-	// ListVolumeSnapshots lists the individual volume snapshots that satisfy
-	// the search criteria.
+	// ListVolumeSnapshots lists volume snapshots matching the search
+	// criteria.
 	ListVolumeSnapshots(l *logger.Logger, vslo VolumeSnapshotListOpts) ([]VolumeSnapshot, error)
 	// DeleteVolumeSnapshots permanently deletes the given snapshots.
 	DeleteVolumeSnapshots(l *logger.Logger, snapshot ...VolumeSnapshot) error
 
-	// SpotVM related APIs.
+	// Spot VM APIs.
 
-	// SupportsSpotVMs returns if the provider supports spot VMs.
-	SupportsSpotVMs() bool
-	// GetPreemptedSpotVMs returns a list of Spot VMs that were preempted since the time specified.
-	// Returns nil, nil when SupportsSpotVMs() is false.
+	// GetPreemptedSpotVMs returns spot VMs that were preempted since
+	// the given time. Returns nil, nil when SupportsSpotVMs() is false.
 	GetPreemptedSpotVMs(l *logger.Logger, vms List, since time.Time) ([]PreemptedVM, error)
-	// GetHostErrorVMs returns a list of VMs that had host error since the time specified.
+	// GetHostErrorVMs returns VMs that had a host error since the
+	// given time.
 	GetHostErrorVMs(l *logger.Logger, vms List, since time.Time) ([]string, error)
-	// GetLiveMigrationVMs checks a list of VMs if a live migration happened since the time specified.
+	// GetLiveMigrationVMs checks if a live migration happened since
+	// the given time.
 	GetLiveMigrationVMs(l *logger.Logger, vms List, since time.Time) ([]string, error)
-	// GetVMSpecs returns a map from VM.Name to a map of VM attributes, according to a specific cloud provider.
+	// GetVMSpecs returns a map from VM.Name to a map of VM attributes.
 	GetVMSpecs(l *logger.Logger, vms List) (map[string]map[string]interface{}, error)
 
-	// CreateLoadBalancer creates a load balancer, for a specific port, that
-	// delegates to the given cluster.
+	// Load balancer APIs.
+
+	// CreateLoadBalancer creates a load balancer for a specific port
+	// that delegates to the given VMs.
 	CreateLoadBalancer(l *logger.Logger, vms List, port int) error
-
-	// DeleteLoadBalancer deletes a load balancers created for a specific port.
+	// DeleteLoadBalancer deletes a load balancer for a specific port.
 	DeleteLoadBalancer(l *logger.Logger, vms List, port int) error
-
-	// ListLoadBalancers returns a list of load balancer IPs and ports that are currently
+	// ListLoadBalancers returns load balancer addresses currently
 	// routing to services for the given VMs.
 	ListLoadBalancers(l *logger.Logger, vms List) ([]ServiceAddress, error)
-
-	// String returns a human-readable identifier for the provider
-	String() string
 }
 
 // DeleteCluster is an optional capability for a Provider which can
@@ -654,8 +656,141 @@ type DeleteCluster interface {
 	DeleteCluster(l *logger.Logger, name string) error
 }
 
-// Providers contains all known Provider instances. This is initialized by subpackage init() functions.
-var Providers = map[string]Provider{}
+// providerEntry holds a registered provider and its lazily initialized client.
+type providerEntry struct {
+	provider    Provider
+	client      ProviderClient
+	initOnce    sync.Once
+	initErr     error
+	disabledMsg string
+}
+
+// ProviderRegistry manages registered providers and their lazily
+// initialized clients.
+type ProviderRegistry struct {
+	mu        syncutil.Mutex
+	providers map[string]*providerEntry
+}
+
+// NewProviderRegistry creates an empty ProviderRegistry.
+func NewProviderRegistry() *ProviderRegistry {
+	return &ProviderRegistry{
+		providers: make(map[string]*providerEntry),
+	}
+}
+
+// Register adds a provider. Its client is created lazily via
+// p.NewClient() on the first Client() call.
+func (r *ProviderRegistry) Register(p Provider) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.providers[p.Name()] = &providerEntry{provider: p}
+}
+
+// RegisterWithClient registers a provider with an already-initialized
+// client, bypassing lazy init.
+func (r *ProviderRegistry) RegisterWithClient(p Provider, c ProviderClient) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry := &providerEntry{provider: p, client: c}
+	entry.initOnce.Do(func() {})
+	r.providers[p.Name()] = entry
+}
+
+func (r *ProviderRegistry) getEntry(name string) (*providerEntry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.providers[name]
+	return entry, ok
+}
+
+// SetDisabled marks a provider as disabled with the given reason.
+// Must be called before any Client() call for the provider.
+func (r *ProviderRegistry) SetDisabled(name, reason string) {
+	if entry, ok := r.getEntry(name); ok {
+		entry.disabledMsg = reason
+	}
+}
+
+// Provider returns the Provider (cheap metadata) for the given name.
+func (r *ProviderRegistry) Provider(name string) (Provider, bool) {
+	entry, ok := r.getEntry(name)
+	if !ok {
+		return nil, false
+	}
+	return entry.provider, true
+}
+
+// Client returns a lazily initialized ProviderClient, or an error if
+// the provider is disabled or initialization failed.
+func (r *ProviderRegistry) Client(name string) (ProviderClient, error) {
+	entry, ok := r.getEntry(name)
+	if !ok {
+		return nil, errors.Errorf("unknown provider: %s", name)
+	}
+	entry.initOnce.Do(func() {
+		if entry.disabledMsg != "" {
+			entry.initErr = errors.Newf("provider disabled: %s", entry.disabledMsg)
+			return
+		}
+		entry.client, entry.initErr = entry.provider.NewClient()
+	})
+	if entry.initErr != nil {
+		return nil, entry.initErr
+	}
+	return entry.client, nil
+}
+
+// Active returns true if Client() would succeed for the named
+// provider — i.e. the provider is registered, not disabled, and
+// initialization succeeds.
+func (r *ProviderRegistry) Active(name string) bool {
+	_, err := r.Client(name)
+	return err == nil
+}
+
+// AllProviders returns all registered Providers.
+func (r *ProviderRegistry) AllProviders() []Provider {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ret := make([]Provider, 0, len(r.providers))
+	for _, entry := range r.providers {
+		ret = append(ret, entry.provider)
+	}
+	return ret
+}
+
+// Filter returns a new ProviderRegistry containing only the named
+// providers. The filtered registry shares lazy-init state with the
+// original. Returns an error if any name is not registered.
+func (r *ProviderRegistry) Filter(names ...string) (*ProviderRegistry, error) {
+	filtered := NewProviderRegistry()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, name := range names {
+		entry, ok := r.providers[name]
+		if !ok {
+			return nil, errors.AssertionFailedf("provider %q not registered", name)
+		}
+		filtered.mu.Lock()
+		filtered.providers[name] = entry
+		filtered.mu.Unlock()
+	}
+	return filtered, nil
+}
+
+// RegistryFrom creates a new ProviderRegistry from a list of providers.
+func RegistryFrom(providers []Provider) *ProviderRegistry {
+	r := NewProviderRegistry()
+	for _, p := range providers {
+		r.Register(p)
+	}
+	return r
+}
+
+// Providers is the global provider registry populated during
+// RegisterProviders() and read after that.
+var Providers = NewProviderRegistry()
 
 // DNSProviders contains all known DNS providers.
 var DNSProviders = map[string]DNSProvider{}
@@ -665,11 +800,11 @@ type ProviderOptionsContainer map[string]ProviderOpts
 
 // CreateProviderOptionsContainer returns a ProviderOptionsContainer which is
 // populated with options for all registered providers. Only call it after
-// initiliazing providers (populating vm.Providers).
+// registering providers (populating vm.Providers).
 func CreateProviderOptionsContainer() ProviderOptionsContainer {
 	container := make(ProviderOptionsContainer)
-	for providerName, providerInstance := range Providers {
-		container[providerName] = providerInstance.CreateProviderOpts()
+	for _, p := range Providers.AllProviders() {
+		container[p.Name()] = p.CreateProviderOpts()
 	}
 	return container
 }
@@ -682,18 +817,10 @@ func (container ProviderOptionsContainer) SetProviderOpts(
 	container[providerName] = providerOpts
 }
 
-// AllProviderNames returns the names of all known vm Providers.  This is useful with the
-// ProvidersSequential or ProvidersParallel methods.
-func AllProviderNames() []string {
-	var ret []string
-	for name := range Providers {
-		ret = append(ret, name)
-	}
-	return ret
-}
-
-// FanOut collates a collection of VMs by their provider and invoke the callbacks in parallel.
-func FanOut(list List, action func(Provider, List) error) error {
+// FanOut collates a collection of VMs by their provider and invokes
+// the action in parallel, resolving each ProviderClient from the
+// registry.
+func (r *ProviderRegistry) FanOut(list List, action func(ProviderClient, List) error) error {
 	var m = map[string]List{}
 	for _, vm := range list {
 		m[vm.Provider] = append(m[vm.Provider], vm)
@@ -702,11 +829,11 @@ func FanOut(list List, action func(Provider, List) error) error {
 	var g errgroup.Group
 	for name, vms := range m {
 		g.Go(func() error {
-			p, ok := Providers[name]
-			if !ok {
-				return errors.Errorf("unknown provider name: %s", name)
+			client, err := r.Client(name)
+			if err != nil {
+				return errors.Wrapf(err, "provider %s", name)
 			}
-			return action(p, vms)
+			return action(client, vms)
 		})
 	}
 
@@ -724,20 +851,20 @@ func FindActiveAccounts(l *logger.Logger) (map[string]string, error) {
 	if source == nil {
 		// Ask each Provider for its active account name.
 		source = map[string]string{}
-		err := ProvidersSequential(AllProviderNames(), func(p Provider) error {
-			account, err := p.FindActiveAccount(l)
+		for _, p := range Providers.AllProviders() {
+			client, err := Providers.Client(p.Name())
+			if err != nil {
+				l.Printf("WARN: provider=%q init failed: %s", p.Name(), err)
+				continue
+			}
+			account, err := client.FindActiveAccount(l)
 			if err != nil {
 				l.Printf("WARN: provider=%q has no active account", p.Name())
-				//nolint:returnerrcheck
-				return nil
+				continue
 			}
 			if len(account) > 0 {
 				source[p.Name()] = account
 			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
 		}
 		cachedActiveAccounts = source
 	}
@@ -751,14 +878,14 @@ func FindActiveAccounts(l *logger.Logger) (map[string]string, error) {
 	return ret, nil
 }
 
-// ForProvider resolves the Provider with the given name and executes the
-// action.
-func ForProvider(named string, action func(Provider) error) error {
-	p, ok := Providers[named]
-	if !ok {
-		return errors.Errorf("unknown vm provider: %s", named)
+// ForProvider resolves the Provider with the given name, initializes
+// the client, and passes the ProviderClient to the action.
+func ForProvider(named string, action func(ProviderClient) error) error {
+	client, err := Providers.Client(named)
+	if err != nil {
+		return errors.Wrapf(err, "provider %s", named)
 	}
-	if err := action(p); err != nil {
+	if err := action(client); err != nil {
 		return errors.Wrapf(err, "in provider: %s", named)
 	}
 	return nil
@@ -769,20 +896,14 @@ func ProvidersParallel(named []string, action func(Provider) error) error {
 	var g errgroup.Group
 	for _, name := range named {
 		g.Go(func() error {
-			return ForProvider(name, action)
+			p, ok := Providers.Provider(name)
+			if !ok {
+				return errors.Errorf("unknown vm provider: %s", name)
+			}
+			return action(p)
 		})
 	}
 	return g.Wait()
-}
-
-// ProvidersSequential sequentially executes actions for each named Provider.
-func ProvidersSequential(named []string, action func(Provider) error) error {
-	for _, name := range named {
-		if err := ForProvider(name, action); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // ZonePlacement allocates zones to numNodes in an equally sized groups in the

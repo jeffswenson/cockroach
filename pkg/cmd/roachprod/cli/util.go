@@ -235,7 +235,7 @@ func ValidateAndConfigure(cmd *cobra.Command, args []string) {
 	// Validate cloud providers, if set.
 	providersSet := make(map[string]struct{})
 	for _, p := range createVMOpts.VMProviders {
-		if _, ok := vm.Providers[p]; !ok {
+		if _, ok := vm.Providers.Provider(p); !ok {
 			printErrAndExit(fmt.Errorf("unknown cloud provider %q", p))
 		}
 		if _, ok := providersSet[p]; ok {

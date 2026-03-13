@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/roachprodutil"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/ui"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/flagstub"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/gce/gcedb"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -79,7 +78,9 @@ var (
 	projectsWithGC []string
 )
 
-func initGCEProjectDefaults() {
+// InitGCEProjectDefaults initializes GCE project defaults from
+// environment variables.
+func InitGCEProjectDefaults() {
 	defaultDefaultProject = config.EnvOrDefaultString(
 		"ROACHPROD_GCE_DEFAULT_PROJECT", DefaultProjectID,
 	)
@@ -102,57 +103,67 @@ func initGCEProjectDefaults() {
 // DefaultProject returns the default GCE project. This is used to determine whether
 // certain features, such as DNS names are enabled.
 func DefaultProject() string {
-	// If the provider was already initialized, read the default project from the
+	// If the provider was already registered, read the default project from the
 	// provider.
-	if p, ok := vm.Providers[ProviderName].(*Provider); ok {
-		return p.defaultProject
+	if p, ok := vm.Providers.Provider(ProviderName); ok {
+		if gceP, ok := p.(*Provider); ok {
+			return gceP.defaultProject
+		}
 	}
 	return defaultDefaultProject
 }
 
-// Denotes if this provider was successfully initialized.
-var initialized = false
-
-// Init registers the GCE provider into vm.Providers.
-//
-// If the gcloud tool is not available on the local path, the provider is a
-// stub.
-//
-// Note that, when roachprod is used as a binary, the defaults for
-// providerInstance properties initialized here can be overriden by flags.
-func Init() error {
-	initGCEProjectDefaults()
-	initDNSDefault()
-
-	providerOpts := []Option{}
-	projectFromEnv := os.Getenv("GCE_PROJECT")
-	if projectFromEnv != "" {
-		fmt.Printf("WARN: `GCE_PROJECT` is deprecated; please, use `ROACHPROD_GCE_DEFAULT_PROJECT` instead\n")
-		providerOpts = append(providerOpts, WithProject(projectFromEnv))
-	}
-
-	// Init the default provider
-	providerInstance, err := NewProvider(providerOpts...)
-	if err != nil {
-		vm.Providers[ProviderName] = flagstub.New(
-			&Provider{},
-			fmt.Sprintf("unable to init gce provider: %s", err),
-		)
-		return err
-	}
-
+// NewClient checks for the gcloud CLI and sets gce.Infrastructure.
+func (p *Provider) NewClient() (vm.ProviderClient, error) {
 	if _, err := exec.LookPath("gcloud"); err != nil {
-		vm.Providers[ProviderName] = flagstub.New(&Provider{}, "please install the gcloud CLI utilities "+
+		return nil, errors.New("please install the gcloud CLI utilities " +
 			"(https://cloud.google.com/sdk/downloads)")
-		return errors.New("gcloud not found")
+	}
+	client := &Client{provider: p}
+
+	// Initialize SDK clients if withSDKSupport is enabled.
+	if p.withSDKSupport {
+		creds, _, err := roachprodutil.GetGCECredentials(
+			context.Background(),
+			roachprodutil.IAPTokenSourceOptions{},
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to get credentials")
+		}
+
+		instancesClient, err := compute.NewInstancesRESTClient(
+			context.Background(),
+			option.WithCredentials(creds),
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to init compute instances client")
+		}
+		client.computeInstancesClient = instancesClient
+
+		instanceTemplatesClient, err := compute.NewInstanceTemplatesRESTClient(
+			context.Background(),
+			option.WithCredentials(creds),
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to init compute instance templates client")
+		}
+		client.computeInstanceTemplatesClient = instanceTemplatesClient
+
+		// If the DNS provider was initialized with the default one
+		// (gcloud), swap it for the SDK-based one.
+		if p.defaultDNSProvider {
+			sdkDNS, err := NewSDKDNSProvider(
+				(&SDKDNSProviderOpts{}).NewFromGCEDNSProviderOpts(p.dnsProviderOpts),
+			)
+			if err != nil {
+				return nil, errors.Wrap(err, "unable to init dns client")
+			}
+			p.dnsProvider = sdkDNS
+		}
 	}
 
-	initialized = true
-	vm.Providers[ProviderName] = providerInstance
-	vm.DNSProviders[providerInstance.dnsProvider.ProviderName()] = providerInstance.dnsProvider
-	Infrastructure = providerInstance
-
-	return nil
+	Infrastructure = client
+	return client, nil
 }
 
 // NewProvider returns a new GCE provider with the given options applied.
@@ -175,55 +186,15 @@ func NewProvider(options ...Option) (*Provider, error) {
 		p.Projects = []string{defaultDefaultProject}
 	}
 
-	// If no DNS provider was specified, create a new default one (gcloud)
-	// with the configured options.
-	dnsProviderInitializedInInit := false
+	// If no DNS provider was specified, create a new default one
+	// (gcloud) with the configured options. When SDK support is
+	// enabled, NewClient will swap this for the SDK-based DNS
+	// provider.
 	if p.dnsProvider == nil {
 		p.dnsProvider = NewDNSProvider(
 			(&DNSProviderOpts{}).NewFromGCEDNSProviderOpts(p.dnsProviderOpts),
 		)
-		dnsProviderInitializedInInit = true
-	}
-
-	// If withSDKSupport is enabled, initialize the GCE clients.
-	if p.withSDKSupport {
-		creds, _, err := roachprodutil.GetGCECredentials(
-			context.Background(),
-			roachprodutil.IAPTokenSourceOptions{},
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to get credentials")
-		}
-
-		instancesClient, err := compute.NewInstancesRESTClient(
-			context.Background(),
-			option.WithCredentials(creds),
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "unable to init compute instances client")
-		}
-
-		instanceTemplatesClient, err := compute.NewInstanceTemplatesRESTClient(
-			context.Background(),
-			option.WithCredentials(creds),
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "unable to init compute instance templates client")
-		}
-
-		p.computeInstancesClient = instancesClient
-		p.computeInstanceTemplatesClient = instanceTemplatesClient
-
-		// If the DNS provider was initialized in this function (with the default one using gcloud),
-		// update it to use the SDK version.
-		if dnsProviderInitializedInInit {
-			p.dnsProvider, err = NewSDKDNSProvider(
-				(&SDKDNSProviderOpts{}).NewFromGCEDNSProviderOpts(p.dnsProviderOpts),
-			)
-			if err != nil {
-				return nil, errors.Wrap(err, "unable to init dns client")
-			}
-		}
+		p.defaultDNSProvider = true
 	}
 
 	return p, nil
@@ -500,10 +471,27 @@ type Provider struct {
 	// The project that provides the core roachprod services.
 	defaultProject string
 
-	// ComputeClients
-	withSDKSupport                 bool
+	withSDKSupport bool
+
+	// defaultDNSProvider is true when the DNS provider was created by
+	// NewProvider using defaults. When SDK support is enabled,
+	// NewClient replaces it with an SDK-based DNS provider.
+	defaultDNSProvider bool
+}
+
+// Client is the initialized GCE provider client. It holds a
+// reference to the registered Provider for flag-bound fields, and
+// owns the SDK clients and InfraProvider state.
+type Client struct {
+	provider *Provider
+
 	computeInstancesClient         *compute.InstancesClient
 	computeInstanceTemplatesClient *compute.InstanceTemplatesClient
+}
+
+// GetDNSProvider returns the provider's DNS provider.
+func (p *Provider) GetDNSProvider() vm.DNSProvider {
+	return p.dnsProvider
 }
 
 type dnsOpts struct {
@@ -548,10 +536,10 @@ func (p *Provider) IsCentralizedProvider() bool {
 }
 
 // GetPreemptedSpotVMs checks the preemption status of the given VMs, by querying the GCP logging service.
-func (p *Provider) GetPreemptedSpotVMs(
+func (c *Client) GetPreemptedSpotVMs(
 	l *logger.Logger, vms vm.List, since time.Time,
 ) ([]vm.PreemptedVM, error) {
-	args, err := buildFilterPreemptionCliArgs(vms, p.GetProject(), since)
+	args, err := buildFilterPreemptionCliArgs(vms, c.provider.GetProject(), since)
 	if err != nil {
 		l.Printf("Error building gcloud cli command: %v\n", err)
 		return nil, err
@@ -576,10 +564,8 @@ func (p *Provider) GetPreemptedSpotVMs(
 }
 
 // GetHostErrorVMs checks the host error status of the given VMs, by querying the GCP logging service.
-func (p *Provider) GetHostErrorVMs(
-	l *logger.Logger, vms vm.List, since time.Time,
-) ([]string, error) {
-	args, err := buildFilterHostErrorCliArgs(vms, since, p.GetProject())
+func (c *Client) GetHostErrorVMs(l *logger.Logger, vms vm.List, since time.Time) ([]string, error) {
+	args, err := buildFilterHostErrorCliArgs(vms, since, c.provider.GetProject())
 	if err != nil {
 		l.Printf("Error building gcloud cli command: %v\n", err)
 		return nil, err
@@ -597,17 +583,17 @@ func (p *Provider) GetHostErrorVMs(
 	return hostErrorVMs, nil
 }
 
-func (p *Provider) GetLiveMigrationVMs(
+func (c *Client) GetLiveMigrationVMs(
 	l *logger.Logger, vms vm.List, since time.Time,
 ) ([]string, error) {
 	return nil, nil
 }
 
 // GetVMSpecs returns a map from VM.Name to a map of VM attributes, provided by GCE
-func (p *Provider) GetVMSpecs(
+func (c *Client) GetVMSpecs(
 	l *logger.Logger, vms vm.List,
 ) (map[string]map[string]interface{}, error) {
-	if p.GetProject() == "" {
+	if c.provider.GetProject() == "" {
 		return nil, errors.New("project name cannot be empty")
 	}
 	if vms == nil {
@@ -617,7 +603,7 @@ func (p *Provider) GetVMSpecs(
 	vmSpecs := make(map[string]map[string]interface{})
 	for _, vmInstance := range vms {
 		var vmSpec map[string]interface{}
-		vmFullResourceName := "projects/" + p.GetProject() + "/zones/" + vmInstance.Zone + "/instances/" + vmInstance.Name
+		vmFullResourceName := "projects/" + c.provider.GetProject() + "/zones/" + vmInstance.Zone + "/instances/" + vmInstance.Name
 		args := []string{"compute", "instances", "describe", vmFullResourceName, "--format=json"}
 
 		if err := runJSONCommand(args, &vmSpec); err != nil {
@@ -705,12 +691,12 @@ type snapshotJson struct {
 	StorageLocations   []string  `json:"storageLocations"`
 }
 
-func (p *Provider) CreateVolumeSnapshot(
+func (c *Client) CreateVolumeSnapshot(
 	l *logger.Logger, volume vm.Volume, vsco vm.VolumeSnapshotCreateOpts,
 ) (vm.VolumeSnapshot, error) {
 	args := []string{
 		"compute",
-		"--project", p.GetProject(),
+		"--project", c.provider.GetProject(),
 		"snapshots",
 		"create", vsco.Name,
 		"--source-disk", volume.ProviderResourceID,
@@ -732,7 +718,7 @@ func (p *Provider) CreateVolumeSnapshot(
 
 	args = []string{
 		"compute",
-		"--project", p.GetProject(),
+		"--project", c.provider.GetProject(),
 		"snapshots",
 		"add-labels", vsco.Name,
 		"--labels", s[:len(s)-1],
@@ -747,12 +733,12 @@ func (p *Provider) CreateVolumeSnapshot(
 	}, nil
 }
 
-func (p *Provider) ListVolumeSnapshots(
+func (c *Client) ListVolumeSnapshots(
 	l *logger.Logger, vslo vm.VolumeSnapshotListOpts,
 ) ([]vm.VolumeSnapshot, error) {
 	args := []string{
 		"compute",
-		"--project", p.GetProject(),
+		"--project", c.provider.GetProject(),
 		"snapshots",
 		"list",
 		"--format", "json(name,id)",
@@ -790,13 +776,13 @@ func (p *Provider) ListVolumeSnapshots(
 	return snapshots, nil
 }
 
-func (p *Provider) DeleteVolumeSnapshots(l *logger.Logger, snapshots ...vm.VolumeSnapshot) error {
+func (c *Client) DeleteVolumeSnapshots(l *logger.Logger, snapshots ...vm.VolumeSnapshot) error {
 	if len(snapshots) == 0 {
 		return nil
 	}
 	args := []string{
 		"compute",
-		"--project", p.GetProject(),
+		"--project", c.provider.GetProject(),
 		"snapshots",
 		"delete",
 	}
@@ -827,7 +813,7 @@ type describeVolumeCommandResponse struct {
 	Users                  []string          `json:"users"`
 }
 
-func (p *Provider) CreateVolume(
+func (c *Client) CreateVolume(
 	l *logger.Logger, vco vm.VolumeCreateOpts,
 ) (vol vm.Volume, err error) {
 	// TODO(leon): IOPS is not handled.
@@ -837,7 +823,7 @@ func (p *Provider) CreateVolume(
 	}
 	args := []string{
 		"compute",
-		"--project", p.GetProject(),
+		"--project", c.provider.GetProject(),
 		"disks",
 		"create", vco.Name,
 		"--size", strconv.Itoa(vco.Size),
@@ -896,7 +882,7 @@ func (p *Provider) CreateVolume(
 		s := sb.String()
 		args = []string{
 			"compute",
-			"--project", p.GetProject(),
+			"--project", c.provider.GetProject(),
 			"disks",
 			"add-labels", vco.Name,
 			"--labels", s[:len(s)-1],
@@ -919,11 +905,11 @@ func (p *Provider) CreateVolume(
 	}, nil
 }
 
-func (p *Provider) DeleteVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) error {
+func (c *Client) DeleteVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) error {
 	{ // Detach disks.
 		args := []string{
 			"compute",
-			"--project", p.GetProject(),
+			"--project", c.provider.GetProject(),
 			"instances",
 			"detach-disk", vm.Name,
 			"--disk", volume.ProviderResourceID,
@@ -937,7 +923,7 @@ func (p *Provider) DeleteVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) e
 	{ // Delete disks.
 		args := []string{
 			"compute",
-			"--project", p.GetProject(),
+			"--project", c.provider.GetProject(),
 			"disks",
 			"delete",
 			volume.ProviderResourceID,
@@ -952,7 +938,7 @@ func (p *Provider) DeleteVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) e
 	return nil
 }
 
-func (p *Provider) ListVolumes(l *logger.Logger, v *vm.VM) ([]vm.Volume, error) {
+func (c *Client) ListVolumes(l *logger.Logger, v *vm.VM) ([]vm.Volume, error) {
 	var attachedDisks []attachDiskCmdDisk
 	var describedVolumes []describeVolumeCommandResponse
 
@@ -969,7 +955,7 @@ func (p *Provider) ListVolumes(l *logger.Logger, v *vm.VM) ([]vm.Volume, error) 
 			"instances",
 			"describe",
 			v.Name,
-			"--project", p.GetProject(),
+			"--project", c.provider.GetProject(),
 			"--zone", v.Zone,
 			"--format", "json(disks)",
 		}
@@ -990,7 +976,7 @@ func (p *Provider) ListVolumes(l *logger.Logger, v *vm.VM) ([]vm.Volume, error) 
 			"compute",
 			"disks",
 			"list",
-			"--project", p.GetProject(),
+			"--project", c.provider.GetProject(),
 			"--filter", fmt.Sprintf("users:(%s)", v.Name),
 			"--format", "json",
 		}
@@ -1090,11 +1076,11 @@ func (d *attachDiskCmdDisk) toVolume() (*vm.Volume, VolumeType, error) {
 	return vol, volType, nil
 }
 
-func (p *Provider) AttachVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) (string, error) {
+func (c *Client) AttachVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) (string, error) {
 	// Volume attach.
 	args := []string{
 		"compute",
-		"--project", p.GetProject(),
+		"--project", c.provider.GetProject(),
 		"instances",
 		"attach-disk",
 		vm.ProviderID,
@@ -1124,7 +1110,7 @@ func (p *Provider) AttachVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) (
 	// Volume auto delete.
 	args = []string{
 		"compute",
-		"--project", p.GetProject(),
+		"--project", c.provider.GetProject(),
 		"instances",
 		"set-disk-auto-delete", vm.ProviderID,
 		"--auto-delete",
@@ -1452,8 +1438,8 @@ func (p *Provider) ConfigureClusterCleanupFlags(flags *pflag.FlagSet) {
 }
 
 // CleanSSH TODO(peter): document
-func (p *Provider) CleanSSH(l *logger.Logger) error {
-	for _, prj := range p.GetProjects() {
+func (c *Client) CleanSSH(l *logger.Logger) error {
+	for _, prj := range c.provider.GetProjects() {
 		args := []string{"compute", "config-ssh", "--project", prj, "--quiet", "--remove"}
 		cmd := exec.Command("gcloud", args...)
 
@@ -1465,15 +1451,15 @@ func (p *Provider) CleanSSH(l *logger.Logger) error {
 	return nil
 }
 
-// ConfigSSH is part of the vm.Provider interface. For this provider,
-// it verifies that the test runner has a public SSH key, as that is
-// required when setting up new clusters.
-func (p *Provider) ConfigSSH(l *logger.Logger, zones []string) error {
+// ConfigSSH is part of the vm.ProviderClient interface. For this
+// provider, it verifies that the test runner has a public SSH key, as
+// that is required when setting up new clusters.
+func (c *Client) ConfigSSH(l *logger.Logger, zones []string) error {
 	_, err := config.SSHPublicKey()
 	return err
 }
 
-func (p *Provider) editLabels(
+func (c *Client) editLabels(
 	l *logger.Logger, vms vm.List, labels map[string]string, remove bool,
 ) error {
 	cmdArgs := []string{"compute", "instances"}
@@ -1492,7 +1478,7 @@ func (p *Provider) editLabels(
 		}
 	}
 	tagArgsString := strings.Join(tagArgs, ",")
-	commonArgs := []string{"--project", p.GetProject(), fmt.Sprintf("--labels=%s", tagArgsString)}
+	commonArgs := []string{"--project", c.provider.GetProject(), fmt.Sprintf("--labels=%s", tagArgsString)}
 
 	g := newLimitedErrorGroup()
 	for _, v := range vms {
@@ -1515,16 +1501,16 @@ func (p *Provider) editLabels(
 
 // AddLabels adds (or updates) the given labels to the given VMs.
 // N.B. If a VM contains a label with the same key, its value will be updated.
-func (p *Provider) AddLabels(l *logger.Logger, vms vm.List, labels map[string]string) error {
-	return p.editLabels(l, vms, labels, false /* remove */)
+func (c *Client) AddLabels(l *logger.Logger, vms vm.List, labels map[string]string) error {
+	return c.editLabels(l, vms, labels, false /* remove */)
 }
 
-func (p *Provider) RemoveLabels(l *logger.Logger, vms vm.List, labels []string) error {
+func (c *Client) RemoveLabels(l *logger.Logger, vms vm.List, labels []string) error {
 	labelsMap := make(map[string]string, len(labels))
 	for _, label := range labels {
 		labelsMap[label] = ""
 	}
-	return p.editLabels(l, vms, labelsMap, true /* remove */)
+	return c.editLabels(l, vms, labelsMap, true /* remove */)
 }
 
 // computeLabelsArg computes the labels arg to be passed to the gcloud command
@@ -1592,11 +1578,11 @@ func computeZones(opts vm.CreateOpts, providerOpts *ProviderOpts) ([]string, err
 // to create a VM or create an instance template for a VM. This function must
 // ensure that it returns arguments compatible with both the `gcloud compute instances create` and `gcloud compute
 // instance-templates create` commands.
-func (p *Provider) computeInstanceArgs(
+func (c *Client) computeInstanceArgs(
 	l *logger.Logger, opts vm.CreateOpts, providerOpts *ProviderOpts,
 ) (args []string, cleanUpFn func(), err error) {
 	cleanUpFn = func() {}
-	project := p.GetProject()
+	project := c.provider.GetProject()
 
 	// Fixed args.
 	image := providerOpts.Image
@@ -1630,7 +1616,7 @@ func (p *Provider) computeInstanceArgs(
 		"--boot-disk-type", providerOpts.bootDiskType(),
 	}
 
-	if project == p.defaultProject && providerOpts.ServiceAccount == "" {
+	if project == c.provider.defaultProject && providerOpts.ServiceAccount == "" {
 		providerOpts.ServiceAccount = providerOpts.defaultServiceAccount
 	}
 	if providerOpts.ServiceAccount != "" {
@@ -1890,14 +1876,14 @@ func waitForGroupStability(l *logger.Logger, project, groupName string, zones []
 // Create instantiates the requested VMs on GCE. If the cluster is managed, it
 // will create an instance template and instance group, otherwise it will create
 // individual instances.
-func (p *Provider) Create(
+func (c *Client) Create(
 	l *logger.Logger, names []string, opts vm.CreateOpts, vmProviderOpts vm.ProviderOpts,
 ) (vm.List, error) {
 	providerOpts := vmProviderOpts.(*ProviderOpts)
-	project := p.GetProject()
+	project := c.provider.GetProject()
 	var gcJob bool
 	for _, prj := range projectsWithGC {
-		if prj == p.GetProject() {
+		if prj == c.provider.GetProject() {
 			gcJob = true
 			break
 		}
@@ -1917,7 +1903,7 @@ func (p *Provider) Create(
 		}
 	}
 
-	instanceArgs, cleanUpFn, err := p.computeInstanceArgs(l, opts, providerOpts)
+	instanceArgs, cleanUpFn, err := c.computeInstanceArgs(l, opts, providerOpts)
 	if cleanUpFn != nil {
 		defer cleanUpFn()
 	}
@@ -1958,7 +1944,7 @@ func (p *Provider) Create(
 			}
 			spotProviderOpts := *providerOpts
 			spotProviderOpts.UseSpot = true
-			spotInstanceArgs, spotCleanUpFn, err := p.computeInstanceArgs(l, opts, &spotProviderOpts)
+			spotInstanceArgs, spotCleanUpFn, err := c.computeInstanceArgs(l, opts, &spotProviderOpts)
 			if spotCleanUpFn != nil {
 				defer spotCleanUpFn()
 			}
@@ -2015,7 +2001,7 @@ func (p *Provider) Create(
 		// Now that the instance-group is stable,
 		// fetch the list of instances in the managed instance group.
 		vmList, err = getManagedInstanceGroupVMs(
-			l, project, groupName, zonesInstanceTemplates, p.dnsProvider.PublicDomain(),
+			l, project, groupName, zonesInstanceTemplates, c.provider.dnsProvider.PublicDomain(),
 		)
 		if err != nil {
 			return nil, err
@@ -2023,7 +2009,7 @@ func (p *Provider) Create(
 
 	case providerOpts.UseBulkInsert:
 		l.Printf("Using SDK-based BulkInsert API")
-		vmList, err = p.createInstancesSDK(l, opts, providerOpts, labels, zoneToHostNames, usedZones)
+		vmList, err = c.createInstancesSDK(l, opts, providerOpts, labels, zoneToHostNames, usedZones)
 		if err != nil {
 			return nil, err
 		}
@@ -2060,7 +2046,7 @@ func (p *Provider) Create(
 					vmListMutex.Lock()
 					defer vmListMutex.Unlock()
 					for _, i := range instances {
-						v := i.toVM(project, p.dnsProvider.PublicDomain())
+						v := i.toVM(project, c.provider.dnsProvider.PublicDomain())
 						vmList = append(vmList, *v)
 					}
 					return nil
@@ -2129,7 +2115,7 @@ func computeHostNamesPerZone(
 // for managed instance groups. Currently, nodes should only be deleted from the
 // tail of the cluster, due to complexities thar arise when the node names are
 // not contiguous.
-func (p *Provider) Shrink(l *logger.Logger, vmsToDelete vm.List, clusterName string) error {
+func (c *Client) Shrink(l *logger.Logger, vmsToDelete vm.List, clusterName string) error {
 	if !isManaged(vmsToDelete) {
 		return errors.New("shrinking is only supported for managed instance groups")
 	}
@@ -2164,7 +2150,7 @@ func (p *Provider) Shrink(l *logger.Logger, vmsToDelete vm.List, clusterName str
 	return waitForGroupStability(l, project, groupName, maps.Keys(vmZones))
 }
 
-func (p *Provider) Grow(
+func (c *Client) Grow(
 	l *logger.Logger, vms vm.List, clusterName string, names []string,
 ) (vm.List, error) {
 	if !isManaged(vms) {
@@ -2225,7 +2211,7 @@ func (p *Provider) Grow(
 	}
 
 	// Fetch the list of instances in the managed instance group.
-	vmList, err := getManagedInstanceGroupVMs(l, project, groupName, zoneToInstanceTemplates, p.dnsProvider.PublicDomain())
+	vmList, err := getManagedInstanceGroupVMs(l, project, groupName, zoneToInstanceTemplates, c.provider.dnsProvider.PublicDomain())
 	if err != nil {
 		return nil, err
 	}
@@ -2472,8 +2458,8 @@ func deleteLoadBalancerResources(project, clusterName, portFilter string) error 
 	return g.Wait()
 }
 
-// DeleteLoadBalancer implements the vm.Provider interface.
-func (p *Provider) DeleteLoadBalancer(_ *logger.Logger, vms vm.List, port int) error {
+// DeleteLoadBalancer implements the vm.ProviderClient interface.
+func (c *Client) DeleteLoadBalancer(_ *logger.Logger, vms vm.List, port int) error {
 	clusterName, err := vms[0].ClusterName()
 	if err != nil {
 		return err
@@ -2508,7 +2494,7 @@ func loadBalancerResourceName(clusterName string, port int, resourceType string)
 // group. Additionally, a health check is created for the given port. A proxy is
 // used to support global load balancing. The different parts of the load
 // balancer are created sequentially, as they depend on each other.
-func (p *Provider) CreateLoadBalancer(l *logger.Logger, vms vm.List, port int) error {
+func (c *Client) CreateLoadBalancer(l *logger.Logger, vms vm.List, port int) error {
 	if err := checkSDKVersion("450.0.0" /* minVersion */, "required by load balancers"); err != nil {
 		return err
 	}
@@ -2649,7 +2635,7 @@ func (p *Provider) CreateLoadBalancer(l *logger.Logger, vms vm.List, port int) e
 // ListLoadBalancers returns the list of load balancers associated with the
 // given VMs. The VMs have to be part of a managed instance group. The load
 // balancers are returned as a list of service addresses.
-func (p *Provider) ListLoadBalancers(_ *logger.Logger, vms vm.List) ([]vm.ServiceAddress, error) {
+func (c *Client) ListLoadBalancers(_ *logger.Logger, vms vm.List) ([]vm.ServiceAddress, error) {
 	// Only managed instance groups support load balancers.
 	if !isManaged(vms) {
 		return nil, nil
@@ -3067,20 +3053,20 @@ func isManaged(vms vm.List) bool {
 	return vms[0].Labels[vm.TagManaged] == "true"
 }
 
-// Delete is part of the vm.Provider interface.
-func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
+// Delete is part of the vm.ProviderClient interface.
+func (c *Client) Delete(l *logger.Logger, vms vm.List) error {
 	switch {
 	case isManaged(vms):
-		return p.deleteManaged(l, vms)
+		return c.deleteManaged(l, vms)
 	default:
-		return p.deleteUnmanaged(l, vms)
+		return c.deleteUnmanaged(l, vms)
 	}
 }
 
 // deleteManaged deletes the managed instance group for the given VMs. It also
 // deletes any instance templates that were used to create the managed instance
 // group and associated load balancers.
-func (p *Provider) deleteManaged(l *logger.Logger, vms vm.List) error {
+func (c *Client) deleteManaged(l *logger.Logger, vms vm.List) error {
 	clusterProjectMap := make(map[string]string)
 	for _, v := range vms {
 		clusterName, err := v.ClusterName()
@@ -3142,7 +3128,7 @@ func (p *Provider) deleteManaged(l *logger.Logger, vms vm.List) error {
 }
 
 // deleteUnmanaged deletes the given VMs that are not part of a managed instance group.
-func (p *Provider) deleteUnmanaged(l *logger.Logger, vms vm.List) error {
+func (c *Client) deleteUnmanaged(l *logger.Logger, vms vm.List) error {
 	// Map from project to map of zone to list of machines in that project/zone.
 	projectZoneMap := make(map[string]map[string][]string)
 	for _, v := range vms {
@@ -3195,8 +3181,8 @@ func (p *Provider) deleteUnmanaged(l *logger.Logger, vms vm.List) error {
 	return g.Wait()
 }
 
-// Reset implements the vm.Provider interface.
-func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
+// Reset implements the vm.ProviderClient interface.
+func (c *Client) Reset(l *logger.Logger, vms vm.List) error {
 	// Map from project to map of zone to list of machines in that project/zone.
 	projectZoneMap := make(map[string]map[string][]string)
 	for _, v := range vms {
@@ -3239,14 +3225,14 @@ func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
 }
 
 // Extend TODO(peter): document
-func (p *Provider) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
-	return p.AddLabels(l, vms, map[string]string{
+func (c *Client) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
+	return c.AddLabels(l, vms, map[string]string{
 		vm.TagLifetime: lifetime.String(),
 	})
 }
 
 // FindActiveAccount TODO(peter): document
-func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
+func (c *Client) FindActiveAccount(l *logger.Logger) (string, error) {
 	args := []string{"auth", "list", "--format", "json", "--filter", "status~ACTIVE"}
 
 	accounts := make([]jsonAuth, 0)
@@ -3270,17 +3256,15 @@ func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
 
 // List queries gcloud to produce a list of VM info objects.
 // TODO(golgeek): honor the context for non-SDK mode.
-func (p *Provider) List(
-	ctx context.Context, l *logger.Logger, opts vm.ListOptions,
-) (vm.List, error) {
+func (c *Client) List(ctx context.Context, l *logger.Logger, opts vm.ListOptions) (vm.List, error) {
 
-	if p.withSDKSupport {
-		return p.listWithSDK(ctx, l, opts)
+	if c.provider.withSDKSupport {
+		return c.listWithSDK(ctx, l, opts)
 	}
 
 	templatesInUse := make(map[string]map[string]struct{})
 	var vms vm.List
-	for _, prj := range p.GetProjects() {
+	for _, prj := range c.provider.GetProjects() {
 		args := []string{"compute", "instances", "list", "--project", prj, "--format", "json"}
 
 		// Run the command, extracting the JSON payload
@@ -3313,7 +3297,7 @@ func (p *Provider) List(
 
 		// Now, convert the json payload into our common VM type
 		for _, jsonVM := range jsonVMS {
-			vms = append(vms, *jsonVM.toVM(prj, p.dnsProvider.PublicDomain()))
+			vms = append(vms, *jsonVM.toVM(prj, c.provider.dnsProvider.PublicDomain()))
 		}
 	}
 
@@ -3323,7 +3307,7 @@ func (p *Provider) List(
 		// any MIG or instance template resources when there are no VMs to
 		// derive it from.
 		clusterSeen := make(map[string]struct{})
-		for _, prj := range p.GetProjects() {
+		for _, prj := range c.provider.GetProjects() {
 			projTemplatesInUse := templatesInUse[prj]
 			if projTemplatesInUse == nil {
 				projTemplatesInUse = make(map[string]struct{})
@@ -3525,11 +3509,6 @@ func serializeLabel(s string) string {
 // Name TODO(peter): document
 func (p *Provider) Name() string {
 	return ProviderName
-}
-
-// Active is part of the vm.Provider interface.
-func (p *Provider) Active() bool {
-	return initialized
 }
 
 // ProjectActive is part of the vm.Provider interface.

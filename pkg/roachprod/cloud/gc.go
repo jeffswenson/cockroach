@@ -368,14 +368,14 @@ func destroyResource(dryrun bool, doDestroy func() error) error {
 	return doDestroy()
 }
 
-// GCClusters checks all cluster to see if they should be deleted. It only
+// GCClusters checks all clusters to see if they should be deleted. It only
 // fails on failure to perform cloud actions. All other actions (load/save
 // file, email) do not abort.
-func GCClusters(l *logger.Logger, cloud *Cloud, dryrun bool) error {
+func (c *Cloud) GCClusters(l *logger.Logger, dryrun bool) error {
 	now := timeutil.Now()
 
 	var names []string
-	for name := range cloud.Clusters {
+	for name := range c.Clusters {
 		if !config.IsLocalClusterName(name) {
 			names = append(names, name)
 		}
@@ -385,19 +385,19 @@ func GCClusters(l *logger.Logger, cloud *Cloud, dryrun bool) error {
 	var s status
 	users := make(map[string]*status)
 	for _, name := range names {
-		c := cloud.Clusters[name]
-		u := users[c.User]
+		cluster := c.Clusters[name]
+		u := users[cluster.User]
 		if u == nil {
 			u = &status{}
-			users[c.User] = u
+			users[cluster.User] = u
 		}
-		s.add(c, now)
-		u.add(c, now)
+		s.add(cluster, now)
+		u.add(cluster, now)
 	}
 
 	// Compile list of "bad vms" and destroy them.
 	var badVMs vm.List
-	for _, vm := range cloud.BadInstances {
+	for _, vm := range c.BadInstances {
 		// We skip fake VMs and only delete "bad vms" if they were created more than 1h ago.
 		if now.Sub(vm.CreatedAt) >= time.Hour && !vm.EmptyCluster {
 			badVMs = append(badVMs, vm)
@@ -426,14 +426,14 @@ func GCClusters(l *logger.Logger, cloud *Cloud, dryrun bool) error {
 	if len(badVMs) > 0 {
 		// Destroy bad VMs.
 		var deletedVMs []resourceDescription
-		if err := vm.FanOut(badVMs, func(p vm.Provider, vms vm.List) error {
+		if err := c.registry.FanOut(badVMs, func(client vm.ProviderClient, vms vm.List) error {
 			err := destroyResource(dryrun, func() error {
-				return p.Delete(l, vms)
+				return client.Delete(l, vms)
 			})
 
 			if err == nil {
 				for _, vm := range vms {
-					l.Printf("Destroying bad VM on %s\n", p.Name())
+					l.Printf("Destroying bad VM on %s\n", vm.Provider)
 					// Dump json payload for debugging.
 					jsonBytes, err := json.Marshal(vm)
 					if err != nil {
@@ -467,11 +467,11 @@ func GCClusters(l *logger.Logger, cloud *Cloud, dryrun bool) error {
 	}
 
 	var destroyedClusters []resourceDescription
-	for _, c := range s.destroy {
+	for _, cl := range s.destroy {
 		if err := destroyResource(dryrun, func() error {
-			return DestroyCluster(l, c)
+			return c.destroyCluster(l, cl)
 		}); err == nil {
-			clouds := c.Clouds()
+			clouds := cl.Clouds()
 			formatPreamble := func(s string, isSlack bool) string {
 				if isSlack {
 					return fmt.Sprintf("*%s*", s)
@@ -508,16 +508,16 @@ func GCClusters(l *logger.Logger, cloud *Cloud, dryrun bool) error {
 				return b.String()
 			}
 
-			if !c.IsEmptyCluster() {
+			if !cl.IsEmptyCluster() {
 				destroyedClusters = append(destroyedClusters, resourceDescription{
-					Description:      fmt.Sprintf("%s (%s, expiration: %s)", c.Name, formatClouds(false), c.GCAt().String()),
-					SlackDescription: fmt.Sprintf("`%s` (%s, *expiration*: %s)", c.Name, formatClouds(true), slackClusterExpirationDate(c)),
+					Description:      fmt.Sprintf("%s (%s, expiration: %s)", cl.Name, formatClouds(false), cl.GCAt().String()),
+					SlackDescription: fmt.Sprintf("`%s` (%s, *expiration*: %s)", cl.Name, formatClouds(true), slackClusterExpirationDate(cl)),
 				})
 			} else {
 				// N.B. elide expiration for dangling resources since it's irrelevant.
 				destroyedClusters = append(destroyedClusters, resourceDescription{
-					Description:      fmt.Sprintf("%s (%s [empty cluster/dangling resource])", c.Name, formatClouds(false)),
-					SlackDescription: fmt.Sprintf("`%s` (%s [empty cluster/dangling resource])", c.Name, formatClouds(true)),
+					Description:      fmt.Sprintf("%s (%s [empty cluster/dangling resource])", cl.Name, formatClouds(false)),
+					SlackDescription: fmt.Sprintf("`%s` (%s [empty cluster/dangling resource])", cl.Name, formatClouds(true)),
 				})
 			}
 		} else {
@@ -543,7 +543,7 @@ func GCDNS(l *logger.Logger, cloud *Cloud, dryrun bool) error {
 	// Ensure all DNS providers do not have records for clusters that are no
 	// longer present.
 	ctx := context.Background()
-	for _, provider := range vm.Providers {
+	for _, provider := range vm.Providers.AllProviders() {
 		p, ok := provider.(vm.DNSProvider)
 		if !ok {
 			continue
@@ -596,31 +596,37 @@ func GCDNS(l *logger.Logger, cloud *Cloud, dryrun bool) error {
 // N.B. this function does not preserve the existing subscription ID set in the
 // provider.
 func GCAzure(l *logger.Logger, dryrun bool) error {
-	provider := vm.Providers[azure.ProviderName]
-	var azureSubscriptions []string
-	p, ok := provider.(*azure.Provider)
-	if ok {
-		azureSubscriptions = p.SubscriptionNames
+	raw, ok := vm.Providers.Provider(azure.ProviderName)
+	if !ok {
+		return errors.Newf("provider %q not registered", azure.ProviderName)
 	}
+	p := raw.(*azure.Provider)
+	azureSubscriptions := p.SubscriptionNames
 
 	if len(azureSubscriptions) == 0 {
 		// If no subscription names were specified, then fall back to cleaning up
 		// the subscription ID specified in the env or the default subscription.
 		cld, _ := ListCloud(l, vm.ListOptions{IncludeEmptyClusters: true, IncludeProviders: []string{azure.ProviderName}})
-		return GCClusters(l, cld, dryrun)
+		return cld.GCClusters(l, dryrun)
 	}
+
+	rawClient, err := vm.Providers.Client(azure.ProviderName)
+	if err != nil {
+		return err
+	}
+	client := rawClient.(*azure.Client)
 
 	ctx, cancel := context.WithTimeout(context.Background(), p.OperationTimeout)
 	defer cancel()
 	var combinedErrors error
 	for _, subscription := range azureSubscriptions {
-		if err := p.SetSubscription(ctx, subscription); err != nil {
+		if err := client.SetSubscription(ctx, subscription); err != nil {
 			combinedErrors = errors.CombineErrors(combinedErrors, err)
 			continue
 		}
 
 		cld, _ := ListCloud(l, vm.ListOptions{IncludeEmptyClusters: true, IncludeProviders: []string{azure.ProviderName}})
-		if err := GCClusters(l, cld, dryrun); err != nil {
+		if err := cld.GCClusters(l, dryrun); err != nil {
 			combinedErrors = errors.CombineErrors(combinedErrors, err)
 		}
 	}
@@ -631,27 +637,23 @@ func GCAzure(l *logger.Logger, dryrun bool) error {
 // and performs GC on them.
 // The accounts specified are used to identify which IBM Cloud API key to get
 // from the environment and use for the GC process.
-// API keys are expected in the format: `IBM_<account>_APIKEY“
+// API keys are expected in the format: IBM_<account>_APIKEY
 func GCIBM(l *logger.Logger, dryrun bool) error {
-
-	provider := vm.Providers[ibm.ProviderName]
-	var ibmAccounts []string
-	p, ok := provider.(*ibm.Provider)
-	if ok {
-		ibmAccounts = p.GCAccounts
+	raw, ok := vm.Providers.Provider(ibm.ProviderName)
+	if !ok {
+		return errors.Newf("provider %q not registered", ibm.ProviderName)
 	}
+	ibmAccounts := raw.(*ibm.Provider).GCAccounts
 
 	if len(ibmAccounts) == 0 {
 		// If no accounts were specified, then fall back to cleaning up
 		// the account specified in the env or the default account.
 		cld, _ := ListCloud(l, vm.ListOptions{IncludeEmptyClusters: true, IncludeProviders: []string{ibm.ProviderName}})
-		return GCClusters(l, cld, dryrun)
+		return cld.GCClusters(l, dryrun)
 	}
 
-	// Create a new provider for each account and set it in the provider map.
 	var combinedErrors error
 	for _, account := range ibmAccounts {
-
 		authenticator, err := core.GetAuthenticatorFromEnvironment(fmt.Sprintf("IBM_%s", account))
 		if err != nil {
 			combinedErrors = errors.CombineErrors(combinedErrors, err)
@@ -664,9 +666,14 @@ func GCIBM(l *logger.Logger, dryrun bool) error {
 			continue
 		}
 
-		vm.Providers[ibm.ProviderName] = p
-		cld, _ := ListCloud(l, vm.ListOptions{IncludeEmptyClusters: true, IncludeProviders: []string{ibm.ProviderName}})
-		if err := GCClusters(l, cld, dryrun); err != nil {
+		registry := vm.NewProviderRegistry()
+		registry.RegisterWithClient(p, p)
+		cld := NewCloud(WithRegistry(registry))
+		if err := cld.ListCloud(context.Background(), l, vm.ListOptions{IncludeEmptyClusters: true}); err != nil {
+			combinedErrors = errors.CombineErrors(combinedErrors, err)
+			continue
+		}
+		if err := cld.GCClusters(l, dryrun); err != nil {
 			combinedErrors = errors.CombineErrors(combinedErrors, err)
 		}
 	}
