@@ -172,7 +172,7 @@ func NewService(
 
 		// Initialize roachprod Cloud with the desired providers.
 		service.roachprodCloud = cloud.NewCloud(
-			cloud.WithProviders(cloudProviders),
+			cloud.WithRegistry(vm.RegistryFrom(cloudProviders)),
 		)
 
 		// Validate that the derived environment mapping matches the real

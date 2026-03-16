@@ -371,11 +371,11 @@ func destroyResource(dryrun bool, doDestroy func() error) error {
 // GCClusters checks all clusters to see if they should be deleted. It only
 // fails on failure to perform cloud actions. All other actions (load/save
 // file, email) do not abort.
-func (cld *Cloud) GCClusters(l *logger.Logger, dryrun bool) error {
+func (c *Cloud) GCClusters(l *logger.Logger, dryrun bool) error {
 	now := timeutil.Now()
 
 	var names []string
-	for name := range cld.Clusters {
+	for name := range c.Clusters {
 		if !config.IsLocalClusterName(name) {
 			names = append(names, name)
 		}
@@ -385,7 +385,7 @@ func (cld *Cloud) GCClusters(l *logger.Logger, dryrun bool) error {
 	var s status
 	users := make(map[string]*status)
 	for _, name := range names {
-		cluster := cld.Clusters[name]
+		cluster := c.Clusters[name]
 		u := users[cluster.User]
 		if u == nil {
 			u = &status{}
@@ -397,7 +397,7 @@ func (cld *Cloud) GCClusters(l *logger.Logger, dryrun bool) error {
 
 	// Compile list of "bad vms" and destroy them.
 	var badVMs vm.List
-	for _, vm := range cld.BadInstances {
+	for _, vm := range c.BadInstances {
 		// We skip fake VMs and only delete "bad vms" if they were created more than 1h ago.
 		if now.Sub(vm.CreatedAt) >= time.Hour && !vm.EmptyCluster {
 			badVMs = append(badVMs, vm)
@@ -426,14 +426,14 @@ func (cld *Cloud) GCClusters(l *logger.Logger, dryrun bool) error {
 	if len(badVMs) > 0 {
 		// Destroy bad VMs.
 		var deletedVMs []resourceDescription
-		if err := cld.registry.FanOut(badVMs, func(p vm.Provider, vms vm.List) error {
+		if err := c.registry.FanOut(badVMs, func(client vm.ProviderClient, vms vm.List) error {
 			err := destroyResource(dryrun, func() error {
-				return p.Delete(l, vms)
+				return client.Delete(l, vms)
 			})
 
 			if err == nil {
 				for _, vm := range vms {
-					l.Printf("Destroying bad VM on %s\n", p.Name())
+					l.Printf("Destroying bad VM on %s\n", vm.Provider)
 					// Dump json payload for debugging.
 					jsonBytes, err := json.Marshal(vm)
 					if err != nil {
@@ -469,7 +469,7 @@ func (cld *Cloud) GCClusters(l *logger.Logger, dryrun bool) error {
 	var destroyedClusters []resourceDescription
 	for _, cl := range s.destroy {
 		if err := destroyResource(dryrun, func() error {
-			return cld.destroyCluster(l, cl)
+			return c.destroyCluster(l, cl)
 		}); err == nil {
 			clouds := cl.Clouds()
 			formatPreamble := func(s string, isSlack bool) string {
@@ -610,11 +610,17 @@ func GCAzure(l *logger.Logger, dryrun bool) error {
 		return cld.GCClusters(l, dryrun)
 	}
 
+	rawClient, err := vm.Providers.Client(azure.ProviderName)
+	if err != nil {
+		return err
+	}
+	client := rawClient.(*azure.Client)
+
 	ctx, cancel := context.WithTimeout(context.Background(), p.OperationTimeout)
 	defer cancel()
 	var combinedErrors error
 	for _, subscription := range azureSubscriptions {
-		if err := p.SetSubscription(ctx, subscription); err != nil {
+		if err := client.SetSubscription(ctx, subscription); err != nil {
 			combinedErrors = errors.CombineErrors(combinedErrors, err)
 			continue
 		}
@@ -631,7 +637,7 @@ func GCAzure(l *logger.Logger, dryrun bool) error {
 // and performs GC on them.
 // The accounts specified are used to identify which IBM Cloud API key to get
 // from the environment and use for the GC process.
-// API keys are expected in the format: `IBM_<account>_APIKEY“
+// API keys are expected in the format: IBM_<account>_APIKEY
 func GCIBM(l *logger.Logger, dryrun bool) error {
 	raw, ok := vm.Providers.Provider(ibm.ProviderName)
 	if !ok {
@@ -646,7 +652,6 @@ func GCIBM(l *logger.Logger, dryrun bool) error {
 		return cld.GCClusters(l, dryrun)
 	}
 
-	// Create a new provider for each account.
 	var combinedErrors error
 	for _, account := range ibmAccounts {
 		authenticator, err := core.GetAuthenticatorFromEnvironment(fmt.Sprintf("IBM_%s", account))
@@ -662,7 +667,7 @@ func GCIBM(l *logger.Logger, dryrun bool) error {
 		}
 
 		registry := vm.NewProviderRegistry()
-		registry.Register(p)
+		registry.RegisterWithClient(p, p)
 		cld := NewCloud(WithRegistry(registry))
 		if err := cld.ListCloud(context.Background(), l, vm.ListOptions{IncludeEmptyClusters: true}); err != nil {
 			combinedErrors = errors.CombineErrors(combinedErrors, err)

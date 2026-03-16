@@ -38,7 +38,8 @@ var (
 	dnsDefaultZone, dnsDefaultDomain, dnsDefaultManagedZone, dnsDefaultManagedDomain string
 )
 
-func initDNSDefault() {
+// InitDNSDefault initializes DNS defaults from environment variables.
+func InitDNSDefault() {
 	dnsDefaultZone = config.EnvOrDefaultString(
 		"ROACHPROD_GCE_DNS_ZONE",
 		"roachprod",

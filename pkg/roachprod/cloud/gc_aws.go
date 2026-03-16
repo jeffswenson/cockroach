@@ -398,10 +398,7 @@ func GCAWS(l *logger.Logger, dryrun bool) error {
 	if !ok {
 		return errors.Newf("provider %q not registered", rochprodaws.ProviderName)
 	}
-	var awsAccountIDs []string
-	if awsProviderInstance, ok := raw.(*rochprodaws.Provider); ok {
-		awsAccountIDs = awsProviderInstance.AccountIDs
-	}
+	awsAccountIDs := raw.(*rochprodaws.Provider).AccountIDs
 
 	// if accountIds are not provided performs cleanup on a single AWS account configured in ${HOME}/.aws/credentials file
 	if len(awsAccountIDs) == 0 {

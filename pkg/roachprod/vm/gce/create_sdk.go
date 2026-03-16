@@ -22,7 +22,7 @@ import (
 
 // buildInstanceProperties creates a computepb.InstanceProperties struct for the
 // GCP Compute SDK. This is the SDK equivalent of computeInstanceArgs().
-func (p *Provider) buildInstanceProperties(
+func (c *Client) buildInstanceProperties(
 	l *logger.Logger,
 	opts vm.CreateOpts,
 	providerOpts *ProviderOpts,
@@ -90,7 +90,7 @@ func (p *Provider) buildInstanceProperties(
 		return nil, errors.Newf("invalid zone %q: must be at least 3 characters", zone)
 	}
 	region := zone[:len(zone)-2]
-	project := p.GetProject()
+	project := c.provider.GetProject()
 	networkInterfaces := []*computepb.NetworkInterface{
 		{
 			Subnetwork: proto.String(fmt.Sprintf("projects/%s/regions/%s/subnetworks/default", project, region)),
@@ -120,7 +120,7 @@ func (p *Provider) buildInstanceProperties(
 	// Configure the service account.
 	var serviceAccounts []*computepb.ServiceAccount
 	sa := providerOpts.ServiceAccount
-	if sa == "" && p.GetProject() == p.defaultProject {
+	if sa == "" && c.provider.GetProject() == c.provider.defaultProject {
 		sa = providerOpts.defaultServiceAccount
 	}
 	if sa != "" {
@@ -186,14 +186,14 @@ func parseLabelsString(labels string) (map[string]string, error) {
 // Benefits over CLI-based approach:
 // - CLI: 100 VMs = ~4 concurrent gcloud CLI calls with batching
 // - BulkInsert: 100 VMs = 1 API call per zone
-func (p *Provider) bulkInsertInstances(
+func (c *Client) bulkInsertInstances(
 	ctx context.Context,
 	l *logger.Logger,
 	zone string,
 	hostNames []string,
 	instanceProps *computepb.InstanceProperties,
 ) error {
-	project := p.GetProject()
+	project := c.provider.GetProject()
 
 	client, err := compute.NewInstancesRESTClient(ctx)
 	if err != nil {
@@ -242,7 +242,7 @@ func (p *Provider) bulkInsertInstances(
 // createInstancesSDK creates VMs using the GCP Compute SDK's BulkInsert API.
 // This is an alternative to the CLI-based approach that is more efficient
 // for creating large numbers of VMs.
-func (p *Provider) createInstancesSDK(
+func (c *Client) createInstancesSDK(
 	l *logger.Logger,
 	opts vm.CreateOpts,
 	providerOpts *ProviderOpts,
@@ -250,7 +250,7 @@ func (p *Provider) createInstancesSDK(
 	zoneToHostNames map[string][]string,
 	usedZones []string,
 ) (vm.List, error) {
-	project := p.GetProject()
+	project := c.provider.GetProject()
 
 	// Compute the extraMountOpts for the startup script.
 	extraMountOpts := ""
@@ -295,7 +295,7 @@ func (p *Provider) createInstancesSDK(
 
 		g.Go(func() error {
 			// Build the InstanceProperties for this zone (includes labels).
-			instanceProps, err := p.buildInstanceProperties(
+			instanceProps, err := c.buildInstanceProperties(
 				l, opts, providerOpts, startupScriptContent, zone, labelsMap,
 			)
 			if err != nil {
@@ -303,7 +303,7 @@ func (p *Provider) createInstancesSDK(
 			}
 
 			// Call BulkInsert for this zone.
-			err = p.bulkInsertInstances(
+			err = c.bulkInsertInstances(
 				context.Background(),
 				l,
 				zone,
@@ -358,7 +358,7 @@ func (p *Provider) createInstancesSDK(
 			defer vmListMutex.Unlock()
 			for _, instance := range instances {
 				if _, ok := hostNameSet[instance.Name]; ok {
-					v := instance.toVM(project, p.dnsProvider.PublicDomain())
+					v := instance.toVM(project, c.provider.dnsProvider.PublicDomain())
 					vmList = append(vmList, *v)
 				}
 			}

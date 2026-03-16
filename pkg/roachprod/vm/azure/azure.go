@@ -30,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/flagstub"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -54,39 +53,6 @@ const (
 	userManagedIdentityResourceGroup = "rp-roachtest"
 )
 
-// Init registers the Azure provider with vm.Providers.
-//
-// If the Azure CLI utilities are not installed, the provider is a stub.
-func Init() error {
-	const cliErr = "please install the Azure CLI utilities " +
-		"(https://docs.microsoft.com/en-us/cli/azure/install-azure-cli)"
-	const authErr = "unable to authenticate; please use `az login` or double check environment variables"
-
-	providerInstance, err := NewProvider(WithOperationTimeout(10*time.Minute), WithSyncDelete(false))
-	if err != nil {
-		vm.Providers.Register(flagstub.New(
-			&Provider{},
-			fmt.Sprintf("unable to init azure provider: %s", err),
-		))
-		return err
-	}
-
-	// If the appropriate environment variables are not set for api access,
-	// then the authenticated CLI must be installed.
-	if !hasEnvAuth {
-		if _, err := exec.LookPath("az"); err != nil {
-			vm.Providers.Register(flagstub.New(&Provider{}, cliErr))
-			return err
-		}
-	}
-	if _, err := providerInstance.getAuthToken(); err != nil {
-		vm.Providers.Register(flagstub.New(&Provider{}, authErr))
-		return err
-	}
-	vm.Providers.Register(providerInstance)
-	return nil
-}
-
 // Provider implements the vm.Provider interface for the Microsoft Azure
 // cloud.
 type Provider struct {
@@ -99,6 +65,11 @@ type Provider struct {
 	SubscriptionNames []string
 
 	dnsProvider vm.DNSProvider
+}
+
+// Client implements the vm.ProviderClient interface for Microsoft Azure.
+type Client struct {
+	provider *Provider
 
 	mu struct {
 		syncutil.Mutex
@@ -113,18 +84,32 @@ type Provider struct {
 
 // NewProvider returns a new Azure provider with the given options applied.
 func NewProvider(options ...Option) (*Provider, error) {
-
 	// Create a new provider with the default options.
 	p := &Provider{}
-	p.mu.resourceGroups = make(map[string]resources.Group)
-	p.mu.securityGroups = make(map[string]network.SecurityGroup)
-	p.mu.subnets = make(map[string]network.Subnet)
 
 	for _, option := range options {
 		option.apply(p)
 	}
 
 	return p, nil
+}
+
+// NewClient checks for az CLI availability and auth token.
+func (p *Provider) NewClient() (vm.ProviderClient, error) {
+	client := &Client{provider: p}
+	client.mu.resourceGroups = make(map[string]resources.Group)
+	client.mu.securityGroups = make(map[string]network.SecurityGroup)
+	client.mu.subnets = make(map[string]network.Subnet)
+	if !hasEnvAuth {
+		if _, err := exec.LookPath("az"); err != nil {
+			return nil, errors.New("please install the Azure CLI utilities " +
+				"(https://docs.microsoft.com/en-us/cli/azure/install-azure-cli)")
+		}
+	}
+	if _, err := client.getAuthToken(); err != nil {
+		return nil, errors.New("unable to authenticate; please use `az login` or double check environment variables")
+	}
+	return client, nil
 }
 
 func (p *Provider) SupportsSpotVMs() bool {
@@ -136,15 +121,28 @@ func (p *Provider) IsCentralizedProvider() bool {
 	return true
 }
 
-func (p *Provider) GetPreemptedSpotVMs(
+// ProjectActive is part of the vm.Provider interface.
+func (p *Provider) ProjectActive(project string) bool {
+	return project == ""
+}
+
+// Name implements vm.Provider.
+func (p *Provider) Name() string {
+	return ProviderName
+}
+
+// String returns a human-readable string representation of the Provider.
+func (p *Provider) String() string {
+	return fmt.Sprintf("%s-%s", ProviderName, strings.Join(p.SubscriptionNames, "_"))
+}
+
+func (c *Client) GetPreemptedSpotVMs(
 	l *logger.Logger, vms vm.List, since time.Time,
 ) ([]vm.PreemptedVM, error) {
 	return nil, nil
 }
 
-func (p *Provider) GetHostErrorVMs(
-	l *logger.Logger, vms vm.List, since time.Time,
-) ([]string, error) {
+func (c *Client) GetHostErrorVMs(l *logger.Logger, vms vm.List, since time.Time) ([]string, error) {
 	return nil, nil
 }
 
@@ -160,12 +158,12 @@ func (t *TokenCredential) GetToken(
 	}, nil
 }
 
-func (p *Provider) GetLiveMigrationVMs(
+func (c *Client) GetLiveMigrationVMs(
 	l *logger.Logger, vms vm.List, since time.Time,
 ) ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), p.OperationTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), c.provider.OperationTimeout)
 	defer cancel()
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +184,7 @@ func (p *Provider) GetLiveMigrationVMs(
 		resourceGroups[fmt.Sprintf("%s-%s", clusterName, zone)] = struct{}{}
 	}
 
-	token, err := p.getAuthToken()
+	token, err := c.getAuthToken()
 	if err != nil {
 		return nil, err
 	}
@@ -237,17 +235,17 @@ func (p *Provider) GetLiveMigrationVMs(
 
 // GetVMSpecs implements the vm.GetVMSpecs interface method which returns a
 // map from VM.Name to a map of VM attributes
-func (p *Provider) GetVMSpecs(
+func (c *Client) GetVMSpecs(
 	l *logger.Logger, vms vm.List,
 ) (map[string]map[string]interface{}, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), p.OperationTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), c.provider.OperationTimeout)
 	defer cancel()
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return nil, err
 	}
 	client := compute.NewVirtualMachinesClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return nil, err
 	}
 
@@ -280,77 +278,67 @@ func (p *Provider) GetVMSpecs(
 	return vmSpecs, nil
 }
 
-func (p *Provider) CreateVolumeSnapshot(
+func (c *Client) CreateVolumeSnapshot(
 	l *logger.Logger, volume vm.Volume, vsco vm.VolumeSnapshotCreateOpts,
 ) (vm.VolumeSnapshot, error) {
 	// TODO(leon): implement
 	return vm.VolumeSnapshot{}, vm.UnimplementedError
 }
 
-func (p *Provider) ListVolumeSnapshots(
+func (c *Client) ListVolumeSnapshots(
 	l *logger.Logger, vslo vm.VolumeSnapshotListOpts,
 ) ([]vm.VolumeSnapshot, error) {
 	return nil, vm.UnimplementedError
 }
 
-func (p *Provider) DeleteVolumeSnapshots(l *logger.Logger, snapshots ...vm.VolumeSnapshot) error {
+func (c *Client) DeleteVolumeSnapshots(l *logger.Logger, snapshots ...vm.VolumeSnapshot) error {
 	return vm.UnimplementedError
 }
 
-func (p *Provider) CreateVolume(*logger.Logger, vm.VolumeCreateOpts) (vm.Volume, error) {
+func (c *Client) CreateVolume(*logger.Logger, vm.VolumeCreateOpts) (vm.Volume, error) {
 	return vm.Volume{}, vm.UnimplementedError
 }
 
-func (p *Provider) DeleteVolume(l *logger.Logger, volume vm.Volume, _ *vm.VM) error {
+func (c *Client) DeleteVolume(l *logger.Logger, volume vm.Volume, _ *vm.VM) error {
 	return vm.UnimplementedError
 }
 
-func (p *Provider) ListVolumes(l *logger.Logger, vm *vm.VM) ([]vm.Volume, error) {
-	return vm.NonBootAttachedVolumes, nil
+func (c *Client) ListVolumes(l *logger.Logger, v *vm.VM) ([]vm.Volume, error) {
+	return v.NonBootAttachedVolumes, nil
 }
 
-func (p *Provider) AttachVolume(*logger.Logger, vm.Volume, *vm.VM) (string, error) {
+func (c *Client) AttachVolume(*logger.Logger, vm.Volume, *vm.VM) (string, error) {
 	return "", vm.UnimplementedError
 }
 
-func (p *Provider) Grow(*logger.Logger, vm.List, string, []string) (vm.List, error) {
+func (c *Client) Grow(*logger.Logger, vm.List, string, []string) (vm.List, error) {
 	return nil, vm.UnimplementedError
 }
 
-func (p *Provider) Shrink(*logger.Logger, vm.List, string) error {
+func (c *Client) Shrink(*logger.Logger, vm.List, string) error {
 	return vm.UnimplementedError
 }
 
-func (p *Provider) CreateLoadBalancer(*logger.Logger, vm.List, int) error {
+func (c *Client) CreateLoadBalancer(*logger.Logger, vm.List, int) error {
 	return vm.UnimplementedError
 }
 
-func (p *Provider) DeleteLoadBalancer(*logger.Logger, vm.List, int) error {
+func (c *Client) DeleteLoadBalancer(*logger.Logger, vm.List, int) error {
 	return vm.UnimplementedError
 }
 
-func (p *Provider) ListLoadBalancers(*logger.Logger, vm.List) ([]vm.ServiceAddress, error) {
+func (c *Client) ListLoadBalancers(*logger.Logger, vm.List) ([]vm.ServiceAddress, error) {
 	// This Provider has no concept of load balancers yet, return an empty list.
 	return nil, nil
 }
 
-// Active implements vm.Provider and always returns true.
-func (p *Provider) Active() bool {
-	return true
-}
-
-// ProjectActive is part of the vm.Provider interface.
-func (p *Provider) ProjectActive(project string) bool {
-	return project == ""
-}
-
-// CleanSSH implements vm.Provider, is a no-op, and returns nil.
-func (p *Provider) CleanSSH(l *logger.Logger) error {
+// CleanSSH implements vm.ProviderClient, is a no-op, and returns nil.
+func (c *Client) CleanSSH(l *logger.Logger) error {
 	return nil
 }
 
-// ConfigSSH is part of the vm.Provider interface and is a no-op.
-func (p *Provider) ConfigSSH(l *logger.Logger, zones []string) error {
+// ConfigSSH is part of the vm.ProviderClient interface and is a no-op.
+func (c *Client) ConfigSSH(l *logger.Logger, zones []string) error {
 	// On Azure, the SSH public key is set as part of VM instance creation.
 	return nil
 }
@@ -363,30 +351,30 @@ func getAzureDefaultLabelMap(opts vm.CreateOpts) map[string]string {
 
 // AddLabels adds (or updates) the given labels to the given VMs.
 // N.B. If a VM contains a label with the same key, its value will be updated.
-func (p *Provider) AddLabels(l *logger.Logger, vms vm.List, labels map[string]string) error {
-	return p.editLabels(l, vms, labels, false /*removeLabels*/)
+func (c *Client) AddLabels(l *logger.Logger, vms vm.List, labels map[string]string) error {
+	return c.editLabels(l, vms, labels, false /*removeLabels*/)
 }
 
-func (p *Provider) RemoveLabels(l *logger.Logger, vms vm.List, labels []string) error {
+func (c *Client) RemoveLabels(l *logger.Logger, vms vm.List, labels []string) error {
 	labelsMap := make(map[string]string, len(labels))
 	for _, label := range labels {
 		labelsMap[label] = ""
 	}
-	return p.editLabels(l, vms, labelsMap, true /*removeLabels*/)
+	return c.editLabels(l, vms, labelsMap, true /*removeLabels*/)
 }
 
-func (p *Provider) editLabels(
+func (c *Client) editLabels(
 	l *logger.Logger, vms vm.List, labels map[string]string, removeLabels bool,
 ) error {
-	ctx, cancel := context.WithTimeout(context.Background(), p.OperationTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), c.provider.OperationTimeout)
 	defer cancel()
 
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return err
 	}
 	client := compute.NewVirtualMachinesClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return err
 	}
 
@@ -477,8 +465,8 @@ func DefaultZones(geoDistributed bool) []string {
 	return []string{defaultZones[0]}
 }
 
-// Create implements vm.Provider.
-func (p *Provider) Create(
+// Create implements vm.ProviderClient.
+func (c *Client) Create(
 	l *logger.Logger, names []string, opts vm.CreateOpts, vmProviderOpts vm.ProviderOpts,
 ) (vm.List, error) {
 	providerOpts := vmProviderOpts.(*ProviderOpts)
@@ -506,7 +494,7 @@ func (p *Provider) Create(
 		return fmt.Sprintf("%s-%s", opts.ClusterName, location)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), p.OperationTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), c.provider.OperationTimeout)
 	defer cancel()
 
 	zones, err := parseZones(opts, providerOpts)
@@ -534,7 +522,7 @@ func (p *Provider) Create(
 		uniqueLocations[zone.Location] = struct{}{}
 	}
 
-	if _, err := p.createVNets(l, ctx, maps.Keys(uniqueLocations), *providerOpts); err != nil {
+	if _, err := c.createVNets(l, ctx, maps.Keys(uniqueLocations), *providerOpts); err != nil {
 		return nil, err
 	}
 
@@ -546,15 +534,15 @@ func (p *Provider) Create(
 			location := zone.Location
 
 			// Create a resource group within the location.
-			group, err := p.getOrCreateResourceGroup(ctx, getClusterResourceGroupName(location), location, clusterTags)
+			group, err := c.getOrCreateResourceGroup(ctx, getClusterResourceGroupName(location), location, clusterTags)
 			if err != nil {
 				return err
 			}
 
 			subnet, ok := func() (network.Subnet, bool) {
-				p.mu.Lock()
-				defer p.mu.Unlock()
-				s, ok := p.mu.subnets[location]
+				c.mu.Lock()
+				defer c.mu.Unlock()
+				s, ok := c.mu.subnets[location]
 				return s, ok
 			}()
 			if !ok {
@@ -563,13 +551,13 @@ func (p *Provider) Create(
 
 			for _, name := range nodes {
 				errs.Go(func() error {
-					cvm, err := p.createVM(l, ctx, group, subnet, name, sshKey, zone, opts, *providerOpts)
+					cvm, err := c.createVM(l, ctx, group, subnet, name, sshKey, zone, opts, *providerOpts)
 					if err != nil {
 						return errors.Wrapf(err, "creating VM %s", name)
 					}
 
 					l.Printf("created VM %s", name)
-					v, err := p.computeVirtualMachineToVM(cvm)
+					v, err := c.computeVirtualMachineToVM(cvm)
 					if err != nil {
 						return err
 					}
@@ -588,7 +576,7 @@ func (p *Provider) Create(
 }
 
 // computeVirtualMachineToVM converts an Azure VirtualMachine to a roachprod vm.VM.
-func (p *Provider) computeVirtualMachineToVM(cvm compute.VirtualMachine) (*vm.VM, error) {
+func (c *Client) computeVirtualMachineToVM(cvm compute.VirtualMachine) (*vm.VM, error) {
 
 	tags := make(map[string]string)
 	for key, value := range cvm.Tags {
@@ -602,7 +590,7 @@ func (p *Provider) computeVirtualMachineToVM(cvm compute.VirtualMachine) (*vm.VM
 	}
 
 	// Get public DNS info from the DNS provider if it is configured.
-	publicDns, publicDnsZone, dnsProviderName := vm.GetVMDNSInfo(context.Background(), *cvm.Name, p.dnsProvider)
+	publicDns, publicDnsZone, dnsProviderName := vm.GetVMDNSInfo(context.Background(), *cvm.Name, c.provider.dnsProvider)
 
 	m := &vm.VM{
 		Name:              *cvm.Name,
@@ -646,7 +634,7 @@ func (p *Provider) computeVirtualMachineToVM(cvm compute.VirtualMachine) (*vm.VM
 	if err != nil {
 		return nil, err
 	}
-	if err := p.fillNetworkDetails(context.Background(), m, nicID); errors.Is(err, vm.ErrBadNetwork) {
+	if err := c.fillNetworkDetails(context.Background(), m, nicID); errors.Is(err, vm.ErrBadNetwork) {
 		m.Errors = append(m.Errors, vm.NewVMError(err))
 	} else if err != nil {
 		return nil, err
@@ -655,17 +643,17 @@ func (p *Provider) computeVirtualMachineToVM(cvm compute.VirtualMachine) (*vm.VM
 	return m, nil
 }
 
-// Delete implements the vm.Provider interface.
-func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
-	ctx, cancel := context.WithTimeout(context.Background(), p.OperationTimeout)
+// Delete implements the vm.ProviderClient interface.
+func (c *Client) Delete(l *logger.Logger, vms vm.List) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.provider.OperationTimeout)
 	defer cancel()
 
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return err
 	}
 	client := compute.NewVirtualMachinesClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return err
 	}
 
@@ -682,7 +670,7 @@ func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
 		futures = append(futures, future)
 	}
 
-	if !p.SyncDelete {
+	if !c.provider.SyncDelete {
 		return nil
 	}
 
@@ -697,17 +685,17 @@ func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
 	return nil
 }
 
-// Reset implements the vm.Provider interface.
-func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
-	ctx, cancel := context.WithTimeout(context.Background(), p.OperationTimeout)
+// Reset implements the vm.ProviderClient interface.
+func (c *Client) Reset(l *logger.Logger, vms vm.List) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.provider.OperationTimeout)
 	defer cancel()
 
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return err
 	}
 	client := compute.NewVirtualMachinesClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return err
 	}
 
@@ -737,16 +725,16 @@ func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
 
 // DeleteCluster implements the vm.DeleteCluster interface, providing
 // a fast-path to tear down all resources associated with a cluster.
-func (p *Provider) DeleteCluster(l *logger.Logger, name string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), p.OperationTimeout)
+func (c *Client) DeleteCluster(l *logger.Logger, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.provider.OperationTimeout)
 	defer cancel()
 
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return err
 	}
 	client := resources.NewGroupsClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return err
 	}
 
@@ -779,7 +767,7 @@ func (p *Provider) DeleteCluster(l *logger.Logger, name string) error {
 		return errors.Newf("**** MANUAL INTERVENTION REQUIRED IF ERROR SEEN MULTIPLE TIMES ****\nDeleteCluster: Found no azure resource groups with tag cluster: %s", name)
 	}
 
-	if !p.SyncDelete {
+	if !c.provider.SyncDelete {
 		return nil
 	}
 
@@ -794,20 +782,20 @@ func (p *Provider) DeleteCluster(l *logger.Logger, name string) error {
 	return nil
 }
 
-// Extend implements the vm.Provider interface.
-func (p *Provider) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
-	return p.AddLabels(l, vms, map[string]string{
+// Extend implements the vm.ProviderClient interface.
+func (c *Client) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
+	return c.AddLabels(l, vms, map[string]string{
 		vm.TagLifetime: lifetime.String(),
 	})
 }
 
-// FindActiveAccount implements vm.Provider.
-func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
+// FindActiveAccount implements vm.ProviderClient.
+func (c *Client) FindActiveAccount(l *logger.Logger) (string, error) {
 	// It's a JSON Web Token, so we'll just dissect it enough to get the
 	// data that we want. There are three base64-encoded segments
 	// separated by periods. The second segment is the "claims" JSON
 	// object.
-	token, err := p.getAuthToken()
+	token, err := c.getAuthToken()
 	if err != nil {
 		return "", err
 	}
@@ -830,21 +818,19 @@ func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
 	return username, nil
 }
 
-// List implements the vm.Provider interface.
-func (p *Provider) List(
-	ctx context.Context, l *logger.Logger, opts vm.ListOptions,
-) (vm.List, error) {
-	ctx, cancel := context.WithTimeout(ctx, p.OperationTimeout)
+// List implements the vm.ProviderClient interface.
+func (c *Client) List(ctx context.Context, l *logger.Logger, opts vm.ListOptions) (vm.List, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.provider.OperationTimeout)
 	defer cancel()
 
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	// We're just going to list all VMs and filter.
 	client := compute.NewVirtualMachinesClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return nil, err
 	}
 
@@ -868,7 +854,7 @@ func (p *Provider) List(
 			continue
 		}
 
-		m, err := p.computeVirtualMachineToVM(found)
+		m, err := c.computeVirtualMachineToVM(found)
 		if err != nil {
 			return nil, err
 		}
@@ -887,7 +873,7 @@ func (p *Provider) List(
 	// Normally we don't want to access these clusters except for deleting them.
 	if opts.IncludeEmptyClusters {
 		groupsClient := resources.NewGroupsClient(sub)
-		if groupsClient.Authorizer, err = p.getAuthorizer(); err != nil {
+		if groupsClient.Authorizer, err = c.getAuthorizer(); err != nil {
 			return nil, err
 		}
 
@@ -959,12 +945,7 @@ func (p *Provider) List(
 	return ret, nil
 }
 
-// Name implements vm.Provider.
-func (p *Provider) Name() string {
-	return ProviderName
-}
-
-func (p *Provider) createVM(
+func (c *Client) createVM(
 	l *logger.Logger,
 	ctx context.Context,
 	group resources.Group,
@@ -990,22 +971,22 @@ func (p *Provider) createVM(
 	if err != nil {
 		return machine, err
 	}
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return compute.VirtualMachine{}, err
 	}
 
 	client := compute.NewVirtualMachinesClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return
 	}
 
 	// We first need to allocate a NIC to give the VM network access
-	ip, err := p.createIP(l, ctx, group, name, zone)
+	ip, err := c.createIP(l, ctx, group, name, zone)
 	if err != nil {
 		return compute.VirtualMachine{}, err
 	}
-	nic, err := p.createNIC(l, ctx, group, ip, subnet)
+	nic, err := c.createNIC(l, ctx, group, ip, subnet)
 	if err != nil {
 		return compute.VirtualMachine{}, err
 	}
@@ -1144,7 +1125,7 @@ func (p *Provider) createVM(
 			case "ultra-disk":
 				// Create multiple ultra disks
 				var ultraDisk compute.Disk
-				ultraDisk, err = p.createUltraDisk(l, ctx, group, fmt.Sprintf("%s-ultra-disk-%d", name, i), zone, providerOpts)
+				ultraDisk, err = c.createUltraDisk(l, ctx, group, fmt.Sprintf("%s-ultra-disk-%d", name, i), zone, providerOpts)
 				if err != nil {
 					return compute.VirtualMachine{}, err
 				}
@@ -1199,23 +1180,23 @@ func (p *Provider) createVM(
 }
 
 // createNIC creates a network adapter that is bound to the given public IP address.
-func (p *Provider) createNIC(
+func (c *Client) createNIC(
 	l *logger.Logger,
 	ctx context.Context,
 	group resources.Group,
 	ip network.PublicIPAddress,
 	subnet network.Subnet,
 ) (iface network.Interface, err error) {
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return
 	}
 	client := network.NewInterfacesClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return
 	}
 
-	_, sg := p.getResourcesAndSecurityGroupByName("", p.getVnetNetworkSecurityGroupName(*group.Location))
+	_, sg := c.getResourcesAndSecurityGroupByName("", c.getVnetNetworkSecurityGroupName(*group.Location))
 
 	future, err := client.CreateOrUpdate(ctx, *group.Name, *ip.Name, network.Interface{
 		Name:     ip.Name,
@@ -1322,35 +1303,35 @@ func securityRules() *[]network.SecurityRule {
 	return &firewallRules
 }
 
-func (p *Provider) getOrCreateNetworkSecurityGroup(
+func (c *Client) getOrCreateNetworkSecurityGroup(
 	ctx context.Context, name string, resourceGroup resources.Group,
 ) (network.SecurityGroup, error) {
 	group, ok := func() (network.SecurityGroup, bool) {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		g, ok := p.mu.securityGroups[name]
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		g, ok := c.mu.securityGroups[name]
 		return g, ok
 	}()
 	if ok {
 		return group, nil
 	}
 
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return network.SecurityGroup{}, err
 	}
 	client := network.NewSecurityGroupsClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return network.SecurityGroup{}, err
 	}
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return network.SecurityGroup{}, err
 	}
 
 	cacheAndReturn := func(group network.SecurityGroup) (network.SecurityGroup, error) {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		p.mu.securityGroups[name] = group
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.mu.securityGroups[name] = group
 		return group, nil
 	}
 
@@ -1374,7 +1355,7 @@ func (p *Provider) getOrCreateNetworkSecurityGroup(
 	return cacheAndReturn(securityGroup)
 }
 
-func (p *Provider) getVnetNetworkSecurityGroupName(location string) string {
+func (c *Client) getVnetNetworkSecurityGroupName(location string) string {
 	return fmt.Sprintf("roachprod-vnets-nsg-%s", location)
 }
 
@@ -1382,16 +1363,16 @@ func (p *Provider) getVnetNetworkSecurityGroupName(location string) string {
 // shared across roachprod clusters. Thus, all roachprod clusters will
 // be able to communicate with one another, although this is scoped by
 // the value of the vnet-name flag.
-func (p *Provider) createVNets(
+func (c *Client) createVNets(
 	l *logger.Logger, ctx context.Context, locations []string, providerOpts ProviderOpts,
 ) (map[string]network.VirtualNetwork, error) {
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	groupsClient := resources.NewGroupsClient(sub)
-	if groupsClient.Authorizer, err = p.getAuthorizer(); err != nil {
+	if groupsClient.Authorizer, err = c.getAuthorizer(); err != nil {
 		return nil, err
 	}
 
@@ -1414,11 +1395,11 @@ func (p *Provider) createVNets(
 	// First, find or create a resource groups and network security groups for
 	// roachprod to create the VNets in. We need one per location.
 	for _, location := range locations {
-		group, err := p.getOrCreateResourceGroup(ctx, vnetResourceGroupName(location), location, vnetResourceGroupTags)
+		group, err := c.getOrCreateResourceGroup(ctx, vnetResourceGroupName(location), location, vnetResourceGroupTags)
 		if err != nil {
 			return nil, errors.Wrapf(err, "resource group for location %q", location)
 		}
-		_, err = p.getOrCreateNetworkSecurityGroup(ctx, p.getVnetNetworkSecurityGroupName(location), group)
+		_, err = c.getOrCreateNetworkSecurityGroup(ctx, c.getVnetNetworkSecurityGroupName(location), group)
 		if err != nil {
 			return nil, errors.Wrapf(err, "nsg for location %q", location)
 		}
@@ -1444,7 +1425,7 @@ func (p *Provider) createVNets(
 	newSubnetsCreated := false
 
 	for _, location := range locations {
-		group, _ := p.getResourcesAndSecurityGroupByName(vnetResourceGroupName(location), "")
+		group, _ := c.getResourcesAndSecurityGroupByName(vnetResourceGroupName(location), "")
 		// Prefix already exists for the resource group.
 		if prefixString := group.Tags[tagSubnet]; prefixString != nil {
 			prefix, err := strconv.Atoi(*prefixString)
@@ -1459,7 +1440,7 @@ func (p *Provider) createVNets(
 			newSubnetsCreated = true
 			prefix := nextAvailablePrefix()
 			prefixesByLocation[location] = prefix
-			group, _ := p.getResourcesAndSecurityGroupByName(vnetResourceGroupName(location), "")
+			group, _ := c.getResourcesAndSecurityGroupByName(vnetResourceGroupName(location), "")
 			group, err = setVNetSubnetPrefix(group, prefix)
 			if err != nil {
 				return nil, errors.Wrapf(err, "for location %q", location)
@@ -1467,9 +1448,9 @@ func (p *Provider) createVNets(
 			// We just updated the VNet Subnet prefix on the resource group -- update
 			// the cached entry to reflect that.
 			func() {
-				p.mu.Lock()
-				defer p.mu.Unlock()
-				p.mu.resourceGroups[vnetResourceGroupName(location)] = group
+				c.mu.Lock()
+				defer c.mu.Unlock()
+				c.mu.resourceGroups[vnetResourceGroupName(location)] = group
 			}()
 		}
 	}
@@ -1481,8 +1462,8 @@ func (p *Provider) createVNets(
 	ret := make(map[string]network.VirtualNetwork)
 	vnets := make([]network.VirtualNetwork, len(ret))
 	for location, prefix := range prefixesByLocation {
-		resourceGroup, networkSecurityGroup := p.getResourcesAndSecurityGroupByName(vnetResourceGroupName(location), p.getVnetNetworkSecurityGroupName(location))
-		if vnet, _, err := p.createVNet(l, ctx, resourceGroup, networkSecurityGroup, prefix, providerOpts); err == nil {
+		resourceGroup, networkSecurityGroup := c.getResourcesAndSecurityGroupByName(vnetResourceGroupName(location), c.getVnetNetworkSecurityGroupName(location))
+		if vnet, _, err := c.createVNet(l, ctx, resourceGroup, networkSecurityGroup, prefix, providerOpts); err == nil {
 			ret[location] = vnet
 			vnets = append(vnets, vnet)
 		} else {
@@ -1492,15 +1473,15 @@ func (p *Provider) createVNets(
 
 	// We only need to create peerings if there are new subnets.
 	if newSubnetsCreated {
-		return ret, p.createVNetPeerings(l, ctx, vnets)
+		return ret, c.createVNetPeerings(l, ctx, vnets)
 	}
 	return ret, nil
 }
 
 // createVNet creates or retrieves a named VNet object using the 10.<offset>/16 prefix.
 // A single /18 subnet will be created within the VNet.
-// The results  will be memoized in the Provider.
-func (p *Provider) createVNet(
+// The results  will be memoized in the Client.
+func (c *Client) createVNet(
 	l *logger.Logger,
 	ctx context.Context,
 	resourceGroup resources.Group,
@@ -1510,12 +1491,12 @@ func (p *Provider) createVNet(
 ) (vnet network.VirtualNetwork, subnet network.Subnet, err error) {
 	vnetName := providerOpts.VnetName
 
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return
 	}
 	client := network.NewVirtualNetworksClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return
 	}
 	vnet = network.VirtualNetwork{
@@ -1551,24 +1532,24 @@ func (p *Provider) createVNet(
 		return
 	}
 	subnet = (*vnet.Subnets)[0]
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.mu.subnets[*resourceGroup.Location] = subnet
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mu.subnets[*resourceGroup.Location] = subnet
 	l.Printf("created Azure VNet %q in %q with prefix %d", vnetName, *resourceGroup.Name, prefix)
 	return
 }
 
 // createVNetPeerings creates a fully-connected graph of peerings
 // between the provided vnets.
-func (p *Provider) createVNetPeerings(
+func (c *Client) createVNetPeerings(
 	l *logger.Logger, ctx context.Context, vnets []network.VirtualNetwork,
 ) error {
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return err
 	}
 	client := network.NewVirtualNetworkPeeringsClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return err
 	}
 
@@ -1621,15 +1602,15 @@ func (p *Provider) createVNetPeerings(
 }
 
 // createIP allocates an IP address that will later be bound to a NIC.
-func (p *Provider) createIP(
+func (c *Client) createIP(
 	l *logger.Logger, ctx context.Context, group resources.Group, name string, zone Zone,
 ) (ip network.PublicIPAddress, err error) {
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return
 	}
 	ipc := network.NewPublicIPAddressesClient(sub)
-	if ipc.Authorizer, err = p.getAuthorizer(); err != nil {
+	if ipc.Authorizer, err = c.getAuthorizer(); err != nil {
 		return
 	}
 	future, err := ipc.CreateOrUpdate(ctx, *group.Name, name,
@@ -1666,14 +1647,14 @@ func (p *Provider) createIP(
 // fillNetworkDetails makes some secondary requests to the Azure
 // API in order to populate the VM details. This will return
 // vm.ErrBadNetwork if the response payload is not of the expected form.
-func (p *Provider) fillNetworkDetails(ctx context.Context, m *vm.VM, nicID azureID) error {
-	sub, err := p.getSubscription(ctx)
+func (c *Client) fillNetworkDetails(ctx context.Context, m *vm.VM, nicID azureID) error {
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return err
 	}
 
 	nicClient := network.NewInterfacesClient(sub)
-	if nicClient.Authorizer, err = p.getAuthorizer(); err != nil {
+	if nicClient.Authorizer, err = c.getAuthorizer(); err != nil {
 		return err
 	}
 
@@ -1715,16 +1696,16 @@ func (p *Provider) fillNetworkDetails(ctx context.Context, m *vm.VM, nicID azure
 
 // getOrCreateResourceGroup retrieves or creates a resource group with the given
 // name in the specified location and with the given tags. Results are memoized
-// within the Provider instance.
-func (p *Provider) getOrCreateResourceGroup(
+// within the Client instance.
+func (c *Client) getOrCreateResourceGroup(
 	ctx context.Context, name string, location string, tags map[string]*string,
 ) (resources.Group, error) {
 
-	// First, check the local provider cache.
+	// First, check the local client cache.
 	group, ok := func() (resources.Group, bool) {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		g, ok := p.mu.resourceGroups[name]
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		g, ok := c.mu.resourceGroups[name]
 		return g, ok
 	}()
 	if ok {
@@ -1732,19 +1713,19 @@ func (p *Provider) getOrCreateResourceGroup(
 	}
 
 	cacheAndReturn := func(group resources.Group) (resources.Group, error) {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		p.mu.resourceGroups[name] = group
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.mu.resourceGroups[name] = group
 		return group, nil
 	}
 
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return resources.Group{}, err
 	}
 
 	client := resources.NewGroupsClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return resources.Group{}, err
 	}
 
@@ -1772,7 +1753,7 @@ func (p *Provider) getOrCreateResourceGroup(
 	return cacheAndReturn(group)
 }
 
-func (p *Provider) createUltraDisk(
+func (c *Client) createUltraDisk(
 	l *logger.Logger,
 	ctx context.Context,
 	group resources.Group,
@@ -1780,13 +1761,13 @@ func (p *Provider) createUltraDisk(
 	zone Zone,
 	providerOpts ProviderOpts,
 ) (compute.Disk, error) {
-	sub, err := p.getSubscription(ctx)
+	sub, err := c.getSubscription(ctx)
 	if err != nil {
 		return compute.Disk{}, err
 	}
 
 	client := compute.NewDisksClient(sub)
-	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+	if client.Authorizer, err = c.getAuthorizer(); err != nil {
 		return compute.Disk{}, err
 	}
 
@@ -1820,22 +1801,22 @@ func (p *Provider) createUltraDisk(
 }
 
 // SetSubscription takes in a subscription name then finds and stores the ID
-// in the Provider instance.
-func (p *Provider) SetSubscription(ctx context.Context, subscription string) error {
-	subscriptionId, err := p.findSubscriptionID(ctx, subscription)
+// in the Client instance.
+func (c *Client) SetSubscription(ctx context.Context, subscription string) error {
+	subscriptionId, err := c.findSubscriptionID(ctx, subscription)
 	if err != nil {
 		return err
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.mu.subscriptionId = subscriptionId
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mu.subscriptionId = subscriptionId
 
 	return nil
 }
 
 // findSubscriptionID takes in a subscription name and returns the ID.
-func (p *Provider) findSubscriptionID(ctx context.Context, subscription string) (string, error) {
-	authorizer, err := p.getAuthorizer()
+func (c *Client) findSubscriptionID(ctx context.Context, subscription string) (string, error) {
+	authorizer, err := c.getAuthorizer()
 	if err != nil {
 		return "", err
 	}
@@ -1872,12 +1853,12 @@ func (p *Provider) findSubscriptionID(ctx context.Context, subscription string) 
 
 // getSubscription returns env.AZURE_SUBSCRIPTION_ID if it exists
 // or the ID of the defaultSubscription.
-// The value is memoized in the Provider instance.
-func (p *Provider) getSubscription(ctx context.Context) (string, error) {
+// The value is memoized in the Client instance.
+func (c *Client) getSubscription(ctx context.Context) (string, error) {
 	subscriptionId := func() string {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return p.mu.subscriptionId
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.mu.subscriptionId
 	}()
 
 	// Use the saved subscriptionID.
@@ -1891,10 +1872,10 @@ func (p *Provider) getSubscription(ctx context.Context) (string, error) {
 	// 2. If the AZURE_SUBSCRIPTION_ID env var is set, use it.
 	// 3. Use the default subscription name configured in the provider.
 	switch {
-	case len(p.SubscriptionNames) == 1:
+	case len(c.provider.SubscriptionNames) == 1:
 		// If there is only one subscription name, use that.
 		var err error
-		subscriptionId, err = p.findSubscriptionID(ctx, p.SubscriptionNames[0])
+		subscriptionId, err = c.findSubscriptionID(ctx, c.provider.SubscriptionNames[0])
 		if err != nil {
 			return "", errors.Wrapf(err, "Error finding Azure subscription. Check that you have permission to view the subscription or use a different subscription by specifying the %s env var", SubscriptionIDEnvVar)
 		}
@@ -1903,32 +1884,32 @@ func (p *Provider) getSubscription(ctx context.Context) (string, error) {
 		subscriptionId = os.Getenv(SubscriptionIDEnvVar)
 	default:
 		var err error
-		subscriptionId, err = p.findSubscriptionID(ctx, defaultSubscription)
+		subscriptionId, err = c.findSubscriptionID(ctx, defaultSubscription)
 		if err != nil {
 			return "", errors.Wrapf(err, "Error finding default Azure subscription. Check that you have permission to view the subscription or use a different subscription by specifying the %s env var", SubscriptionIDEnvVar)
 		}
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.mu.subscriptionId = subscriptionId
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mu.subscriptionId = subscriptionId
 	return subscriptionId, nil
 }
 
 // getResourceGroupByName receives a string name and returns
 // the resources.Group associated with it.
-func (p *Provider) getResourcesAndSecurityGroupByName(
+func (c *Client) getResourcesAndSecurityGroupByName(
 	rName string, sName string,
 ) (resources.Group, network.SecurityGroup) {
 	var rGroup resources.Group
 	var sGroup network.SecurityGroup
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if rName != "" {
-		rGroup = p.mu.resourceGroups[rName]
+		rGroup = c.mu.resourceGroups[rName]
 	}
 	if sName != "" {
-		sGroup = p.mu.securityGroups[sName]
+		sGroup = c.mu.securityGroups[sName]
 	}
 	return rGroup, sGroup
 }
@@ -1991,9 +1972,4 @@ func MachineSupportsNVMe(machineType string) bool {
 		}
 	}
 	return false
-}
-
-// String returns a human-readable string representation of the Provider.
-func (p *Provider) String() string {
-	return fmt.Sprintf("%s-%s", ProviderName, strings.Join(p.SubscriptionNames, "_"))
 }

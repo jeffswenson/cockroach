@@ -47,8 +47,10 @@ func newCommandRegistry(rootCmd *cobra.Command) *commandRegistry {
 }
 
 // Initialize sets up and initializes the command-line interface.
+// Provider registration is cheap (no CLI checks, auth, or SDK clients).
+// Expensive provider validation happens lazily on first use.
 func Initialize(rootCmd *cobra.Command) {
-	_ = roachprod.InitProviders()
+	roachprod.RegisterProviders()
 	providerOptsContainer = vm.CreateProviderOptionsContainer()
 	// The commands are displayed in the order they are added to rootCmd. Note
 	// that gcCmd and adminurlCmd contain a trailing \n in their Short help in

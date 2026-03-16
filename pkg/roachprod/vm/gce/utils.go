@@ -204,13 +204,13 @@ func generateStartupScriptContent(
 }
 
 // SyncDNS implements the InfraProvider interface.
-func (p *Provider) SyncDNS(l *logger.Logger, vms vm.List) error {
-	return p.dnsProvider.SyncDNS(l, vms)
+func (c *Client) SyncDNS(l *logger.Logger, vms vm.List) error {
+	return c.provider.dnsProvider.SyncDNS(l, vms)
 }
 
 // DNSDomain implements the InfraProvider interface.
-func (p *Provider) DNSDomain() string {
-	return p.dnsProvider.PublicDomain()
+func (c *Client) DNSDomain() string {
+	return c.provider.dnsProvider.PublicDomain()
 }
 
 type AuthorizedKey struct {
@@ -273,11 +273,11 @@ func (ak AuthorizedKeys) AsProjectMetadata() []byte {
 }
 
 // GetUserAuthorizedKeys implements the InfraProvider interface.
-func (p *Provider) GetUserAuthorizedKeys() (AuthorizedKeys, error) {
+func (c *Client) GetUserAuthorizedKeys() (AuthorizedKeys, error) {
 	var outBuf bytes.Buffer
 	// The below command will return a stream of user:pubkey as text.
 	cmd := exec.Command("gcloud", "compute", "project-info", "describe",
-		"--project="+p.metadataProject,
+		"--project="+c.provider.metadataProject,
 		"--format=value(commonInstanceMetadata.ssh-keys)")
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = &outBuf

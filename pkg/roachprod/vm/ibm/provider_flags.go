@@ -184,7 +184,7 @@ func (p *Provider) ConfigureProviderFlags(flags *pflag.FlagSet, _ vm.MultiplePro
 // ConfigureClusterCleanupFlags is part of the vm.Provider interface.
 func (p *Provider) ConfigureClusterCleanupFlags(flags *pflag.FlagSet) {
 	flags.StringSliceVar(
-		&providerInstance.GCAccounts,
+		&p.GCAccounts,
 		ProviderName+"-accounts",
 		[]string{},
 		`List of accounts to GC. Accounts are expected to match API keys in the environment with the format:

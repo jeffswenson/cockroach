@@ -22,20 +22,20 @@ import (
 )
 
 // listWithSDK lists VMs using the GCP SDK.
-func (p *Provider) listWithSDK(
+func (c *Client) listWithSDK(
 	ctx context.Context, l *logger.Logger, opts vm.ListOptions,
 ) (vm.List, error) {
 
 	templatesInUse := make(map[string]map[string]struct{})
 	var vms vm.List
-	for _, prj := range p.GetProjects() {
+	for _, prj := range c.provider.GetProjects() {
 		req := &computepb.AggregatedListInstancesRequest{
 			Project:              prj,
 			ReturnPartialSuccess: proto.Bool(true),
 			Filter:               proto.String("labels." + vm.TagRoachprod + " = true"),
 		}
 
-		it := p.computeInstancesClient.AggregatedList(ctx, req)
+		it := c.computeInstancesClient.AggregatedList(ctx, req)
 
 		for {
 			pair, err := it.Next()
@@ -55,7 +55,7 @@ func (p *Provider) listWithSDK(
 			for _, inst := range pair.Value.Instances {
 
 				// Convert the SDK payload into our common VM type
-				vms = append(vms, *(&sdkInstance{inst}).toVM(prj, p.dnsProvider.PublicDomain()))
+				vms = append(vms, *(&sdkInstance{inst}).toVM(prj, c.provider.dnsProvider.PublicDomain()))
 
 				// Check if the instance was created from an instance template.
 				if inst.GetMetadata() != nil {
@@ -80,12 +80,12 @@ func (p *Provider) listWithSDK(
 		// any MIG or instance template resources when there are no VMs to
 		// derive it from.
 		clusterSeen := make(map[string]struct{})
-		for _, prj := range p.GetProjects() {
+		for _, prj := range c.provider.GetProjects() {
 			projTemplatesInUse := templatesInUse[prj]
 			if projTemplatesInUse == nil {
 				projTemplatesInUse = make(map[string]struct{})
 			}
-			templates, err := p.listInstanceTemplatesWithSDK(ctx, l, prj, "" /* clusterFilter */)
+			templates, err := c.listInstanceTemplatesWithSDK(ctx, l, prj, "" /* clusterFilter */)
 			if err != nil {
 				return nil, err
 			}
@@ -134,12 +134,12 @@ func (p *Provider) listWithSDK(
 
 // listInstanceTemplates returns a list of instance templates for a given
 // project.
-func (p *Provider) listInstanceTemplatesWithSDK(
+func (c *Client) listInstanceTemplatesWithSDK(
 	ctx context.Context, l *logger.Logger, project, clusterFilter string,
 ) ([]*computepb.InstanceTemplate, error) {
 
 	req := &computepb.ListInstanceTemplatesRequest{Project: project}
-	it := p.computeInstanceTemplatesClient.List(ctx, req)
+	it := c.computeInstanceTemplatesClient.List(ctx, req)
 
 	templates := make([]*computepb.InstanceTemplate, 0)
 	for {

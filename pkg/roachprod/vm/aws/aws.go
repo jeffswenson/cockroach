@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/flagstub"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -60,27 +59,25 @@ var (
 	}
 )
 
-// Init initializes the AWS provider and registers it into vm.Providers.
-//
-// If the aws tool is not available on the local path, the provider is a stub.
-func Init() error {
-	// aws-cli version 1 automatically base64 encodes the string passed as --public-key-material.
-	// Version 2 supports file:// and fileb:// prefixes for text and binary files.
-	// The latter prefix will base64-encode the file contents. See
-	// https://docs.aws.amazon.//com/cli/latest/userguide/cliv2-migration.html#cliv2-migration-binaryparam
+// NewClient performs expensive AWS validation (CLI version, credentials).
+func (p *Provider) NewClient() (vm.ProviderClient, error) {
+	client := &Client{
+		provider:    p,
+		dnsProvider: p.dnsProvider,
+	}
+	if err := client.validate(); err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+// validate performs expensive AWS provider checks: aws CLI version and
+// credential verification.
+func (c *Client) validate() error {
 	const unsupportedAwsCliVersionPrefix = "aws-cli/1."
 	const unimplemented = "please install the AWS CLI utilities version 2+ " +
 		"(https://docs.aws.amazon.com/cli/latest/userguide/installing.html)"
 	const noCredentials = "missing AWS credentials, expected ~/.aws/credentials file or AWS_ACCESS_KEY_ID env var"
-
-	providerInstance, err := NewProvider()
-	if err != nil {
-		vm.Providers.Register(flagstub.New(
-			&Provider{},
-			fmt.Sprintf("unable to init aws provider: %s", err),
-		))
-		return errors.Wrap(err, "unable to init aws provider")
-	}
 
 	haveRequiredVersion := func() bool {
 		// `aws --version` takes around 400ms on my machine.
@@ -98,8 +95,7 @@ func Init() error {
 		return true
 	}
 	if !haveRequiredVersion() {
-		vm.Providers.Register(flagstub.New(&Provider{}, unimplemented))
-		return errors.New("doesn't have the required version")
+		return errors.New(unimplemented)
 	}
 
 	// NB: This is a bit hacky, but using something like `aws iam get-user` is
@@ -133,10 +129,8 @@ func Init() error {
 		return true
 	}
 	if !haveCredentials() {
-		vm.Providers.Register(flagstub.New(&Provider{}, noCredentials))
-		return errors.New("missing/invalid credentials")
+		return errors.New(noCredentials)
 	}
-	vm.Providers.Register(providerInstance)
 	return nil
 }
 
@@ -164,10 +158,10 @@ func NewProvider(options ...Option) (*Provider, error) {
 	return p, nil
 }
 
-func (p *Provider) getEnvironmentAWSCredentials() ([]string, error) {
+func (c *Client) getEnvironmentAWSCredentials() ([]string, error) {
 
 	// If we don't need to assume a role, return an empty slice.
-	if p.AssumeSTSRole == "" || len(p.AccountIDs) == 0 {
+	if c.provider.AssumeSTSRole == "" || len(c.provider.AccountIDs) == 0 {
 		return []string{}, nil
 	}
 
@@ -175,19 +169,19 @@ func (p *Provider) getEnvironmentAWSCredentials() ([]string, error) {
 
 	// In case we need to assume a role, we need to generate and return temporary
 	// credentials.
-	// We lock the provider to avoid concurrent generations.
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	// We lock the client to avoid concurrent generations.
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	// If we never fetched the credentials or they're about to expire, fetch them.
-	if p.mu.credentials == nil || p.mu.credentials.Expiration.Before(timeutil.Now().Add(time.Minute*2)) {
+	if c.mu.credentials == nil || c.mu.credentials.Expiration.Before(timeutil.Now().Add(time.Minute*2)) {
 		cfg, err := awsconfig.LoadDefaultConfig(context.TODO(), awsconfig.WithRegion("us-east-1"))
 		if err != nil {
 			return nil, errors.Wrap(err, "assumeRole: failed to load config")
 		}
 
-		roleArn := fmt.Sprintf("arn:aws:iam::%s:role/%s", p.AccountIDs[0], p.AssumeSTSRole)
-		roleSessionName := fmt.Sprintf("%s-%s", p.AssumeSTSSessionName, p.AccountIDs[0])
+		roleArn := fmt.Sprintf("arn:aws:iam::%s:role/%s", c.provider.AccountIDs[0], c.provider.AssumeSTSRole)
+		roleSessionName := fmt.Sprintf("%s-%s", c.provider.AssumeSTSSessionName, c.provider.AccountIDs[0])
 
 		stsClient := sts.NewFromConfig(cfg)
 		tmpCredentials, err := stsClient.AssumeRole(context.TODO(), &sts.AssumeRoleInput{
@@ -198,13 +192,13 @@ func (p *Provider) getEnvironmentAWSCredentials() ([]string, error) {
 			return nil, errors.Wrapf(err, "failed to assume role %s", roleArn)
 		}
 
-		p.mu.credentials = tmpCredentials.Credentials
+		c.mu.credentials = tmpCredentials.Credentials
 	}
 
 	return []string{
-		fmt.Sprintf("%s=%s", amazon.AWSAccessKeyParam, *p.mu.credentials.AccessKeyId),
-		fmt.Sprintf("%s=%s", amazon.AWSSecretParam, *p.mu.credentials.SecretAccessKey),
-		fmt.Sprintf("%s=%s", amazon.AWSTempTokenParam, *p.mu.credentials.SessionToken),
+		fmt.Sprintf("%s=%s", amazon.AWSAccessKeyParam, *c.mu.credentials.AccessKeyId),
+		fmt.Sprintf("%s=%s", amazon.AWSSecretParam, *c.mu.credentials.SecretAccessKey),
+		fmt.Sprintf("%s=%s", amazon.AWSTempTokenParam, *c.mu.credentials.SessionToken),
 	}, nil
 }
 
@@ -391,9 +385,19 @@ type Provider struct {
 	AssumeSTSRole        string
 	AssumeSTSSessionName string
 
+	// dnsProvider is set during construction via WithDNSProvider and
+	// transferred to the Client on NewClient.
+	dnsProvider vm.DNSProvider
+}
+
+// Client is the initialized AWS provider client. It holds a reference
+// to the registered Provider for flag-bound fields, and owns the
+// runtime state (credentials, DNS provider).
+type Client struct {
+	provider *Provider
+
 	mu struct {
 		syncutil.Mutex
-
 		// credentials are the AWS credentials.
 		credentials *awsststypes.Credentials
 	}
@@ -410,7 +414,7 @@ func (p *Provider) IsCentralizedProvider() bool {
 	return true
 }
 
-func (p *Provider) GetPreemptedSpotVMs(
+func (c *Client) GetPreemptedSpotVMs(
 	l *logger.Logger, vms vm.List, since time.Time,
 ) ([]vm.PreemptedVM, error) {
 	byRegion, err := regionMap(vms)
@@ -427,7 +431,7 @@ func (p *Provider) GetPreemptedSpotVMs(
 		}
 		args = append(args, vmList.ProviderIDs()...)
 		var describeInstancesResponse DescribeInstancesOutput
-		err = p.runJSONCommand(l, args, &describeInstancesResponse)
+		err = c.runJSONCommand(l, args, &describeInstancesResponse)
 		if err != nil {
 			// if the describe-instances operation fails with the error InvalidInstanceID.NotFound,
 			// we assume that the instance has been preempted and describe-instances operation is attempted one hour after the instance termination
@@ -470,20 +474,18 @@ func getInstanceIDsNotFound(errorMsg string) []string {
 	return nil
 }
 
-func (p *Provider) GetHostErrorVMs(
-	l *logger.Logger, vms vm.List, since time.Time,
-) ([]string, error) {
+func (c *Client) GetHostErrorVMs(l *logger.Logger, vms vm.List, since time.Time) ([]string, error) {
 	return nil, nil
 }
 
-func (p *Provider) GetLiveMigrationVMs(
+func (c *Client) GetLiveMigrationVMs(
 	l *logger.Logger, vms vm.List, since time.Time,
 ) ([]string, error) {
 	return nil, nil
 }
 
 // GetVMSpecs returns a map from VM.Name to a map of VM attributes, provided by AWS
-func (p *Provider) GetVMSpecs(
+func (c *Client) GetVMSpecs(
 	l *logger.Logger, vms vm.List,
 ) (map[string]map[string]interface{}, error) {
 	if vms == nil {
@@ -505,7 +507,7 @@ func (p *Provider) GetVMSpecs(
 		}
 		args = append(args, list.ProviderIDs()...)
 		var describeInstancesResponse DescribeInstancesOutput
-		err := p.runJSONCommand(l, args, &describeInstancesResponse)
+		err := c.runJSONCommand(l, args, &describeInstancesResponse)
 		if err != nil {
 			return nil, errors.Wrapf(err, "error describing instances in region %s: ", region)
 		}
@@ -678,18 +680,18 @@ func (p *Provider) ConfigureProviderFlags(flags *pflag.FlagSet, _ vm.MultiplePro
 
 // CleanSSH is part of vm.Provider.  This implementation is a no-op,
 // since we depend on the user's local identity file.
-func (p *Provider) CleanSSH(l *logger.Logger) error {
+func (c *Client) CleanSSH(l *logger.Logger) error {
 	return nil
 }
 
 // ConfigSSH is part of the vm.Provider interface.
-func (p *Provider) ConfigSSH(l *logger.Logger, zones []string) error {
-	keyName, err := p.sshKeyName(l)
+func (c *Client) ConfigSSH(l *logger.Logger, zones []string) error {
+	keyName, err := c.sshKeyName(l)
 	if err != nil {
 		return err
 	}
 
-	regions, err := p.allRegions(zones)
+	regions, err := c.allRegions(zones)
 	if err != nil {
 		return err
 	}
@@ -703,12 +705,12 @@ func (p *Provider) ConfigSSH(l *logger.Logger, zones []string) error {
 	var g errgroup.Group
 	for _, r := range regions {
 		g.Go(func() error {
-			exists, err := p.sshKeyExists(l, keyName, r)
+			exists, err := c.sshKeyExists(l, keyName, r)
 			if err != nil {
 				return err
 			}
 			if !exists {
-				err = p.sshKeyImport(l, keyName, r)
+				err = c.sshKeyImport(l, keyName, r)
 				if err != nil {
 					return err
 				}
@@ -726,7 +728,7 @@ func (p *Provider) ConfigSSH(l *logger.Logger, zones []string) error {
 }
 
 // editLabels is a helper that adds or removes labels from the given VMs.
-func (p *Provider) editLabels(
+func (c *Client) editLabels(
 	l *logger.Logger, vms vm.List, labels map[string]string, remove bool,
 ) error {
 	args := []string{"ec2"}
@@ -761,7 +763,7 @@ func (p *Provider) editLabels(
 		regionArgs = append(regionArgs, list.ProviderIDs()...)
 
 		g.Go(func() error {
-			_, err := p.runCommand(l, regionArgs)
+			_, err := c.runCommand(l, regionArgs)
 			return err
 		})
 	}
@@ -770,21 +772,21 @@ func (p *Provider) editLabels(
 
 // AddLabels adds (or updates) the given labels to the given VMs.
 // N.B. If a VM contains a label with the same key, its value will be updated.
-func (p *Provider) AddLabels(l *logger.Logger, vms vm.List, labels map[string]string) error {
-	return p.editLabels(l, vms, labels, false)
+func (c *Client) AddLabels(l *logger.Logger, vms vm.List, labels map[string]string) error {
+	return c.editLabels(l, vms, labels, false)
 }
 
 // RemoveLabels removes the given labels from the given VMs.
-func (p *Provider) RemoveLabels(l *logger.Logger, vms vm.List, labels []string) error {
+func (c *Client) RemoveLabels(l *logger.Logger, vms vm.List, labels []string) error {
 	labelMap := make(map[string]string, len(labels))
 	for _, label := range labels {
 		labelMap[label] = ""
 	}
-	return p.editLabels(l, vms, labelMap, true)
+	return c.editLabels(l, vms, labelMap, true)
 }
 
 // Create is part of the vm.Provider interface.
-func (p *Provider) Create(
+func (c *Client) Create(
 	l *logger.Logger, names []string, opts vm.CreateOpts, vmProviderOpts vm.ProviderOpts,
 ) (vm.List, error) {
 	providerOpts := vmProviderOpts.(*ProviderOpts)
@@ -822,11 +824,11 @@ func (p *Provider) Create(
 	}
 
 	// We need to make sure that the SSH keys have been distributed to all regions.
-	if err := p.ConfigSSH(l, expandedZones); err != nil {
+	if err := c.ConfigSSH(l, expandedZones); err != nil {
 		return nil, err
 	}
 
-	regions, err := p.allRegions(expandedZones)
+	regions, err := c.allRegions(expandedZones)
 	if err != nil {
 		return nil, err
 	}
@@ -843,18 +845,18 @@ func (p *Provider) Create(
 
 	// Use managed cluster creation (launch template + ASG) if --aws-managed is specified.
 	if providerOpts.Managed {
-		return p.createManagedCluster(l, names, zones, regions, machineType, opts, providerOpts)
+		return c.createManagedCluster(l, names, zones, regions, machineType, opts, providerOpts)
 	}
 
 	// Create instances using the shared createInstances function.
-	if _, err := p.createInstances(l, names, zones, machineType, opts, providerOpts); err != nil {
+	if _, err := c.createInstances(l, names, zones, machineType, opts, providerOpts); err != nil {
 		return nil, err
 	}
 
 	// Our initial list of VMs does not include the IP addresses or volumes.
 	// waitForIPs() returns the VMs list with all information set, so we simply
 	// overwrite the list with the result of waitForIPs().
-	vmList, err := p.waitForIPs(context.Background(), l, names, regions, providerOpts)
+	vmList, err := c.waitForIPs(context.Background(), l, names, regions, providerOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -871,7 +873,7 @@ func DefaultZones(geoDistributed bool) []string {
 
 // createInstances creates EC2 instances in parallel with rate limiting.
 // It returns a map of region -> instance IDs for the created instances.
-func (p *Provider) createInstances(
+func (c *Client) createInstances(
 	l *logger.Logger,
 	names []string,
 	zones []string,
@@ -891,13 +893,13 @@ func (p *Provider) createInstances(
 		index := i
 		vmName := names[i]
 		zone := zones[i]
-		az := p.Config.getAvailabilityZone(zone)
+		az := c.provider.Config.getAvailabilityZone(zone)
 		region := az.Region.Name
 		res := limiter.Reserve()
 
 		g.Go(func() error {
 			time.Sleep(res.Delay())
-			v, err := p.runInstance(l, vmName, index, zone, machineType, opts, providerOpts)
+			v, err := c.runInstance(l, vmName, index, zone, machineType, opts, providerOpts)
 			if err != nil {
 				return errors.Wrapf(err, "failed to create instance %s", vmName)
 			}
@@ -919,7 +921,7 @@ func (p *Provider) createInstances(
 
 // getIAMProfileForInstance returns the IAM instance profile name attached to the
 // given EC2 instance. Returns an empty string if no profile is attached.
-func (p *Provider) getIAMProfileForInstance(
+func (c *Client) getIAMProfileForInstance(
 	ctx context.Context, l *logger.Logger, region, instanceID string,
 ) (string, error) {
 	args := []string{
@@ -928,7 +930,7 @@ func (p *Provider) getIAMProfileForInstance(
 		"--region", region,
 	}
 	var descOutput DescribeInstancesOutput
-	if err := p.runJSONCommandWithContext(ctx, l, args, &descOutput); err != nil {
+	if err := c.runJSONCommandWithContext(ctx, l, args, &descOutput); err != nil {
 		return "", err
 	}
 	if len(descOutput.Reservations) == 0 || len(descOutput.Reservations[0].Instances) == 0 {
@@ -948,7 +950,7 @@ func (p *Provider) getIAMProfileForInstance(
 
 // waitForInstancesStatus waits for instances to reach the specified target state.
 // It polls AWS until all instances reach the target state or the timeout is reached.
-func (p *Provider) waitForInstancesStatus(
+func (c *Client) waitForInstancesStatus(
 	ctx context.Context, l *logger.Logger, region string, instanceIDs []string, targetState string,
 ) error {
 	if len(instanceIDs) == 0 {
@@ -972,7 +974,7 @@ func (p *Provider) waitForInstancesStatus(
 		descArgs = append(descArgs, "--region", region)
 
 		var descOutput DescribeInstancesOutput
-		if err := p.runJSONCommandWithContext(ctx, l, descArgs, &descOutput); err != nil {
+		if err := c.runJSONCommandWithContext(ctx, l, descArgs, &descOutput); err != nil {
 			// If instances not found, they're already terminated (relevant for termination waits)
 			if strings.Contains(err.Error(), "InvalidInstanceID.NotFound") {
 				if targetState == "terminated" {
@@ -1007,7 +1009,7 @@ func (p *Provider) waitForInstancesStatus(
 // attachInstancesToASG attaches instances to an Auto Scaling Group.
 // The caller is responsible for ensuring the ASG has sufficient max size capacity
 // before calling this function.
-func (p *Provider) attachInstancesToASG(
+func (c *Client) attachInstancesToASG(
 	ctx context.Context, l *logger.Logger, asgName, region string, instanceIDs []string,
 ) error {
 	l.Printf("Attaching %d instances to ASG %s", len(instanceIDs), asgName)
@@ -1019,7 +1021,7 @@ func (p *Provider) attachInstancesToASG(
 	attachArgs = append(attachArgs, instanceIDs...)
 	attachArgs = append(attachArgs, "--region", region)
 
-	if _, err := p.runCommandWithContext(ctx, l, attachArgs); err != nil {
+	if _, err := c.runCommandWithContext(ctx, l, attachArgs); err != nil {
 		return errors.Wrapf(err, "failed to attach instances to ASG")
 	}
 
@@ -1027,7 +1029,7 @@ func (p *Provider) attachInstancesToASG(
 }
 
 // updateASGMaxSize updates the max size of an Auto Scaling Group.
-func (p *Provider) updateASGMaxSize(
+func (c *Client) updateASGMaxSize(
 	ctx context.Context, l *logger.Logger, asgName, region string, maxSize int,
 ) error {
 	l.Printf("Updating ASG %s max size to %d", asgName, maxSize)
@@ -1037,7 +1039,7 @@ func (p *Provider) updateASGMaxSize(
 		"--max-size", strconv.Itoa(maxSize),
 		"--region", region,
 	}
-	if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+	if _, err := c.runCommandWithContext(ctx, l, args); err != nil {
 		return errors.Wrapf(err, "failed to update ASG max size")
 	}
 	return nil
@@ -1061,7 +1063,7 @@ type asgInfo struct {
 
 // describeASG retrieves information about an Auto Scaling Group.
 // Returns nil (not an error) if the ASG doesn't exist.
-func (p *Provider) describeASG(
+func (c *Client) describeASG(
 	ctx context.Context, l *logger.Logger, asgName, region string,
 ) (*asgInfo, error) {
 	args := []string{
@@ -1084,7 +1086,7 @@ func (p *Provider) describeASG(
 		} `json:"AutoScalingGroups"`
 	}
 
-	if err := p.runJSONCommandWithContext(ctx, l, args, &output); err != nil {
+	if err := c.runJSONCommandWithContext(ctx, l, args, &output); err != nil {
 		return nil, errors.Wrapf(err, "failed to describe ASG %s", asgName)
 	}
 
@@ -1120,7 +1122,7 @@ func (p *Provider) describeASG(
 // 2. Create the ASG with desiredCapacity=0 (management structure only)
 // 3. Create instances using runInstance() with proper names
 // 4. Attach instances to the ASG
-func (p *Provider) createManagedCluster(
+func (c *Client) createManagedCluster(
 	l *logger.Logger,
 	names []string,
 	zones []string,
@@ -1142,7 +1144,7 @@ func (p *Provider) createManagedCluster(
 	zonesByRegion := make(map[string][]string)
 	zoneForName := make(map[string]string)
 	for i, zone := range zones {
-		az := p.Config.getAvailabilityZone(zone)
+		az := c.provider.Config.getAvailabilityZone(zone)
 		if az == nil {
 			return nil, errors.Errorf("unknown availability zone %s", zone)
 		}
@@ -1158,21 +1160,21 @@ func (p *Provider) createManagedCluster(
 	for region, regionZones := range zonesByRegion {
 		// Use the first zone for instance configuration (AMI lookup, etc.)
 		zone := regionZones[0]
-		cfg, az, err := p.getInstanceConfig(l, zone, machineType, opts, providerOpts)
+		cfg, az, err := c.getInstanceConfig(l, zone, machineType, opts, providerOpts)
 		if err != nil {
 			return nil, err
 		}
 
 		g.GoCtx(func(ctx context.Context) error {
 			// Create launch template
-			ltID, err := p.createLaunchTemplate(ctx, l, clusterName, region, cfg, az, opts, providerOpts)
+			ltID, err := c.createLaunchTemplate(ctx, l, clusterName, region, cfg, az, opts, providerOpts)
 			if err != nil {
 				return errors.Wrapf(err, "failed to create launch template in region %s", region)
 			}
 
 			// Create ASG with desiredCapacity=0 (we'll create and attach instances separately).
 			// Set maxSize upfront to allow room for the instances we'll attach plus future growth.
-			if err := p.createAutoScalingGroup(ctx, l, clusterName, region, ltID, regionZones, 0, len(names)*2, opts); err != nil {
+			if err := c.createAutoScalingGroup(ctx, l, clusterName, region, ltID, regionZones, 0, len(names)*2, opts); err != nil {
 				return errors.Wrapf(err, "failed to create auto scaling group in region %s", region)
 			}
 
@@ -1190,7 +1192,7 @@ func (p *Provider) createManagedCluster(
 		opts.CustomLabels = make(map[string]string)
 	}
 	opts.CustomLabels[vm.TagManaged] = "true"
-	instanceIDsByRegion, err := p.createInstances(l, names, zones, machineType, opts, providerOpts)
+	instanceIDsByRegion, err := c.createInstances(l, names, zones, machineType, opts, providerOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -1198,7 +1200,7 @@ func (p *Provider) createManagedCluster(
 	// Step 3: Wait for instances to be running before attaching to ASG.
 	l.Printf("Waiting for instances to be running...")
 	for region, instanceIDs := range instanceIDsByRegion {
-		if err := p.waitForInstancesStatus(ctx, l, region, instanceIDs, "running"); err != nil {
+		if err := c.waitForInstancesStatus(ctx, l, region, instanceIDs, "running"); err != nil {
 			return nil, err
 		}
 	}
@@ -1209,7 +1211,7 @@ func (p *Provider) createManagedCluster(
 	for region, instanceIDs := range instanceIDsByRegion {
 		asgName := autoScalingGroupName(clusterName, region)
 		g.GoCtx(func(ctx context.Context) error {
-			return p.attachInstancesToASG(ctx, l, asgName, region, instanceIDs)
+			return c.attachInstancesToASG(ctx, l, asgName, region, instanceIDs)
 		})
 	}
 
@@ -1218,13 +1220,13 @@ func (p *Provider) createManagedCluster(
 	}
 
 	// Wait for IPs and return the VM list.
-	return p.waitForIPs(ctx, l, names, regions, providerOpts)
+	return c.waitForIPs(ctx, l, names, regions, providerOpts)
 }
 
 // Grow adds new VMs to a managed cluster.
 // For AWS, we create new EC2 instances using the launch template and attach them to the ASG.
 // This preserves roachprod's naming conventions while keeping the instances managed by the ASG.
-func (p *Provider) Grow(
+func (c *Client) Grow(
 	l *logger.Logger, vms vm.List, clusterName string, names []string,
 ) (vm.List, error) {
 	if !isManaged(vms) {
@@ -1237,14 +1239,14 @@ func (p *Provider) Grow(
 	ctx := context.Background()
 
 	// For simplicity, add new VMs to the first region.
-	region, existingVMs, err := p.getFirstRegion(vms)
+	region, existingVMs, err := c.getFirstRegion(vms)
 	if err != nil {
 		return nil, err
 	}
 
 	// Validate ASG exists and expand capacity if needed.
 	asgName := autoScalingGroupName(clusterName, region)
-	asg, err := p.describeASG(ctx, l, asgName, region)
+	asg, err := c.describeASG(ctx, l, asgName, region)
 	if err != nil {
 		return nil, err
 	}
@@ -1252,14 +1254,14 @@ func (p *Provider) Grow(
 		return nil, errors.Errorf("ASG %s not found", asgName)
 	}
 	if newCapacity := asg.DesiredCapacity + len(names); newCapacity > asg.MaxSize {
-		if err := p.updateASGMaxSize(ctx, l, asgName, region, newCapacity*2); err != nil {
+		if err := c.updateASGMaxSize(ctx, l, asgName, region, newCapacity*2); err != nil {
 			return nil, err
 		}
 	}
 
 	// Configure SSH and extract config from existing VMs.
 	zone := existingVMs[0].Zone
-	if err := p.ConfigSSH(l, []string{zone}); err != nil {
+	if err := c.ConfigSSH(l, []string{zone}); err != nil {
 		return nil, errors.Wrap(err, "failed to configure SSH keys")
 	}
 	machineType := existingVMs[0].MachineType
@@ -1267,34 +1269,34 @@ func (p *Provider) Grow(
 
 	// Inherit the IAM profile from the existing instances so that new nodes
 	// have the same permissions (e.g., S3 access, CloudWatch, etc.).
-	if iamProfile, err := p.getIAMProfileForInstance(ctx, l, region, existingVMs[0].ProviderID); err != nil {
+	if iamProfile, err := c.getIAMProfileForInstance(ctx, l, region, existingVMs[0].ProviderID); err != nil {
 		l.Printf("Warning: failed to get IAM profile from existing instance: %v", err)
 	} else if iamProfile != "" {
 		providerOpts.IAMProfile = iamProfile
 	}
 
-	opts := p.buildCreateOptsFromVM(clusterName, existingVMs[0])
+	opts := c.buildCreateOptsFromVM(clusterName, existingVMs[0])
 
 	// Create instances in parallel.
-	instanceIDs, err := p.createInstancesInParallel(ctx, l, names, zone, machineType, opts, providerOpts)
+	instanceIDs, err := c.createInstancesInParallel(ctx, l, names, zone, machineType, opts, providerOpts)
 	if err != nil {
 		return nil, err
 	}
 
 	// Wait for instances to be running, then attach to ASG.
-	if err := p.waitForInstancesStatus(ctx, l, region, instanceIDs, "running"); err != nil {
+	if err := c.waitForInstancesStatus(ctx, l, region, instanceIDs, "running"); err != nil {
 		return nil, err
 	}
-	if err := p.attachInstancesToASG(ctx, l, asgName, region, instanceIDs); err != nil {
+	if err := c.attachInstancesToASG(ctx, l, asgName, region, instanceIDs); err != nil {
 		return nil, err
 	}
 
 	// Wait for IPs and copy labels from existing VMs.
-	newVMs, err := p.waitForIPs(ctx, l, names, []string{region}, providerOpts)
+	newVMs, err := c.waitForIPs(ctx, l, names, []string{region}, providerOpts)
 	if err != nil {
 		return nil, err
 	}
-	if err := p.copyLabelsToNewVMs(l, existingVMs[0], newVMs); err != nil {
+	if err := c.copyLabelsToNewVMs(l, existingVMs[0], newVMs); err != nil {
 		l.Printf("Warning: failed to add labels to new VMs: %v", err)
 	}
 
@@ -1304,7 +1306,7 @@ func (p *Provider) Grow(
 
 // getFirstRegion returns the first region and its VMs from the given VM list.
 // This is used when we need to pick a single region for an operation.
-func (p *Provider) getFirstRegion(vms vm.List) (string, vm.List, error) {
+func (c *Client) getFirstRegion(vms vm.List) (string, vm.List, error) {
 	byRegion, err := regionMap(vms)
 	if err != nil {
 		return "", nil, err
@@ -1316,7 +1318,7 @@ func (p *Provider) getFirstRegion(vms vm.List) (string, vm.List, error) {
 }
 
 // buildCreateOptsFromVM builds CreateOpts by extracting configuration from an existing VM.
-func (p *Provider) buildCreateOptsFromVM(clusterName string, existingVM vm.VM) vm.CreateOpts {
+func (c *Client) buildCreateOptsFromVM(clusterName string, existingVM vm.VM) vm.CreateOpts {
 	opts := vm.DefaultCreateOpts()
 	opts.ClusterName = clusterName
 	if lifetimeStr, ok := existingVM.Labels[vm.TagLifetime]; ok {
@@ -1328,7 +1330,7 @@ func (p *Provider) buildCreateOptsFromVM(clusterName string, existingVM vm.VM) v
 }
 
 // createInstancesInParallel creates EC2 instances in parallel and returns their IDs.
-func (p *Provider) createInstancesInParallel(
+func (c *Client) createInstancesInParallel(
 	ctx context.Context,
 	l *logger.Logger,
 	names []string,
@@ -1347,7 +1349,7 @@ func (p *Provider) createInstancesInParallel(
 		res := limiter.Reserve()
 		g.GoCtx(func(ctx context.Context) error {
 			time.Sleep(res.Delay())
-			v, err := p.runInstance(l, name, index, zone, machineType, opts, providerOpts)
+			v, err := c.runInstance(l, name, index, zone, machineType, opts, providerOpts)
 			if err != nil {
 				return errors.Wrapf(err, "failed to create instance %s", name)
 			}
@@ -1366,7 +1368,7 @@ func (p *Provider) createInstancesInParallel(
 
 // copyLabelsToNewVMs copies labels from a source VM to new VMs.
 // It skips instance-specific labels like Name and AWS-reserved tags.
-func (p *Provider) copyLabelsToNewVMs(l *logger.Logger, sourceVM vm.VM, newVMs vm.List) error {
+func (c *Client) copyLabelsToNewVMs(l *logger.Logger, sourceVM vm.VM, newVMs vm.List) error {
 	labels := map[string]string{vm.TagManaged: "true"}
 	for key, value := range sourceVM.Labels {
 		// Skip instance-specific and AWS-reserved labels.
@@ -1375,7 +1377,7 @@ func (p *Provider) copyLabelsToNewVMs(l *logger.Logger, sourceVM vm.VM, newVMs v
 		}
 		labels[key] = value
 	}
-	if err := p.AddLabels(l, newVMs, labels); err != nil {
+	if err := c.AddLabels(l, newVMs, labels); err != nil {
 		return err
 	}
 
@@ -1395,7 +1397,7 @@ func (p *Provider) copyLabelsToNewVMs(l *logger.Logger, sourceVM vm.VM, newVMs v
 // Shrink removes VMs from a managed cluster.
 // For AWS, we use terminate-instance-in-auto-scaling-group to remove specific instances.
 // This decrements the ASG's desired capacity and terminates the specified instances.
-func (p *Provider) Shrink(l *logger.Logger, vmsToDelete vm.List, clusterName string) error {
+func (c *Client) Shrink(l *logger.Logger, vmsToDelete vm.List, clusterName string) error {
 	if !isManaged(vmsToDelete) {
 		return errors.New("shrinking is only supported for managed clusters (created with --aws-managed)")
 	}
@@ -1432,7 +1434,7 @@ func (p *Provider) Shrink(l *logger.Logger, vmsToDelete vm.List, clusterName str
 					"--region", region,
 				}
 
-				if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+				if _, err := c.runCommandWithContext(ctx, l, args); err != nil {
 					return errors.Wrapf(err, "failed to terminate instance %s", instanceID)
 				}
 
@@ -1447,7 +1449,7 @@ func (p *Provider) Shrink(l *logger.Logger, vmsToDelete vm.List, clusterName str
 
 	// Wait for instances to be fully terminated in each region.
 	for region, regionVMs := range byRegion {
-		if err := p.waitForInstancesStatus(ctx, l, region, regionVMs.ProviderIDs(), "terminated"); err != nil {
+		if err := c.waitForInstancesStatus(ctx, l, region, regionVMs.ProviderIDs(), "terminated"); err != nil {
 			return err
 		}
 	}
@@ -1461,7 +1463,7 @@ func (p *Provider) Shrink(l *logger.Logger, vmsToDelete vm.List, clusterName str
 // list the new VMs after the creation might find VMs without an external IP.
 // We do a bad job at higher layers detecting this lack of IP which can lead to
 // commands hanging indefinitely.
-func (p *Provider) waitForIPs(
+func (c *Client) waitForIPs(
 	ctx context.Context, l *logger.Logger, names []string, regions []string, opts *ProviderOpts,
 ) ([]vm.VM, error) {
 	waitForIPRetry := retry.Start(retry.Options{
@@ -1474,7 +1476,7 @@ func (p *Provider) waitForIPs(
 		// We also include volumes in the list because they were not included
 		// in the initial list of VMs as they're only returned by run-instances
 		// when ready.
-		vms, err := p.listRegionsFiltered(ctx, l, regions, names, *opts, vm.ListOptions{
+		vms, err := c.listRegionsFiltered(ctx, l, regions, names, *opts, vm.ListOptions{
 			IncludeVolumes: true,
 		})
 		if err != nil {
@@ -1496,13 +1498,13 @@ func (p *Provider) waitForIPs(
 // Delete is part of vm.Provider.
 // This will delete all instances in a single AWS command.
 // For managed clusters, it also deletes the ASG and launch template.
-func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
+func (c *Client) Delete(l *logger.Logger, vms vm.List) error {
 	if len(vms) == 0 {
 		return nil
 	}
 
 	// Clean up any load balancers that may exist.
-	if err := p.DeleteLoadBalancer(l, vms, 0); err != nil {
+	if err := c.DeleteLoadBalancer(l, vms, 0); err != nil {
 		l.Printf("Warning: failed to delete load balancers: %v", err)
 	}
 
@@ -1511,7 +1513,7 @@ func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
 	// orphaned launch templates/ASGs), this is the only cleanup needed since
 	// there are no real instances to terminate.
 	if isManaged(vms) {
-		return p.deleteManagedCluster(l, vms)
+		return c.deleteManagedCluster(l, vms)
 	}
 
 	// Empty cluster placeholders with no managed resources have nothing
@@ -1542,14 +1544,14 @@ func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
 			if len(data.TerminatingInstances) > 0 {
 				_ = data.TerminatingInstances[0].InstanceID // silence unused warning
 			}
-			return p.runJSONCommand(l, args, &data)
+			return c.runJSONCommand(l, args, &data)
 		})
 	}
 	return g.Wait()
 }
 
 // deleteManagedCluster deletes a managed cluster's ASG, launch template, and instances.
-func (p *Provider) deleteManagedCluster(l *logger.Logger, vms vm.List) error {
+func (c *Client) deleteManagedCluster(l *logger.Logger, vms vm.List) error {
 	clusterName, err := vms[0].ClusterName()
 	if err != nil {
 		return err
@@ -1566,12 +1568,12 @@ func (p *Provider) deleteManagedCluster(l *logger.Logger, vms vm.List) error {
 	for region := range byRegion {
 		g.GoCtx(func(ctx context.Context) error {
 			// Delete the ASG first (this terminates instances)
-			if err := p.deleteAutoScalingGroup(ctx, l, clusterName, region); err != nil {
+			if err := c.deleteAutoScalingGroup(ctx, l, clusterName, region); err != nil {
 				l.Printf("Warning: failed to delete ASG: %v", err)
 			}
 
 			// Delete the launch template
-			if err := p.deleteLaunchTemplate(ctx, l, clusterName, region); err != nil {
+			if err := c.deleteLaunchTemplate(ctx, l, clusterName, region); err != nil {
 				l.Printf("Warning: failed to delete launch template: %v", err)
 			}
 
@@ -1583,7 +1585,7 @@ func (p *Provider) deleteManagedCluster(l *logger.Logger, vms vm.List) error {
 }
 
 // Reset is part of vm.Provider.
-func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
+func (c *Client) Reset(l *logger.Logger, vms vm.List) error {
 	byRegion, err := regionMap(vms)
 	if err != nil {
 		return err
@@ -1597,7 +1599,7 @@ func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
 		}
 		args = append(args, list.ProviderIDs()...)
 		g.Go(func() error {
-			_, e := p.runCommand(l, args)
+			_, e := c.runCommand(l, args)
 			return e
 		})
 	}
@@ -1606,8 +1608,8 @@ func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
 
 // Extend is part of the vm.Provider interface.
 // This will update the Lifetime tag on the instances.
-func (p *Provider) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
-	return p.AddLabels(l, vms, map[string]string{
+func (c *Client) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
+	return c.AddLabels(l, vms, map[string]string{
 		vm.TagLifetime: lifetime.String(),
 	})
 }
@@ -1617,24 +1619,24 @@ var cachedActiveAccount string
 
 // FindActiveAccount is part of the vm.Provider interface.
 // This queries the AWS command for the current IAM user or role.
-func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
+func (c *Client) FindActiveAccount(l *logger.Logger) (string, error) {
 	if len(cachedActiveAccount) > 0 {
 		return cachedActiveAccount, nil
 	}
 	var account string
 	var err error
-	if p.Profile == "" {
-		account, err = p.iamGetUser(l)
+	if c.provider.Profile == "" {
+		account, err = c.iamGetUser(l)
 		if err != nil {
 			// iamGetUser fails with role-based credentials;
 			// fall back to stsGetCallerIdentity.
-			account, err = p.stsGetCallerIdentity(l)
+			account, err = c.stsGetCallerIdentity(l)
 		}
 		if err != nil {
 			return "", err
 		}
 	} else {
-		account, err = p.stsGetCallerIdentity(l)
+		account, err = c.stsGetCallerIdentity(l)
 		if err != nil {
 			return "", err
 		}
@@ -1644,14 +1646,14 @@ func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
 }
 
 // iamGetUser returns the identity of an IAM user.
-func (p *Provider) iamGetUser(l *logger.Logger) (string, error) {
+func (c *Client) iamGetUser(l *logger.Logger) (string, error) {
 	var userInfo struct {
 		User struct {
 			UserName string
 		}
 	}
 	args := []string{"iam", "get-user"}
-	err := p.runJSONCommand(l, args, &userInfo)
+	err := c.runJSONCommand(l, args, &userInfo)
 	if err != nil {
 		return "", err
 	}
@@ -1663,12 +1665,12 @@ func (p *Provider) iamGetUser(l *logger.Logger) (string, error) {
 
 // stsGetCallerIdentity returns the identity of a user assuming a role
 // into the account.
-func (p *Provider) stsGetCallerIdentity(l *logger.Logger) (string, error) {
+func (c *Client) stsGetCallerIdentity(l *logger.Logger) (string, error) {
 	var userInfo struct {
 		Arn string
 	}
 	args := []string{"sts", "get-caller-identity"}
-	err := p.runJSONCommand(l, args, &userInfo)
+	err := c.runJSONCommand(l, args, &userInfo)
 	if err != nil {
 		return "", err
 	}
@@ -1680,32 +1682,30 @@ func (p *Provider) stsGetCallerIdentity(l *logger.Logger) (string, error) {
 }
 
 // List is part of the vm.Provider interface.
-func (p *Provider) List(
-	ctx context.Context, l *logger.Logger, opts vm.ListOptions,
-) (vm.List, error) {
-	regions, err := p.allRegions(p.Config.availabilityZoneNames())
+func (c *Client) List(ctx context.Context, l *logger.Logger, opts vm.ListOptions) (vm.List, error) {
+	regions, err := c.allRegions(c.provider.Config.availabilityZoneNames())
 	if err != nil {
 		return nil, err
 	}
-	defaultOpts := p.CreateProviderOpts().(*ProviderOpts)
-	return p.listRegions(ctx, l, regions, *defaultOpts, opts)
+	defaultOpts := c.provider.CreateProviderOpts().(*ProviderOpts)
+	return c.listRegions(ctx, l, regions, *defaultOpts, opts)
 }
 
 // listRegions lists VMs in the regions passed.
 // It ignores region-specific errors.
-func (p *Provider) listRegions(
+func (c *Client) listRegions(
 	ctx context.Context,
 	l *logger.Logger,
 	regions []string,
 	opts ProviderOpts,
 	listOpts vm.ListOptions,
 ) (vm.List, error) {
-	return p.listRegionsFiltered(ctx, l, regions, nil, opts, listOpts)
+	return c.listRegionsFiltered(ctx, l, regions, nil, opts, listOpts)
 }
 
 // listRegionsFiltered lists VMs in the regions with a filter on instance names.
 // The filter makes it more efficient to list specific VMs than listRegions.
-func (p *Provider) listRegionsFiltered(
+func (c *Client) listRegionsFiltered(
 	ctx context.Context,
 	l *logger.Logger,
 	regions, names []string,
@@ -1724,7 +1724,7 @@ func (p *Provider) listRegionsFiltered(
 
 	for _, r := range regions {
 		g.GoCtx(func(ctx context.Context) error {
-			vms, err := p.describeInstances(ctx, l, r, opts, listOpts, namesFilter)
+			vms, err := c.describeInstances(ctx, l, r, opts, listOpts, namesFilter)
 			if err != nil {
 				l.Printf("Failed to list AWS VMs in region: %s\n%v\n", r, err)
 				return nil
@@ -1754,7 +1754,7 @@ func (p *Provider) listRegionsFiltered(
 		}
 
 		for _, r := range regions {
-			clusterNames, err := p.listManagedLaunchTemplates(l, r)
+			clusterNames, err := c.listManagedLaunchTemplates(l, r)
 			if err != nil {
 				l.Printf("Failed to list managed launch templates in region %s: %v", r, err)
 				continue
@@ -1791,10 +1791,10 @@ func (p *Provider) Name() string {
 
 // allRegions returns the regions that have been configured with
 // AMI and SecurityGroup instances.
-func (p *Provider) allRegions(zones []string) (regions []string, err error) {
+func (c *Client) allRegions(zones []string) (regions []string, err error) {
 	byName := make(map[string]struct{})
 	for _, z := range zones {
-		az := p.Config.getAvailabilityZone(z)
+		az := c.provider.Config.getAvailabilityZone(z)
 		if az == nil {
 			return nil, fmt.Errorf("unknown availability zone %v, please provide a "+
 				"correct value or update your config accordingly", z)
@@ -1807,7 +1807,7 @@ func (p *Provider) allRegions(zones []string) (regions []string, err error) {
 	return regions, nil
 }
 
-func (p *Provider) getVolumesForInstances(
+func (c *Client) getVolumesForInstances(
 	ctx context.Context, l *logger.Logger, region string, instanceIDs []string,
 ) (vols map[string]map[string]vm.Volume, err error) {
 	type describeVolume struct {
@@ -1844,7 +1844,7 @@ func (p *Provider) getVolumesForInstances(
 		"Name=attachment.instance-id,Values=" + strings.Join(instanceIDs, ","),
 	}
 
-	err = p.runJSONCommandWithContext(ctx, l, getVolumesArgs, &volumeOut)
+	err = c.runJSONCommandWithContext(ctx, l, getVolumesArgs, &volumeOut)
 	if err != nil {
 		return vols, err
 	}
@@ -2027,7 +2027,7 @@ type RunInstancesOutput struct {
 
 // describeInstances executes the ec2 describe-instances command
 // with the given filters.
-func (p *Provider) describeInstances(
+func (c *Client) describeInstances(
 	ctx context.Context,
 	l *logger.Logger,
 	region string,
@@ -2044,7 +2044,7 @@ func (p *Provider) describeInstances(
 		args = append(args, "--filters", filters)
 	}
 	var describeInstancesResponse DescribeInstancesOutput
-	err := p.runJSONCommandWithContext(ctx, l, args, &describeInstancesResponse)
+	err := c.runJSONCommandWithContext(ctx, l, args, &describeInstancesResponse)
 	if err != nil {
 		return nil, err
 	}
@@ -2075,7 +2075,7 @@ func (p *Provider) describeInstances(
 	// Fetch volume info for all instances at once
 	var volumes map[string]map[string]vm.Volume
 	if listOpt.IncludeVolumes && len(instances) > 0 {
-		volumes, err = p.getVolumesForInstances(ctx, l, region, maps.Keys(instances))
+		volumes, err = c.getVolumesForInstances(ctx, l, region, maps.Keys(instances))
 		if err != nil {
 			return nil, err
 		}
@@ -2083,7 +2083,7 @@ func (p *Provider) describeInstances(
 
 	var ret vm.List
 	for _, in := range instances {
-		v := in.toVM(volumes[in.InstanceID], opts.RemoteUserName, p.dnsProvider)
+		v := in.toVM(volumes[in.InstanceID], opts.RemoteUserName, c.dnsProvider)
 		ret = append(ret, *v)
 	}
 
@@ -2094,7 +2094,7 @@ func (p *Provider) describeInstances(
 // Given that every AWS region may as well be a parallel dimension,
 // we need to do a bit of work to look up all of the various ids that
 // we need in order to actually allocate an instance.
-func (p *Provider) runInstance(
+func (c *Client) runInstance(
 	l *logger.Logger,
 	name string,
 	instanceIdx int,
@@ -2103,7 +2103,7 @@ func (p *Provider) runInstance(
 	opts vm.CreateOpts,
 	providerOpts *ProviderOpts,
 ) (*vm.VM, error) {
-	cfg, az, err := p.getInstanceConfig(l, zone, machineType, opts, providerOpts)
+	cfg, az, err := c.getInstanceConfig(l, zone, machineType, opts, providerOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -2206,11 +2206,11 @@ func (p *Provider) runInstance(
 
 	if providerOpts.UseSpot {
 		//todo(babusrithar): Add fallback to on-demand instances if spot instances are not available.
-		return runSpotInstance(l, p, args, az.Region.Name, providerOpts)
+		return runSpotInstance(l, c, args, az.Region.Name, providerOpts)
 	}
 
 	runInstancesOutput := RunInstancesOutput{}
-	err = p.runJSONCommand(l, args, &runInstancesOutput)
+	err = c.runJSONCommand(l, args, &runInstancesOutput)
 	if err != nil {
 		return nil, err
 	}
@@ -2222,7 +2222,7 @@ func (p *Provider) runInstance(
 	// Volumes are attached to the instance only after the instance is running.
 	// We will fill in the volume information during the waitForIPs call.
 	v := runInstancesOutput.Instances[0].toVM(
-		map[string]vm.Volume{}, providerOpts.RemoteUserName, p.dnsProvider,
+		map[string]vm.Volume{}, providerOpts.RemoteUserName, c.dnsProvider,
 	)
 	return v, err
 }
@@ -2238,7 +2238,7 @@ func isArmMachineType(machineType string) bool {
 // It returns an error if the spot request is not fulfilled within 2 minutes.
 // It uses describe-spot-instance-requests command to get the status of the spot request.
 func runSpotInstance(
-	l *logger.Logger, p *Provider, args []string, regionName string, providerOpts *ProviderOpts,
+	l *logger.Logger, c *Client, args []string, regionName string, providerOpts *ProviderOpts,
 ) (*vm.VM, error) {
 	waitForSpotDuration := 2 * time.Minute
 
@@ -2247,7 +2247,7 @@ func runSpotInstance(
 		fmt.Sprintf("MarketType=spot,SpotOptions={SpotInstanceType=one-time,"+
 			"InstanceInterruptionBehavior=terminate}"))
 	runInstancesOutput := RunInstancesOutput{}
-	err := p.runJSONCommand(l, spotArgs, &runInstancesOutput)
+	err := c.runJSONCommand(l, spotArgs, &runInstancesOutput)
 	if err != nil {
 		return nil, err
 	}
@@ -2256,10 +2256,10 @@ func runSpotInstance(
 		return nil, errors.Errorf("No instances found for spot request, likely the spot request had bad parameter")
 	}
 
-	v := runInstancesOutput.Instances[0].toVM(map[string]vm.Volume{}, providerOpts.RemoteUserName, p.dnsProvider)
+	v := runInstancesOutput.Instances[0].toVM(map[string]vm.Volume{}, providerOpts.RemoteUserName, c.dnsProvider)
 
 	instanceId := runInstancesOutput.Instances[0].InstanceID
-	spotInstanceRequestId, err := getSpotInstanceRequestId(l, p, regionName, instanceId)
+	spotInstanceRequestId, err := getSpotInstanceRequestId(l, c, regionName, instanceId)
 	if err != nil {
 		return nil, err
 	}
@@ -2268,7 +2268,7 @@ func runSpotInstance(
 	startTime := timeutil.Now()
 	duration := waitForSpotDuration
 	for {
-		describeSpotInstanceRequestsOutput, err := describeSpotInstanceRequest(l, p, regionName, spotInstanceRequestId)
+		describeSpotInstanceRequestsOutput, err := describeSpotInstanceRequest(l, c, regionName, spotInstanceRequestId)
 		if err != nil {
 			return nil, err
 		}
@@ -2283,7 +2283,7 @@ func runSpotInstance(
 		// One way to manually test is tested by commenting out return nil above and check cancellation after 2 minutes.
 		if timeutil.Since(startTime) >= duration {
 			l.Printf("waitForSpotDuration passed, cancel the spot instance request and exit loop")
-			err := cancelSpotRequest(l, p, regionName, spotInstanceRequestId)
+			err := cancelSpotRequest(l, c, regionName, spotInstanceRequestId)
 			if err != nil {
 				return nil, err
 			}
@@ -2295,7 +2295,7 @@ func runSpotInstance(
 }
 
 func cancelSpotRequest(
-	l *logger.Logger, p *Provider, regionName string, spotInstanceRequestId string,
+	l *logger.Logger, c *Client, regionName string, spotInstanceRequestId string,
 ) error {
 	// Cancel the spot instance request.
 	csrArgs := []string{
@@ -2303,7 +2303,7 @@ func cancelSpotRequest(
 		"--region", regionName,
 		"--spot-instance-request-ids", spotInstanceRequestId,
 	}
-	err := p.runJSONCommand(l, csrArgs, &CancelSpotInstanceRequestsOutput{})
+	err := c.runJSONCommand(l, csrArgs, &CancelSpotInstanceRequestsOutput{})
 	if err != nil {
 		// This code path is not expected to be hit, but if it does, we should return the error, so that roachprod
 		// can destroy the cluster being created.
@@ -2313,7 +2313,7 @@ func cancelSpotRequest(
 }
 
 func describeSpotInstanceRequest(
-	l *logger.Logger, p *Provider, regionName string, spotInstanceRequestId string,
+	l *logger.Logger, c *Client, regionName string, spotInstanceRequestId string,
 ) (DescribeSpotInstanceRequestsOutput, error) {
 	// Use describe-spot-instance-requests to get the status of the spot request.
 	dsirArgs := []string{
@@ -2322,7 +2322,7 @@ func describeSpotInstanceRequest(
 		"--spot-instance-request-ids", spotInstanceRequestId,
 	}
 	var describeSpotInstanceRequestsOutput DescribeSpotInstanceRequestsOutput
-	err := p.runJSONCommand(l, dsirArgs, &describeSpotInstanceRequestsOutput)
+	err := c.runJSONCommand(l, dsirArgs, &describeSpotInstanceRequestsOutput)
 	if err != nil {
 		return DescribeSpotInstanceRequestsOutput{}, err
 	}
@@ -2356,7 +2356,7 @@ func processSpotInstanceRequestStatus(
 }
 
 func getSpotInstanceRequestId(
-	l *logger.Logger, p *Provider, regionName string, instanceId string,
+	l *logger.Logger, c *Client, regionName string, instanceId string,
 ) (string, error) {
 	diArgs := []string{
 		"ec2", "describe-instances",
@@ -2364,7 +2364,7 @@ func getSpotInstanceRequestId(
 		"--instance-ids", instanceId,
 	}
 	var describeInstancesResponse DescribeInstancesOutput
-	err := p.runJSONCommand(l, diArgs, &describeInstancesResponse)
+	err := c.runJSONCommand(l, diArgs, &describeInstancesResponse)
 	if err != nil {
 		return "", err
 	}
@@ -2493,11 +2493,6 @@ func assignEBSVolumes(opts *vm.CreateOpts, providerOpts *ProviderOpts) ebsVolume
 	return ebsVolumes
 }
 
-// Active is part of the vm.Provider interface.
-func (p *Provider) Active() bool {
-	return true
-}
-
 // ProjectActive is part of the vm.Provider interface.
 func (p *Provider) ProjectActive(project string) bool {
 	return project == ""
@@ -2511,7 +2506,7 @@ type attachJsonResponse struct {
 	Device     string `json:"Device"`
 }
 
-func (p *Provider) AttachVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) (string, error) {
+func (c *Client) AttachVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) (string, error) {
 	// TODO(leon): what happens if this device already exists?
 	deviceName := "/dev/sdf"
 	args := []string{
@@ -2524,7 +2519,7 @@ func (p *Provider) AttachVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) (
 	}
 
 	var commandResponse attachJsonResponse
-	err := p.runJSONCommand(l, args, &commandResponse)
+	err := c.runJSONCommand(l, args, &commandResponse)
 	if err != nil {
 		return "", err
 	}
@@ -2541,7 +2536,7 @@ func (p *Provider) AttachVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) (
 		"--block-device-mappings",
 		"DeviceName=" + deviceName + ",Ebs={DeleteOnTermination=true,VolumeId=" + volume.ProviderResourceID + "}",
 	}
-	_, err = p.runCommand(l, args)
+	_, err = c.runCommand(l, args)
 	if err != nil {
 		return "", err
 	}
@@ -2562,7 +2557,7 @@ type createVolume struct {
 	Size             int       `json:"Size"`
 }
 
-func (p *Provider) CreateVolume(
+func (c *Client) CreateVolume(
 	l *logger.Logger, vco vm.VolumeCreateOpts,
 ) (vol vm.Volume, err error) {
 	// TODO(leon): SourceSnapshotID and IOPS, are not handled
@@ -2613,7 +2608,7 @@ func (p *Provider) CreateVolume(
 	}
 	args = append(args, "--size", strconv.Itoa(vco.Size))
 	var volumeDetails createVolume
-	err = p.runJSONCommand(l, args, &volumeDetails)
+	err = c.runJSONCommand(l, args, &volumeDetails)
 	if err != nil {
 		return vol, err
 	}
@@ -2636,7 +2631,7 @@ func (p *Provider) CreateVolume(
 		"--query", "Volumes[*].State",
 	}
 	for waitForVolume.Next() {
-		err = p.runJSONCommand(l, args, &state)
+		err = c.runJSONCommand(l, args, &state)
 		if len(state) > 0 && state[0] == "available" {
 			close(waitForVolumeCloser)
 		}
@@ -2658,11 +2653,11 @@ func (p *Provider) CreateVolume(
 	return vol, err
 }
 
-func (p *Provider) DeleteVolume(l *logger.Logger, volume vm.Volume, _ *vm.VM) error {
+func (c *Client) DeleteVolume(l *logger.Logger, volume vm.Volume, _ *vm.VM) error {
 	return vm.UnimplementedError
 }
 
-func (p *Provider) ListVolumes(l *logger.Logger, vm *vm.VM) ([]vm.Volume, error) {
+func (c *Client) ListVolumes(l *logger.Logger, vm *vm.VM) ([]vm.Volume, error) {
 	return vm.NonBootAttachedVolumes, nil
 }
 
@@ -2682,7 +2677,7 @@ type snapshotOutput struct {
 	SnapshotID string    `json:"SnapshotId"`
 }
 
-func (p *Provider) CreateVolumeSnapshot(
+func (c *Client) CreateVolumeSnapshot(
 	l *logger.Logger, volume vm.Volume, vsco vm.VolumeSnapshotCreateOpts,
 ) (vm.VolumeSnapshot, error) {
 	region := volume.Zone[:len(volume.Zone)-1]
@@ -2701,7 +2696,7 @@ func (p *Provider) CreateVolumeSnapshot(
 	}
 
 	var so snapshotOutput
-	if err := p.runJSONCommand(l, args, &so); err != nil {
+	if err := c.runJSONCommand(l, args, &so); err != nil {
 		return vm.VolumeSnapshot{}, err
 	}
 	return vm.VolumeSnapshot{
@@ -2710,13 +2705,13 @@ func (p *Provider) CreateVolumeSnapshot(
 	}, nil
 }
 
-func (p *Provider) ListVolumeSnapshots(
+func (c *Client) ListVolumeSnapshots(
 	l *logger.Logger, vslo vm.VolumeSnapshotListOpts,
 ) ([]vm.VolumeSnapshot, error) {
 	return nil, vm.UnimplementedError
 }
 
-func (p *Provider) DeleteVolumeSnapshots(l *logger.Logger, snapshots ...vm.VolumeSnapshot) error {
+func (c *Client) DeleteVolumeSnapshots(l *logger.Logger, snapshots ...vm.VolumeSnapshot) error {
 	return vm.UnimplementedError
 }
 
@@ -2800,7 +2795,7 @@ type describeTagsOutput struct {
 
 // getLoadBalancerTags fetches tags for the given load balancer ARNs and returns
 // a map from ARN to tag map.
-func (p *Provider) getLoadBalancerTags(
+func (c *Client) getLoadBalancerTags(
 	ctx context.Context, l *logger.Logger, region string, arns []string,
 ) (map[string]map[string]string, error) {
 	if len(arns) == 0 {
@@ -2826,7 +2821,7 @@ func (p *Provider) getLoadBalancerTags(
 		args = append(args, "--region", region)
 
 		var output describeTagsOutput
-		if err := p.runJSONCommandWithContext(ctx, l, args, &output); err != nil {
+		if err := c.runJSONCommandWithContext(ctx, l, args, &output); err != nil {
 			return nil, err
 		}
 
@@ -2840,7 +2835,7 @@ func (p *Provider) getLoadBalancerTags(
 
 // CreateLoadBalancer creates a Network Load Balancer (NLB) for the given cluster and port.
 // The NLB is created with a target group containing all the cluster's EC2 instances.
-func (p *Provider) CreateLoadBalancer(l *logger.Logger, vms vm.List, port int) error {
+func (c *Client) CreateLoadBalancer(l *logger.Logger, vms vm.List, port int) error {
 	if len(vms) == 0 {
 		return errors.New("no VMs provided for load balancer creation")
 	}
@@ -2862,7 +2857,7 @@ func (p *Provider) CreateLoadBalancer(l *logger.Logger, vms vm.List, port int) e
 	g := ctxgroup.WithContext(ctx)
 	for region, regionVMs := range byRegion {
 		g.GoCtx(func(ctx context.Context) error {
-			return p.createRegionalLoadBalancer(ctx, l, clusterName, region, regionVMs, port)
+			return c.createRegionalLoadBalancer(ctx, l, clusterName, region, regionVMs, port)
 		})
 	}
 
@@ -2873,7 +2868,7 @@ func (p *Provider) CreateLoadBalancer(l *logger.Logger, vms vm.List, port int) e
 // On failure, any partially created resources are left behind; the caller
 // (roachprod.CreateLoadBalancer) is expected to call DeleteLoadBalancer
 // to clean up.
-func (p *Provider) createRegionalLoadBalancer(
+func (c *Client) createRegionalLoadBalancer(
 	ctx context.Context, l *logger.Logger, clusterName, region string, vms vm.List, port int,
 ) error {
 	if len(vms) == 0 {
@@ -2888,7 +2883,7 @@ func (p *Provider) createRegionalLoadBalancer(
 	// Collect unique subnets from VMs
 	subnetSet := make(map[string]struct{})
 	for _, v := range vms {
-		az, ok := p.Config.AZByName[v.Zone]
+		az, ok := c.provider.Config.AZByName[v.Zone]
 		if ok && az.SubnetID != "" {
 			subnetSet[az.SubnetID] = struct{}{}
 		}
@@ -2924,7 +2919,7 @@ func (p *Provider) createRegionalLoadBalancer(
 	var tgOutput struct {
 		TargetGroups []elbv2TargetGroup `json:"TargetGroups"`
 	}
-	if err := p.runJSONCommandWithContext(ctx, l, args, &tgOutput); err != nil {
+	if err := c.runJSONCommandWithContext(ctx, l, args, &tgOutput); err != nil {
 		return errors.Wrapf(err, "failed to create target group")
 	}
 	if len(tgOutput.TargetGroups) == 0 {
@@ -2945,7 +2940,7 @@ func (p *Provider) createRegionalLoadBalancer(
 			"--target-group-arns", tgArn,
 			"--region", region,
 		}
-		if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+		if _, err := c.runCommandWithContext(ctx, l, args); err != nil {
 			return errors.Wrapf(err, "failed to attach target group to ASG")
 		}
 	} else {
@@ -2964,7 +2959,7 @@ func (p *Provider) createRegionalLoadBalancer(
 		args = append(args, targets...)
 		args = append(args, "--region", region)
 
-		if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+		if _, err := c.runCommandWithContext(ctx, l, args); err != nil {
 			return errors.Wrapf(err, "failed to register targets")
 		}
 	}
@@ -2992,7 +2987,7 @@ func (p *Provider) createRegionalLoadBalancer(
 	var nlbOutput struct {
 		LoadBalancers []elbv2LoadBalancer `json:"LoadBalancers"`
 	}
-	if err := p.runJSONCommandWithContext(ctx, l, args, &nlbOutput); err != nil {
+	if err := c.runJSONCommandWithContext(ctx, l, args, &nlbOutput); err != nil {
 		return errors.Wrapf(err, "failed to create load balancer")
 	}
 	if len(nlbOutput.LoadBalancers) == 0 {
@@ -3007,7 +3002,7 @@ func (p *Provider) createRegionalLoadBalancer(
 		"--load-balancer-arns", nlbArn,
 		"--region", region,
 	}
-	if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+	if _, err := c.runCommandWithContext(ctx, l, args); err != nil {
 		l.Printf("Warning: load balancer may not be fully active yet: %v", err)
 	}
 
@@ -3022,7 +3017,7 @@ func (p *Provider) createRegionalLoadBalancer(
 		"--region", region,
 	}
 
-	if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+	if _, err := c.runCommandWithContext(ctx, l, args); err != nil {
 		return errors.Wrapf(err, "failed to create listener")
 	}
 
@@ -3031,7 +3026,7 @@ func (p *Provider) createRegionalLoadBalancer(
 }
 
 // DeleteLoadBalancer deletes all NLBs and associated resources for the given cluster.
-func (p *Provider) DeleteLoadBalancer(l *logger.Logger, vms vm.List, _ int) error {
+func (c *Client) DeleteLoadBalancer(l *logger.Logger, vms vm.List, _ int) error {
 	if len(vms) == 0 {
 		return nil
 	}
@@ -3050,7 +3045,7 @@ func (p *Provider) DeleteLoadBalancer(l *logger.Logger, vms vm.List, _ int) erro
 	g := ctxgroup.WithContext(ctx)
 	for region := range byRegion {
 		g.GoCtx(func(ctx context.Context) error {
-			return p.deleteLoadBalancerResources(ctx, l, clusterName, region)
+			return c.deleteLoadBalancerResources(ctx, l, clusterName, region)
 		})
 	}
 
@@ -3061,11 +3056,11 @@ func (p *Provider) DeleteLoadBalancer(l *logger.Logger, vms vm.List, _ int) erro
 // This function is lenient: it attempts to delete all resources and continues
 // even if some deletions fail, logging warnings for individual failures.
 // Target groups are always attempted even if load balancer operations fail.
-func (p *Provider) deleteLoadBalancerResources(
+func (c *Client) deleteLoadBalancerResources(
 	ctx context.Context, l *logger.Logger, clusterName, region string,
 ) error {
 	// Find load balancers belonging to this cluster
-	lbs, _, err := p.listClusterLoadBalancers(ctx, l, clusterName, region)
+	lbs, _, err := c.listClusterLoadBalancers(ctx, l, clusterName, region)
 	if err != nil {
 		// Log the error but continue to try deleting target groups
 		l.Printf("Warning: failed to list load balancers in region %s: %v", region, err)
@@ -3080,7 +3075,7 @@ func (p *Provider) deleteLoadBalancerResources(
 			"--region", region,
 		}
 		var listenersOutput describeListenersOutput
-		if err := p.runJSONCommandWithContext(ctx, l, listenerArgs, &listenersOutput); err == nil {
+		if err := c.runJSONCommandWithContext(ctx, l, listenerArgs, &listenersOutput); err == nil {
 			for _, listener := range listenersOutput.Listeners {
 				l.Printf("Deleting listener %s", listener.ListenerArn)
 				deleteArgs := []string{
@@ -3088,7 +3083,7 @@ func (p *Provider) deleteLoadBalancerResources(
 					"--listener-arn", listener.ListenerArn,
 					"--region", region,
 				}
-				if _, err := p.runCommand(l, deleteArgs); err != nil {
+				if _, err := c.runCommand(l, deleteArgs); err != nil {
 					l.Printf("Warning: failed to delete listener: %v", err)
 				}
 			}
@@ -3101,7 +3096,7 @@ func (p *Provider) deleteLoadBalancerResources(
 			"--load-balancer-arn", lb.LoadBalancerArn,
 			"--region", region,
 		}
-		if _, err := p.runCommand(l, deleteArgs); err != nil {
+		if _, err := c.runCommand(l, deleteArgs); err != nil {
 			l.Printf("Warning: failed to delete load balancer: %v", err)
 		}
 
@@ -3112,13 +3107,13 @@ func (p *Provider) deleteLoadBalancerResources(
 			"--load-balancer-arns", lb.LoadBalancerArn,
 			"--region", region,
 		}
-		if _, err := p.runCommand(l, waitArgs); err != nil {
+		if _, err := c.runCommand(l, waitArgs); err != nil {
 			l.Printf("Warning: wait for load balancer deletion may have timed out: %v", err)
 		}
 	}
 
 	// Delete all target groups for this cluster
-	if err := p.deleteClusterTargetGroups(ctx, l, clusterName, region); err != nil {
+	if err := c.deleteClusterTargetGroups(ctx, l, clusterName, region); err != nil {
 		l.Printf("Warning: failed to delete target groups: %v", err)
 	}
 
@@ -3127,7 +3122,7 @@ func (p *Provider) deleteLoadBalancerResources(
 
 // deleteClusterTargetGroups deletes all target groups for a cluster in a region.
 // For managed clusters, it first detaches target groups from the ASG before deleting.
-func (p *Provider) deleteClusterTargetGroups(
+func (c *Client) deleteClusterTargetGroups(
 	ctx context.Context, l *logger.Logger, clusterName, region string,
 ) error {
 	tgArgs := []string{
@@ -3136,7 +3131,7 @@ func (p *Provider) deleteClusterTargetGroups(
 	}
 
 	var tgOutput describeTargetGroupsOutput
-	if err := p.runJSONCommandWithContext(ctx, l, tgArgs, &tgOutput); err != nil {
+	if err := c.runJSONCommandWithContext(ctx, l, tgArgs, &tgOutput); err != nil {
 		return errors.Wrap(err, "could not list target groups")
 	}
 
@@ -3150,7 +3145,7 @@ func (p *Provider) deleteClusterTargetGroups(
 		tgArns[i] = tg.TargetGroupArn
 	}
 
-	tgTagsByArn, err := p.getLoadBalancerTags(ctx, l, region, tgArns)
+	tgTagsByArn, err := c.getLoadBalancerTags(ctx, l, region, tgArns)
 	if err != nil {
 		return errors.Wrap(err, "could not get target group tags")
 	}
@@ -3173,7 +3168,7 @@ func (p *Provider) deleteClusterTargetGroups(
 
 		// Query the ASG to get its attached target group ARNs
 		attachedTgArns := make(map[string]struct{})
-		if asg, err := p.describeASG(ctx, l, asgName, region); err == nil && asg != nil {
+		if asg, err := c.describeASG(ctx, l, asgName, region); err == nil && asg != nil {
 			for _, arn := range asg.TargetGroupARNs {
 				attachedTgArns[arn] = struct{}{}
 			}
@@ -3197,7 +3192,7 @@ func (p *Provider) deleteClusterTargetGroups(
 			detachArgs = append(detachArgs, tgArnsToDetach...)
 			detachArgs = append(detachArgs, "--region", region)
 
-			if _, err := p.runCommandWithContext(ctx, l, detachArgs); err != nil {
+			if _, err := c.runCommandWithContext(ctx, l, detachArgs); err != nil {
 				// Log warning but continue - ASG may have been deleted already
 				l.Printf("Warning: failed to detach target groups from ASG: %v", err)
 			}
@@ -3206,7 +3201,7 @@ func (p *Provider) deleteClusterTargetGroups(
 
 	// Now delete the target groups
 	for _, tgArn := range clusterTgArns {
-		if err := p.deleteTargetGroup(l, tgArn, region); err != nil {
+		if err := c.deleteTargetGroup(l, tgArn, region); err != nil {
 			l.Printf("Warning: failed to delete target group: %v", err)
 		}
 	}
@@ -3215,19 +3210,19 @@ func (p *Provider) deleteClusterTargetGroups(
 }
 
 // deleteTargetGroup deletes a target group by ARN.
-func (p *Provider) deleteTargetGroup(l *logger.Logger, tgArn, region string) error {
+func (c *Client) deleteTargetGroup(l *logger.Logger, tgArn, region string) error {
 	l.Printf("Deleting target group %s", tgArn)
 	args := []string{
 		"elbv2", "delete-target-group",
 		"--target-group-arn", tgArn,
 		"--region", region,
 	}
-	_, err := p.runCommand(l, args)
+	_, err := c.runCommand(l, args)
 	return err
 }
 
 // ListLoadBalancers returns the list of load balancer addresses for the given VMs.
-func (p *Provider) ListLoadBalancers(l *logger.Logger, vms vm.List) ([]vm.ServiceAddress, error) {
+func (c *Client) ListLoadBalancers(l *logger.Logger, vms vm.List) ([]vm.ServiceAddress, error) {
 	if len(vms) == 0 {
 		return nil, nil
 	}
@@ -3250,7 +3245,7 @@ func (p *Provider) ListLoadBalancers(l *logger.Logger, vms vm.List) ([]vm.Servic
 	for region := range byRegion {
 		g.GoCtx(func(ctx context.Context) error {
 			// Find load balancers belonging to this cluster
-			lbs, tagsByArn, err := p.listClusterLoadBalancers(ctx, l, clusterName, region)
+			lbs, tagsByArn, err := c.listClusterLoadBalancers(ctx, l, clusterName, region)
 			if err != nil {
 				return err
 			}
@@ -3285,7 +3280,7 @@ func (p *Provider) ListLoadBalancers(l *logger.Logger, vms vm.List) ([]vm.Servic
 
 // listClusterLoadBalancers lists all load balancers belonging to the given cluster in a region.
 // It returns the load balancers and their tags (keyed by ARN).
-func (p *Provider) listClusterLoadBalancers(
+func (c *Client) listClusterLoadBalancers(
 	ctx context.Context, l *logger.Logger, clusterName, region string,
 ) ([]elbv2LoadBalancer, map[string]map[string]string, error) {
 	args := []string{
@@ -3294,7 +3289,7 @@ func (p *Provider) listClusterLoadBalancers(
 	}
 
 	var output describeLoadBalancersOutput
-	if err := p.runJSONCommandWithContext(ctx, l, args, &output); err != nil {
+	if err := c.runJSONCommandWithContext(ctx, l, args, &output); err != nil {
 		return nil, nil, err
 	}
 
@@ -3311,7 +3306,7 @@ func (p *Provider) listClusterLoadBalancers(
 	}
 
 	// Fetch tags for all load balancers
-	tagsByArn, err := p.getLoadBalancerTags(ctx, l, region, arns)
+	tagsByArn, err := c.getLoadBalancerTags(ctx, l, region, arns)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "failed to get load balancer tags")
 	}
@@ -3344,16 +3339,16 @@ type instanceConfig struct {
 // getInstanceConfig builds the common instance configuration from the given options.
 // This is used by both runInstance (for unmanaged clusters) and createLaunchTemplate
 // (for managed clusters).
-func (p *Provider) getInstanceConfig(
+func (c *Client) getInstanceConfig(
 	l *logger.Logger, zone string, machineType string, opts vm.CreateOpts, providerOpts *ProviderOpts,
 ) (*instanceConfig, *availabilityZone, error) {
-	az, ok := p.Config.AZByName[zone]
+	az, ok := c.provider.Config.AZByName[zone]
 	if !ok {
 		return nil, nil, fmt.Errorf("no region in %v corresponds to availability zone %v",
-			p.Config.regionNames(), zone)
+			c.provider.Config.regionNames(), zone)
 	}
 
-	keyName, err := p.sshKeyName(l)
+	keyName, err := c.sshKeyName(l)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -3423,7 +3418,7 @@ type describeLaunchTemplatesOutput struct {
 // listManagedLaunchTemplates returns the cluster names that have managed
 // launch templates in the given region. This is used during GC to discover
 // orphaned launch templates that no longer have active instances.
-func (p *Provider) listManagedLaunchTemplates(l *logger.Logger, region string) ([]string, error) {
+func (c *Client) listManagedLaunchTemplates(l *logger.Logger, region string) ([]string, error) {
 	args := []string{
 		"ec2", "describe-launch-templates",
 		"--filters",
@@ -3433,7 +3428,7 @@ func (p *Provider) listManagedLaunchTemplates(l *logger.Logger, region string) (
 	}
 
 	var output describeLaunchTemplatesOutput
-	if err := p.runJSONCommand(l, args, &output); err != nil {
+	if err := c.runJSONCommand(l, args, &output); err != nil {
 		return nil, errors.Wrap(err, "listing managed launch templates")
 	}
 
@@ -3458,7 +3453,7 @@ type createLaunchTemplateOutput struct {
 // createLaunchTemplate creates an EC2 launch template for the cluster.
 // The launch template captures all instance configuration (AMI, instance type,
 // security groups, volumes, etc.) so that the ASG can launch identical instances.
-func (p *Provider) createLaunchTemplate(
+func (c *Client) createLaunchTemplate(
 	ctx context.Context,
 	l *logger.Logger,
 	clusterName string,
@@ -3566,7 +3561,7 @@ func (p *Provider) createLaunchTemplate(
 	}
 
 	var output createLaunchTemplateOutput
-	if err := p.runJSONCommandWithContext(ctx, l, args, &output); err != nil {
+	if err := c.runJSONCommandWithContext(ctx, l, args, &output); err != nil {
 		return "", errors.Wrapf(err, "failed to create launch template")
 	}
 
@@ -3577,7 +3572,7 @@ func (p *Provider) createLaunchTemplate(
 // createAutoScalingGroup creates an Auto Scaling Group for the cluster in a region.
 // The ASG manages the desired number of instances using the launch template.
 // maxSize specifies the maximum number of instances the ASG can hold.
-func (p *Provider) createAutoScalingGroup(
+func (c *Client) createAutoScalingGroup(
 	ctx context.Context,
 	l *logger.Logger,
 	clusterName string,
@@ -3593,7 +3588,7 @@ func (p *Provider) createAutoScalingGroup(
 	// Collect subnet IDs for the zones
 	var subnetIDs []string
 	for _, zone := range zones {
-		az, ok := p.Config.AZByName[zone]
+		az, ok := c.provider.Config.AZByName[zone]
 		if ok && az.SubnetID != "" {
 			subnetIDs = append(subnetIDs, az.SubnetID)
 		}
@@ -3627,7 +3622,7 @@ func (p *Provider) createAutoScalingGroup(
 	args = append(args, tags...)
 	args = append(args, "--region", region)
 
-	if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+	if _, err := c.runCommandWithContext(ctx, l, args); err != nil {
 		return errors.Wrapf(err, "failed to create auto scaling group")
 	}
 
@@ -3650,7 +3645,7 @@ func (p *Provider) createAutoScalingGroup(
 
 	for waitRetry.Next() {
 		// Check ASG status
-		asg, err := p.describeASG(ctx, l, asgName, region)
+		asg, err := c.describeASG(ctx, l, asgName, region)
 		if err != nil {
 			l.Printf("Warning: failed to describe ASG: %v", err)
 			continue
@@ -3678,7 +3673,7 @@ func (p *Provider) createAutoScalingGroup(
 }
 
 // deleteLaunchTemplate deletes the launch template for a cluster.
-func (p *Provider) deleteLaunchTemplate(
+func (c *Client) deleteLaunchTemplate(
 	ctx context.Context, l *logger.Logger, clusterName, region string,
 ) error {
 	ltName := launchTemplateName(clusterName)
@@ -3690,7 +3685,7 @@ func (p *Provider) deleteLaunchTemplate(
 		"--region", region,
 	}
 
-	if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+	if _, err := c.runCommandWithContext(ctx, l, args); err != nil {
 		// Ignore "not found" errors
 		if !strings.Contains(err.Error(), "InvalidLaunchTemplateName.NotFoundException") {
 			return errors.Wrapf(err, "failed to delete launch template")
@@ -3702,7 +3697,7 @@ func (p *Provider) deleteLaunchTemplate(
 }
 
 // deleteAutoScalingGroup deletes the Auto Scaling Group for a cluster in a region.
-func (p *Provider) deleteAutoScalingGroup(
+func (c *Client) deleteAutoScalingGroup(
 	ctx context.Context, l *logger.Logger, clusterName, region string,
 ) error {
 	asgName := autoScalingGroupName(clusterName, region)
@@ -3715,7 +3710,7 @@ func (p *Provider) deleteAutoScalingGroup(
 		"--region", region,
 	}
 
-	if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+	if _, err := c.runCommandWithContext(ctx, l, args); err != nil {
 		// Ignore "not found" errors
 		if !strings.Contains(err.Error(), "AutoScalingGroup name not found") {
 			return errors.Wrapf(err, "failed to delete auto scaling group")
@@ -3732,7 +3727,7 @@ func (p *Provider) deleteAutoScalingGroup(
 	})
 
 	for waitRetry.Next() {
-		asg, err := p.describeASG(ctx, l, asgName, region)
+		asg, err := c.describeASG(ctx, l, asgName, region)
 		if err != nil {
 			l.Printf("Warning: failed to describe ASG: %v", err)
 			continue

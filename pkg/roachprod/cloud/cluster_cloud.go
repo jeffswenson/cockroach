@@ -35,7 +35,7 @@ type Cloud struct {
 	// are not part of any Cluster.
 	BadInstances vm.List `json:"bad_instances"`
 
-	// registry resolves providers. Defaults to vm.Providers.
+	// registry resolves providers and clients. Defaults to vm.Providers.
 	registry *vm.ProviderRegistry
 }
 
@@ -132,7 +132,11 @@ func (c *Cloud) ListCloud(ctx context.Context, l *logger.Logger, options vm.List
 	vmListLock := syncutil.Mutex{}
 	for _, provider := range providers {
 		g.GoCtx(func(ctx context.Context) error {
-			pVms, err := provider.List(ctx, l, options)
+			client, err := c.registry.Client(provider.Name())
+			if err != nil {
+				return errors.Wrapf(err, "provider %s", provider.String())
+			}
+			pVms, err := client.List(ctx, l, options)
 			if err != nil {
 				return errors.Wrapf(err, "provider %s", provider.String())
 			}
@@ -291,7 +295,11 @@ func CreateCluster(l *logger.Logger, opts []*ClusterCreateOpts) (*cloudcluster.C
 		// Each provider will return the list of VMs it created, and we append
 		// them to the cached Cluster.
 		if err := vm.ProvidersParallel(o.CreateOpts.VMProviders, func(p vm.Provider) error {
-			providerVmList, err := p.Create(
+			client, err := vm.Providers.Client(p.Name())
+			if err != nil {
+				return err
+			}
+			providerVmList, err := client.Create(
 				l, vmLocations[p.Name()], o.CreateOpts, o.ProviderOptsContainer[p.Name()],
 			)
 			if err != nil {
@@ -347,8 +355,8 @@ func GrowCluster(l *logger.Logger, c *cloudcluster.Cluster, numNodes int) error 
 		}
 	}
 
-	err := vm.ForProvider(provider, func(p vm.Provider) error {
-		addedVms, err := p.Grow(l, c.VMs, c.Name, names)
+	err := vm.ForProvider(provider, func(client vm.ProviderClient) error {
+		addedVms, err := client.Grow(l, c.VMs, c.Name, names)
 		if err != nil {
 			return err
 		}
@@ -387,8 +395,8 @@ func ShrinkCluster(l *logger.Logger, c *cloudcluster.Cluster, numNodes int) erro
 	// Always delete from the tail.
 	vmsToDelete := c.VMs[len(c.VMs)-numNodes:]
 
-	err := vm.ForProvider(provider, func(p vm.Provider) error {
-		return p.Shrink(l, vmsToDelete, c.Name)
+	err := vm.ForProvider(provider, func(client vm.ProviderClient) error {
+		return client.Shrink(l, vmsToDelete, c.Name)
 	})
 	if err != nil {
 		return err
@@ -423,12 +431,42 @@ func DestroyCluster(l *logger.Logger, c *cloudcluster.Cluster) error {
 
 	stopSpinner = ui.NewDefaultSpinner(l, "Destroying VMs").Start()
 	// Allow both DNS and VM operations to run before returning any errors.
-	clusterErr := vm.Providers.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
+	clusterErr := vm.Providers.FanOut(c.VMs, func(client vm.ProviderClient, vms vm.List) error {
 		// Enable a fast-path for providers that can destroy a cluster in one shot.
-		if x, ok := p.(vm.DeleteCluster); ok {
+		if x, ok := client.(vm.DeleteCluster); ok {
 			return x.DeleteCluster(l, c.Name)
 		}
-		return p.Delete(l, vms)
+		return client.Delete(l, vms)
+	})
+	stopSpinner()
+	return errors.CombineErrors(dnsErr, clusterErr)
+}
+
+// destroyCluster destroys a cluster using the Cloud's registry to
+// resolve clients.
+func (c *Cloud) destroyCluster(l *logger.Logger, cluster *cloudcluster.Cluster) error {
+	if err := cluster.DeletePrometheusConfig(context.Background(), l); err != nil {
+		l.Printf("WARNING: failed to delete the prometheus config (already wiped?): %s", err)
+	}
+
+	stopSpinner := ui.NewDefaultSpinner(l, "Destroying DNS entries").Start()
+	publicRecords := make([]string, 0, len(cluster.VMs))
+	for _, v := range cluster.VMs {
+		publicRecords = append(publicRecords, v.PublicDNS)
+	}
+	dnsErr := vm.FanOutDNS(cluster.VMs, func(p vm.DNSProvider, vms vm.List) error {
+		publicRecordsErr := p.DeletePublicRecordsByName(context.Background(), publicRecords...)
+		srvRecordsErr := p.DeleteSRVRecordsBySubdomain(context.Background(), cluster.Name)
+		return errors.CombineErrors(publicRecordsErr, srvRecordsErr)
+	})
+	stopSpinner()
+
+	stopSpinner = ui.NewDefaultSpinner(l, "Destroying VMs").Start()
+	clusterErr := c.registry.FanOut(cluster.VMs, func(client vm.ProviderClient, vms vm.List) error {
+		if x, ok := client.(vm.DeleteCluster); ok {
+			return x.DeleteCluster(l, cluster.Name)
+		}
+		return client.Delete(l, vms)
 	})
 	stopSpinner()
 	return errors.CombineErrors(dnsErr, clusterErr)
@@ -438,55 +476,12 @@ func DestroyCluster(l *logger.Logger, c *cloudcluster.Cluster) error {
 func ExtendCluster(l *logger.Logger, c *cloudcluster.Cluster, extension time.Duration) error {
 	// Round new lifetime to nearest second.
 	newLifetime := (c.Lifetime + extension).Round(time.Second)
-	err := vm.Providers.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
-		return p.Extend(l, vms, newLifetime)
+	err := vm.Providers.FanOut(c.VMs, func(client vm.ProviderClient, vms vm.List) error {
+		return client.Extend(l, vms, newLifetime)
 	})
 	if err != nil {
 		return err
 	}
 	c.Lifetime = newLifetime
 	return nil
-}
-
-// destroyCluster destroys a cluster using the Cloud's registry to
-// resolve providers.
-func (c *Cloud) destroyCluster(l *logger.Logger, cluster *cloudcluster.Cluster) error {
-	if err := cluster.DeletePrometheusConfig(context.Background(), l); err != nil {
-		l.Printf(
-			"WARNING: failed to delete the prometheus config (already wiped?): %s",
-			err,
-		)
-	}
-
-	stopSpinner := ui.NewDefaultSpinner(l, "Destroying DNS entries").Start()
-	publicRecords := make([]string, 0, len(cluster.VMs))
-	for _, v := range cluster.VMs {
-		publicRecords = append(publicRecords, v.PublicDNS)
-	}
-	dnsErr := vm.FanOutDNS(
-		cluster.VMs,
-		func(p vm.DNSProvider, vms vm.List) error {
-			publicRecordsErr := p.DeletePublicRecordsByName(
-				context.Background(), publicRecords...,
-			)
-			srvRecordsErr := p.DeleteSRVRecordsBySubdomain(
-				context.Background(), cluster.Name,
-			)
-			return errors.CombineErrors(publicRecordsErr, srvRecordsErr)
-		},
-	)
-	stopSpinner()
-
-	stopSpinner = ui.NewDefaultSpinner(l, "Destroying VMs").Start()
-	clusterErr := c.registry.FanOut(
-		cluster.VMs,
-		func(p vm.Provider, vms vm.List) error {
-			if x, ok := p.(vm.DeleteCluster); ok {
-				return x.DeleteCluster(l, cluster.Name)
-			}
-			return p.Delete(l, vms)
-		},
-	)
-	stopSpinner()
-	return errors.CombineErrors(dnsErr, clusterErr)
 }

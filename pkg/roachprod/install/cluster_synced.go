@@ -2786,7 +2786,7 @@ func (c *SyncedCluster) Reset(l *logger.Logger) error {
 		targetVMs[idx] = c.VMs[node-1]
 	}
 
-	return vm.Providers.FanOut(targetVMs, func(p vm.Provider, vms vm.List) error {
-		return p.Reset(l, vms)
+	return vm.Providers.FanOut(targetVMs, func(client vm.ProviderClient, vms vm.List) error {
+		return client.Reset(l, vms)
 	})
 }

@@ -17,7 +17,6 @@ go_library(
         "//pkg/roachprod/config",
         "//pkg/roachprod/logger",
         "//pkg/roachprod/vm",
-        "//pkg/roachprod/vm/flagstub",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "@com_github_azure_azure_sdk_for_go//profiles/latest/compute/mgmt/compute",

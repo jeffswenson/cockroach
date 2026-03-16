@@ -50,34 +50,47 @@ func VMDir(clusterName string, nodeIdx int) string {
 	return filepath.Join(localDir, fmt.Sprintf("%s-%d", name, nodeIdx))
 }
 
-// Init initializes the Local provider and registers it into vm.Providers.
-func Init(storage VMStorage) error {
-	p := &Provider{
+// NewProvider creates a new local Provider without registering it.
+func NewProvider(storage VMStorage) *Provider {
+	return &Provider{
 		clusters:    make(cloudcluster.Clusters),
 		storage:     storage,
 		dnsProvider: NewDNSProvider(config.DNSDir, "local-zone"),
 	}
-	vm.Providers.Register(p)
-	vm.DNSProviders[ProviderName] = p.dnsProvider
-	return nil
+}
+
+// GetDNSProvider returns the local DNS provider.
+func (p *Provider) GetDNSProvider() vm.DNSProvider {
+	return p.dnsProvider
+}
+
+// NewClient returns the provider as a client. The local provider
+// requires no expensive initialization.
+func (p *Provider) NewClient() (vm.ProviderClient, error) {
+	return p, nil
 }
 
 // AddCluster adds the metadata of a local cluster; used when loading the saved
 // metadata for local clusters.
 func AddCluster(cluster *cloudcluster.Cluster) {
-	raw, _ := vm.Providers.Provider(ProviderName)
-	p := raw.(*Provider)
-	p.clusters[cluster.Name] = cluster
+	raw, ok := vm.Providers.Provider(ProviderName)
+	if !ok {
+		return
+	}
+	raw.(*Provider).clusters[cluster.Name] = cluster
 }
 
 // DeleteCluster destroys a local cluster. It assumes that the cockroach
 // processes are stopped.
 func DeleteCluster(l *logger.Logger, name string) error {
-	raw, _ := vm.Providers.Provider(ProviderName)
+	raw, ok := vm.Providers.Provider(ProviderName)
+	if !ok {
+		return errors.New("local provider not registered")
+	}
 	p := raw.(*Provider)
 	c := p.clusters[name]
 	if c == nil {
-		return fmt.Errorf("local cluster %s does not exist", name)
+		return errors.Newf("local cluster %s does not exist", name)
 	}
 	l.Printf("Deleting local cluster %s\n", name)
 
@@ -102,9 +115,11 @@ func DeleteCluster(l *logger.Logger, name string) error {
 
 // Clusters returns a list of all known local clusters.
 func Clusters() []string {
-	raw, _ := vm.Providers.Provider(ProviderName)
-	p := raw.(*Provider)
-	return p.clusters.Names()
+	raw, ok := vm.Providers.Provider(ProviderName)
+	if !ok {
+		return nil
+	}
+	return raw.(*Provider).clusters.Names()
 }
 
 // VMStorage is the interface for saving metadata for local clusters.
@@ -363,11 +378,6 @@ func (p *Provider) List(_ context.Context, l *logger.Logger, opts vm.ListOptions
 // Name returns the name of the Provider, which will also surface in VM.Provider
 func (p *Provider) Name() string {
 	return ProviderName
-}
-
-// Active is part of the vm.Provider interface.
-func (p *Provider) Active() bool {
-	return true
 }
 
 // ProjectActive is part of the vm.Provider interface.

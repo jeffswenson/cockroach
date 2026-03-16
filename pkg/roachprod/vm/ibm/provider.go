@@ -24,7 +24,6 @@ import (
 	"github.com/IBM/vpc-go-sdk/vpcv1"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/flagstub"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -139,44 +138,21 @@ func DefaultZones(geoDistributed bool) []string {
 	return []string{selectedRegionZones[rng.Intn(len(selectedRegionZones))]}
 }
 
-// providerInstance is the global instance of the IBM provider used by the
-// roachprod CLI.
-var providerInstance = &Provider{}
-
-// Init initializes the IBM provider instance for the roachprod CLI.
-func Init() (err error) {
-
-	hasCliOrEnv := func() bool {
-		// If the credentials environment variable is set, we can use the IBM sdk.
-		if os.Getenv(expectedEnvVarIBMAPIKey) != "" {
-			return true
+// NewClient performs the expensive IBM provider initialization by
+// calling NewProvider.
+func (p *Provider) NewClient() (vm.ProviderClient, error) {
+	if os.Getenv(expectedEnvVarIBMAPIKey) == "" {
+		if _, err := exec.LookPath("ibmcloud"); err != nil {
+			return nil, ErrMissingAuth
 		}
-
-		// If the ibmcloud CLI is installed, we assume the user wants
-		// the IBM provider to be enabled, and we'll try to initialize it.
-		if _, err := exec.LookPath("ibmcloud"); err == nil {
-			return true
-		}
-
-		// Nothing points to the IBM provider being used.
-		return false
 	}
-
-	if !hasCliOrEnv() {
-		vm.Providers.Register(flagstub.New(&Provider{}, ErrMissingAuth.Error()))
-		return err
-	}
-
-	providerInstance, err = NewProvider()
+	initialized, err := NewProvider()
 	if err != nil {
-		fmt.Printf("failed to create IBM provider: %v\n", err)
-		vm.Providers.Register(flagstub.New(&Provider{}, err.Error()))
-		return nil
+		return nil, err
 	}
-
-	vm.Providers.Register(providerInstance)
-
-	return nil
+	// Copy GCAccounts from the registered provider (set via flags).
+	initialized.GCAccounts = p.GCAccounts
+	return initialized, nil
 }
 
 // Provider implements the vm.Provider interface for IBM.
@@ -343,11 +319,6 @@ func (p *Provider) String() string {
 		return fmt.Sprintf("%s-unknown-account", ProviderName)
 	}
 	return fmt.Sprintf("%s-%s", ProviderName, accountID)
-}
-
-// Active is part of the vm.Provider interface.
-func (p *Provider) Active() bool {
-	return true
 }
 
 // IsCentralizedProvider returns true because IBM is a remote provider.

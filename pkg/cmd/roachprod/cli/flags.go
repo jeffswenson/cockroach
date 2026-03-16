@@ -159,9 +159,15 @@ func initCreateCmdFlags(createCmd *cobra.Command) {
 		"nodes", "n", 4, "Total number of nodes, distributed across all clouds")
 	createCmd.Flags().IntVarP(&createVMOpts.OsVolumeSize,
 		"os-volume-size", "", 10, "OS disk volume size in GB")
+	var providerNames []string
+	for _, p := range vm.Providers.AllProviders() {
+		providerNames = append(providerNames, p.Name())
+	}
 	createCmd.Flags().StringSliceVarP(&createVMOpts.VMProviders,
 		"clouds", "c", []string{gce.ProviderName},
-		"The cloud provider(s) to use when creating new vm instances")
+		fmt.Sprintf(
+			"The cloud provider(s) to use when creating new vm instances: %s",
+			providerNames))
 	createCmd.Flags().BoolVar(&createVMOpts.GeoDistributed,
 		"geo", false, "Create geo-distributed cluster")
 	createCmd.Flags().StringVar(&createVMOpts.Arch, "arch", "",
@@ -175,14 +181,14 @@ func initCreateCmdFlags(createCmd *cobra.Command) {
 			"quotes, gce label name only allows hyphens (-), underscores (_), lowercase characters, numbers and "+
 			"international characters. Examples: usage=cloud-report-2021, namewithspaceinvalue='s o s'")
 
-	// Allow each Provider to inject additional configuration flags
+	// Allow each Provider to inject additional configuration flags.
+	// Flags are registered for all providers unconditionally — they are
+	// cheap and should always be available.
 	for _, provider := range vm.Providers.AllProviders() {
-		if provider.Active() {
-			providerOptsContainer[provider.Name()].ConfigureCreateFlags(createCmd.Flags())
-			// createCmd only accepts a single GCE project, as opposed to all the other
-			// commands.
-			provider.ConfigureProviderFlags(createCmd.Flags(), vm.SingleProject)
-		}
+		providerOptsContainer[provider.Name()].ConfigureCreateFlags(createCmd.Flags())
+		// createCmd only accepts a single GCE project, as opposed to all the other
+		// commands.
+		provider.ConfigureProviderFlags(createCmd.Flags(), vm.SingleProject)
 	}
 }
 
@@ -190,20 +196,18 @@ func initClusterFlagsForMultiProjects(
 	rootCmd *cobra.Command, excludeFromClusterFlagsMulti []*cobra.Command,
 ) {
 	for _, provider := range vm.Providers.AllProviders() {
-		if provider.Active() {
-			for _, cmd := range rootCmd.Commands() {
-				excludeCmd := false
-				for _, c := range excludeFromClusterFlagsMulti {
-					if cmd == c {
-						excludeCmd = true
-						break
-					}
+		for _, cmd := range rootCmd.Commands() {
+			excludeCmd := false
+			for _, c := range excludeFromClusterFlagsMulti {
+				if cmd == c {
+					excludeCmd = true
+					break
 				}
-				if excludeCmd {
-					continue
-				}
-				provider.ConfigureProviderFlags(cmd.Flags(), vm.AcceptMultipleProjects)
 			}
+			if excludeCmd {
+				continue
+			}
+			provider.ConfigureProviderFlags(cmd.Flags(), vm.AcceptMultipleProjects)
 		}
 	}
 }
@@ -412,11 +416,9 @@ func initGCCmdFlags(gcCmd *cobra.Command) {
 	gcCmd.Flags().BoolVarP(&dryrun,
 		"dry-run", "n", dryrun, "dry run (don't perform any actions)")
 	gcCmd.Flags().StringVar(&config.SlackToken, "slack-token", "", "Slack bot token")
-	// Allow each Provider to inject additional configuration flags
+	// Allow each Provider to inject additional configuration flags.
 	for _, provider := range vm.Providers.AllProviders() {
-		if provider.Active() {
-			provider.ConfigureClusterCleanupFlags(gcCmd.Flags())
-		}
+		provider.ConfigureClusterCleanupFlags(gcCmd.Flags())
 	}
 }
 

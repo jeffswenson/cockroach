@@ -1456,8 +1456,12 @@ func (c *clusterImpl) FetchVMSpecs(ctx context.Context, l *logger.Logger) error 
 		providerToVMs := bucketVMsByProvider(cachedCluster)
 
 		for provider, vms := range providerToVMs {
-			p, _ := vm.Providers.Provider(provider)
-			vmSpecs, err := p.GetVMSpecs(l, vms)
+			client, err := vm.Providers.Client(provider)
+			if err != nil {
+				l.Errorf("failed to get provider client for %s: %s", provider, err)
+				continue
+			}
+			vmSpecs, err := client.GetVMSpecs(l, vms)
 			if err != nil {
 				l.Errorf("failed to get VM spec for provider %s: %s", provider, err)
 				continue
@@ -3337,9 +3341,17 @@ func (c *clusterImpl) GetPreemptedVMs(
 
 	var allPreemptedVMs []vm.PreemptedVM
 	for provider, vms := range providerToVMs {
-		p, _ := vm.Providers.Provider(provider)
+		p, ok := vm.Providers.Provider(provider)
+		if !ok {
+			continue
+		}
 		if p.SupportsSpotVMs() {
-			preemptedVMS, err := p.GetPreemptedSpotVMs(l, vms, cachedCluster.CreatedAt)
+			client, err := vm.Providers.Client(provider)
+			if err != nil {
+				l.Errorf("failed to get provider client for %s: %s", provider, err)
+				continue
+			}
+			preemptedVMS, err := client.GetPreemptedSpotVMs(l, vms, cachedCluster.CreatedAt)
 			if err != nil {
 				l.Errorf("failed to get preempted VMs for provider %s: %s", provider, err)
 				continue
@@ -3364,8 +3376,12 @@ func (c *clusterImpl) GetHostErrorVMs(ctx context.Context, l *logger.Logger) ([]
 
 	var allHostErrorVMs []string
 	for provider, vms := range providerToVMs {
-		p, _ := vm.Providers.Provider(provider)
-		hostErrorVMS, err := p.GetHostErrorVMs(l, vms, cachedCluster.CreatedAt)
+		client, err := vm.Providers.Client(provider)
+		if err != nil {
+			l.Errorf("failed to get provider client for %s: %s", provider, err)
+			continue
+		}
+		hostErrorVMS, err := client.GetHostErrorVMs(l, vms, cachedCluster.CreatedAt)
 		if err != nil {
 			l.Errorf("failed to get hostError VMs for provider %s: %s", provider, err)
 			continue
@@ -3388,8 +3404,8 @@ func (c *clusterImpl) GetLiveMigrationVMs(l *logger.Logger) ([]string, error) {
 		syncutil.Mutex
 		names []string
 	}
-	clusterErr := vm.Providers.FanOut(cachedCluster.VMs, func(p vm.Provider, vms vm.List) error {
-		names, err := p.GetLiveMigrationVMs(l, vms, cachedCluster.CreatedAt)
+	clusterErr := vm.Providers.FanOut(cachedCluster.VMs, func(client vm.ProviderClient, vms vm.List) error {
+		names, err := client.GetLiveMigrationVMs(l, vms, cachedCluster.CreatedAt)
 		if err != nil {
 			return err
 		}

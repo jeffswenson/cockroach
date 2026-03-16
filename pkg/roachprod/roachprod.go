@@ -46,7 +46,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/aws"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/azure"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/flagstub"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/gce"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/ibm"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/local"
@@ -313,7 +312,7 @@ func Sync(l *logger.Logger, options vm.ListOptions) (*cloud.Cloud, error) {
 	refreshDNS := true
 
 	gceProvider, gceOK := vm.Providers.Provider(gce.ProviderName)
-	if !gceOK || !gceProvider.Active() {
+	if !gceOK || !vm.Providers.Active(gce.ProviderName) {
 		refreshDNS = false
 	} else {
 		var defaultProjectFound bool
@@ -334,8 +333,7 @@ func Sync(l *logger.Logger, options vm.ListOptions) (*cloud.Cloud, error) {
 	} else {
 		// If any of the required providers is not active, we shouldn't refresh DNS.
 		for _, name := range config.DNSRequiredProviders {
-			p, ok := vm.Providers.Provider(name)
-			if !ok || !p.Active() {
+			if !vm.Providers.Active(name) {
 				refreshDNS = false
 				break
 			}
@@ -357,7 +355,12 @@ func Sync(l *logger.Logger, options vm.ListOptions) (*cloud.Cloud, error) {
 	}
 
 	for _, p := range vm.Providers.AllProviders() {
-		if err := p.CleanSSH(l); err != nil {
+		client, err := vm.Providers.Client(p.Name())
+		if err != nil {
+			l.Printf("WARN: provider=%q init failed, skipping CleanSSH: %s", p.Name(), err)
+			continue
+		}
+		if err := client.CleanSSH(l); err != nil {
 			return nil, err
 		}
 	}
@@ -665,21 +668,21 @@ func SetupSSH(ctx context.Context, l *logger.Logger, clusterName string, sync bo
 	for _, vm := range cloudCluster.VMs {
 		zones[vm.Provider] = append(zones[vm.Provider], vm.Zone)
 	}
-	providers := make([]string, 0)
-	for provider := range zones {
-		providers = append(providers, provider)
-	}
 
 	// Configure SSH for machines in the zones we operate on.
-	for _, providerName := range providers {
-		if err := vm.ForProvider(providerName, func(p vm.Provider) error {
+	for provider, providerZones := range zones {
+		if err := func() error {
+			client, err := vm.Providers.Client(provider)
+			if err != nil {
+				return err
+			}
 			unlock, lockErr := lock.AcquireFilesystemLock(config.DefaultLockPath)
 			if lockErr != nil {
 				return lockErr
 			}
 			defer unlock()
-			return p.ConfigSSH(l, zones[p.Name()])
-		}); err != nil {
+			return client.ConfigSSH(l, providerZones)
+		}(); err != nil {
 			return err
 		}
 	}
@@ -1665,8 +1668,8 @@ func AddLabels(l *logger.Logger, clusterName string, labels map[string]string) e
 		return err
 	}
 
-	err = vm.Providers.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
-		return p.AddLabels(l, vms, labels)
+	err = vm.Providers.FanOut(c.VMs, func(client vm.ProviderClient, vms vm.List) error {
+		return client.AddLabels(l, vms, labels)
 	})
 	if err != nil {
 		return err
@@ -1694,8 +1697,8 @@ func RemoveLabels(l *logger.Logger, clusterName string, labels []string) error {
 		return err
 	}
 
-	err = vm.Providers.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
-		return p.RemoveLabels(l, vms, labels)
+	err = vm.Providers.FanOut(c.VMs, func(client vm.ProviderClient, vms vm.List) error {
+		return client.RemoveLabels(l, vms, labels)
 	})
 	if err != nil {
 		return err
@@ -2011,58 +2014,95 @@ var disabledProviders = func() map[string]struct{} {
 	return disabled
 }()
 
-// InitProviders initializes providers and returns a map that indicates
-// if a provider is active or inactive.
-func InitProviders() map[string]string {
-	providersState := make(map[string]string)
+// providerDef defines a provider and how to create it. NewClient is
+// part of the Provider interface; expensive init happens lazily.
+type providerDef struct {
+	name        string
+	newProvider func() (vm.Provider, error)
+}
 
-	for _, prov := range []struct {
-		name  string
-		init  func() error
-		empty vm.Provider
-	}{
-		{
-			name:  aws.ProviderName,
-			init:  aws.Init,
-			empty: &aws.Provider{},
+var providerDefs = []providerDef{
+	{
+		name: aws.ProviderName,
+		newProvider: func() (vm.Provider, error) {
+			return aws.NewProvider()
 		},
-		{
-			name:  gce.ProviderName,
-			init:  gce.Init,
-			empty: &gce.Provider{},
+	},
+	{
+		name: gce.ProviderName,
+		newProvider: func() (vm.Provider, error) {
+			gce.InitGCEProjectDefaults()
+			gce.InitDNSDefault()
+			var opts []gce.Option
+			if proj := os.Getenv("GCE_PROJECT"); proj != "" {
+				fmt.Printf("WARN: `GCE_PROJECT` is deprecated; please, use `ROACHPROD_GCE_DEFAULT_PROJECT` instead\n")
+				opts = append(opts, gce.WithProject(proj))
+			}
+			p, err := gce.NewProvider(opts...)
+			if err != nil {
+				return nil, err
+			}
+			// Register DNS provider immediately (cheap).
+			vm.DNSProviders[p.GetDNSProvider().ProviderName()] = p.GetDNSProvider()
+			return p, nil
 		},
-		{
-			name:  azure.ProviderName,
-			init:  azure.Init,
-			empty: &azure.Provider{},
+	},
+	{
+		name: azure.ProviderName,
+		newProvider: func() (vm.Provider, error) {
+			return azure.NewProvider(azure.WithOperationTimeout(10*time.Minute), azure.WithSyncDelete(false))
 		},
-		{
-			name:  ibm.ProviderName,
-			init:  ibm.Init,
-			empty: &ibm.Provider{},
+	},
+	{
+		name: ibm.ProviderName,
+		newProvider: func() (vm.Provider, error) {
+			return &ibm.Provider{}, nil
 		},
-		{
-			name: local.ProviderName,
-			init: func() error {
-				return local.Init(localVMStorage{})
-			},
-			empty: &local.Provider{},
+	},
+	{
+		name: local.ProviderName,
+		newProvider: func() (vm.Provider, error) {
+			p := local.NewProvider(localVMStorage{})
+			// Local provider init is cheap; register DNS immediately.
+			vm.DNSProviders[local.ProviderName] = p.GetDNSProvider()
+			return p, nil
 		},
-	} {
-		if _, dis := disabledProviders[prov.name]; dis {
-			reason := "disabled via ROACHPROD_DISABLED_PROVIDERS"
-			providersState[prov.name] = "Inactive - " + reason
-			// We need an empty provider that emits errors or we'll
-			// crash as roachprod expects all providers to be present.
-			vm.Providers.Register(flagstub.New(prov.empty, reason))
-		} else if err := prov.init(); err != nil {
-			providersState[prov.name] = "Inactive - " + err.Error()
-		} else {
-			providersState[prov.name] = "Active"
+	},
+}
+
+// RegisterProviders performs cheap registration of all providers.
+// Expensive validation (CLI checks, auth, SDK clients) is deferred
+// to lazy init on first Client() call.
+func RegisterProviders() {
+	for _, def := range providerDefs {
+		p, err := def.newProvider()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: provider %q registration failed: %s\n", def.name, err)
+			continue
+		}
+		vm.Providers.Register(p)
+		if _, dis := disabledProviders[def.name]; dis {
+			vm.Providers.SetDisabled(def.name, "disabled via ROACHPROD_DISABLED_PROVIDERS")
 		}
 	}
+}
 
-	return providersState
+// InitProviders initializes providers and returns a map that indicates
+// if a provider is active or inactive. This calls RegisterProviders then
+// eagerly initializes all providers. Used by roachtest, drtprod, and
+// other callers that need all providers ready upfront.
+func InitProviders() map[string]string {
+	RegisterProviders()
+	result := make(map[string]string)
+	for _, p := range vm.Providers.AllProviders() {
+		_, err := vm.Providers.Client(p.Name())
+		if err != nil {
+			result[p.Name()] = "Inactive - " + err.Error()
+		} else {
+			result[p.Name()] = "Active"
+		}
+	}
+	return result
 }
 
 // StartPyroscope deploys and starts the Pyroscope profiling stack on a node.
@@ -2373,8 +2413,8 @@ func CreateSnapshot(
 				labels[k] = v
 			}
 
-			if err := vm.ForProvider(cVM.Provider, func(provider vm.Provider) error {
-				volumes, err := provider.ListVolumes(l, &cVM)
+			if err := vm.ForProvider(cVM.Provider, func(client vm.ProviderClient) error {
+				volumes, err := client.ListVolumes(l, &cVM)
 				if err != nil {
 					return err
 				}
@@ -2390,7 +2430,7 @@ func CreateSnapshot(
 					if len(snapshotName) > 63 {
 						return fmt.Errorf("snapshot name %q exceeds 63 characters; shorten name prefix and use description arg. for more context", snapshotName)
 					}
-					volumeSnapshot, err := provider.CreateVolumeSnapshot(l, volume,
+					volumeSnapshot, err := client.CreateVolumeSnapshot(l, volume,
 						vm.VolumeSnapshotCreateOpts{
 							Name:        snapshotName,
 							Labels:      labels,
@@ -2422,9 +2462,9 @@ func ListSnapshots(
 	ctx context.Context, l *logger.Logger, provider string, vslo vm.VolumeSnapshotListOpts,
 ) ([]vm.VolumeSnapshot, error) {
 	var volumeSnapshots []vm.VolumeSnapshot
-	if err := vm.ForProvider(provider, func(provider vm.Provider) error {
+	if err := vm.ForProvider(provider, func(client vm.ProviderClient) error {
 		var err error
-		volumeSnapshots, err = provider.ListVolumeSnapshots(l, vslo)
+		volumeSnapshots, err = client.ListVolumeSnapshots(l, vslo)
 		return err
 	}); err != nil {
 		return nil, err
@@ -2435,8 +2475,8 @@ func ListSnapshots(
 func DeleteSnapshots(
 	ctx context.Context, l *logger.Logger, provider string, snapshots ...vm.VolumeSnapshot,
 ) error {
-	return vm.ForProvider(provider, func(provider vm.Provider) error {
-		return provider.DeleteVolumeSnapshots(l, snapshots...)
+	return vm.ForProvider(provider, func(client vm.ProviderClient) error {
+		return client.DeleteVolumeSnapshots(l, snapshots...)
 	})
 }
 
@@ -2463,13 +2503,13 @@ func ApplySnapshots(
 			res := &install.RunResultDetails{Node: node}
 
 			cVM := &c.VMs[node-1]
-			if err := vm.ForProvider(cVM.Provider, func(provider vm.Provider) error {
-				volumes, err := provider.ListVolumes(l, cVM)
+			if err := vm.ForProvider(cVM.Provider, func(client vm.ProviderClient) error {
+				volumes, err := client.ListVolumes(l, cVM)
 				if err != nil {
 					return err
 				}
 				for _, volume := range volumes {
-					if err := provider.DeleteVolume(l, volume, cVM); err != nil {
+					if err := client.DeleteVolume(l, volume, cVM); err != nil {
 						return err
 					}
 					l.Printf("detached and deleted volume %s from %s", volume.ProviderResourceID, cVM.Name)
@@ -2495,14 +2535,14 @@ func ApplySnapshots(
 
 			// TODO: same issue as above if the target nodes are not sequential starting from 1
 			cVM := &c.VMs[node-1]
-			if err := vm.ForProvider(cVM.Provider, func(provider vm.Provider) error {
+			if err := vm.ForProvider(cVM.Provider, func(client vm.ProviderClient) error {
 				volumeOpts.Zone = cVM.Zone
 				// NB: The "-1" signifies that it's the first attached non-boot volume.
 				// This is typical naming convention in GCE clusters.
 				volumeOpts.Name = fmt.Sprintf("%s-%04d-1", clusterName, node)
 				volumeOpts.SourceSnapshotID = snapshots[node-1].ID
 
-				volumes, err := provider.ListVolumes(l, cVM)
+				volumes, err := client.ListVolumes(l, cVM)
 				if err != nil {
 					return err
 				}
@@ -2520,7 +2560,7 @@ func ApplySnapshots(
 				volumeOpts.Labels[vm.TagCreated] = strings.ToLower(
 					strings.ReplaceAll(timeutil.Now().Format(time.RFC3339), ":", "_")) // format according to gce label naming requirements
 
-				volume, err := provider.CreateVolume(l, volumeOpts)
+				volume, err := client.CreateVolume(l, volumeOpts)
 				if err != nil {
 					return err
 				}
@@ -2967,7 +3007,7 @@ func createAttachMountVolumes(
 		curNode := nodes[idx : idx+1]
 
 		cVM := &c.VMs[n-1]
-		err := vm.ForProvider(cVM.Provider, func(provider vm.Provider) error {
+		err := vm.ForProvider(cVM.Provider, func(client vm.ProviderClient) error {
 			opts.Name = fmt.Sprintf("%s-n%d", c.Name, n)
 			for _, vol := range cVM.NonBootAttachedVolumes {
 				if vol.Name == opts.Name {
@@ -2978,7 +3018,7 @@ func createAttachMountVolumes(
 			}
 			opts.Zone = cVM.Zone
 
-			volume, err := provider.CreateVolume(l, opts)
+			volume, err := client.CreateVolume(l, opts)
 			if err != nil {
 				return err
 			}
@@ -3050,11 +3090,11 @@ func CreateLoadBalancer(
 	}
 
 	// Create a load balancer for the service's port.
-	err = vm.Providers.FanOut(c.VMs, func(provider vm.Provider, vms vm.List) error {
-		createErr := provider.CreateLoadBalancer(l, vms, port)
+	err = vm.Providers.FanOut(c.VMs, func(client vm.ProviderClient, vms vm.List) error {
+		createErr := client.CreateLoadBalancer(l, vms, port)
 		if createErr != nil {
 			l.Errorf("Cleaning up partially-created load balancer (prev err: %s)", createErr)
-			cleanupErr := provider.DeleteLoadBalancer(l, vms, port)
+			cleanupErr := client.DeleteLoadBalancer(l, vms, port)
 			if cleanupErr != nil {
 				l.Errorf("Error while cleaning up partially-created load balancer: %s", cleanupErr)
 			} else {
@@ -3147,8 +3187,8 @@ func DeleteLoadBalancer(l *logger.Logger, clusterName string) error {
 	}
 
 	// Delete all load balancers for the cluster (port=0 means delete all).
-	return vm.Providers.FanOut(c.VMs, func(provider vm.Provider, vms vm.List) error {
-		return provider.DeleteLoadBalancer(l, vms, 0)
+	return vm.Providers.FanOut(c.VMs, func(client vm.ProviderClient, vms vm.List) error {
+		return client.DeleteLoadBalancer(l, vms, 0)
 	})
 }
 
