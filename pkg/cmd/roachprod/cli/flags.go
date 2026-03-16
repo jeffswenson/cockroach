@@ -161,9 +161,7 @@ func initCreateCmdFlags(createCmd *cobra.Command) {
 		"os-volume-size", "", 10, "OS disk volume size in GB")
 	createCmd.Flags().StringSliceVarP(&createVMOpts.VMProviders,
 		"clouds", "c", []string{gce.ProviderName},
-		fmt.Sprintf(
-			"The cloud provider(s) to use when creating new vm instances: %s",
-			vm.AllProviderNames()))
+		"The cloud provider(s) to use when creating new vm instances")
 	createCmd.Flags().BoolVar(&createVMOpts.GeoDistributed,
 		"geo", false, "Create geo-distributed cluster")
 	createCmd.Flags().StringVar(&createVMOpts.Arch, "arch", "",
@@ -178,10 +176,9 @@ func initCreateCmdFlags(createCmd *cobra.Command) {
 			"international characters. Examples: usage=cloud-report-2021, namewithspaceinvalue='s o s'")
 
 	// Allow each Provider to inject additional configuration flags
-	for _, providerName := range vm.AllProviderNames() {
-		provider := vm.Providers[providerName]
+	for _, provider := range vm.Providers.AllProviders() {
 		if provider.Active() {
-			providerOptsContainer[providerName].ConfigureCreateFlags(createCmd.Flags())
+			providerOptsContainer[provider.Name()].ConfigureCreateFlags(createCmd.Flags())
 			// createCmd only accepts a single GCE project, as opposed to all the other
 			// commands.
 			provider.ConfigureProviderFlags(createCmd.Flags(), vm.SingleProject)
@@ -192,8 +189,7 @@ func initCreateCmdFlags(createCmd *cobra.Command) {
 func initClusterFlagsForMultiProjects(
 	rootCmd *cobra.Command, excludeFromClusterFlagsMulti []*cobra.Command,
 ) {
-	for _, providerName := range vm.AllProviderNames() {
-		provider := vm.Providers[providerName]
+	for _, provider := range vm.Providers.AllProviders() {
 		if provider.Active() {
 			for _, cmd := range rootCmd.Commands() {
 				excludeCmd := false
@@ -417,7 +413,7 @@ func initGCCmdFlags(gcCmd *cobra.Command) {
 		"dry-run", "n", dryrun, "dry run (don't perform any actions)")
 	gcCmd.Flags().StringVar(&config.SlackToken, "slack-token", "", "Slack bot token")
 	// Allow each Provider to inject additional configuration flags
-	for _, provider := range vm.Providers {
+	for _, provider := range vm.Providers.AllProviders() {
 		if provider.Active() {
 			provider.ConfigureClusterCleanupFlags(gcCmd.Flags())
 		}

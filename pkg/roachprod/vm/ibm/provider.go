@@ -163,18 +163,18 @@ func Init() (err error) {
 	}
 
 	if !hasCliOrEnv() {
-		vm.Providers[ProviderName] = flagstub.New(&Provider{}, ErrMissingAuth.Error())
+		vm.Providers.Register(flagstub.New(&Provider{}, ErrMissingAuth.Error()))
 		return err
 	}
 
 	providerInstance, err = NewProvider()
 	if err != nil {
 		fmt.Printf("failed to create IBM provider: %v\n", err)
-		vm.Providers[ProviderName] = flagstub.New(&Provider{}, err.Error())
+		vm.Providers.Register(flagstub.New(&Provider{}, err.Error()))
 		return nil
 	}
 
-	vm.Providers[ProviderName] = providerInstance
+	vm.Providers.Register(providerInstance)
 
 	return nil
 }

@@ -337,7 +337,7 @@ func gc(l *logger.Logger, dryrun bool) error {
 	}()
 
 	cld, _ := ListCloud(l, vm.ListOptions{IncludeEmptyClusters: true, IncludeProviders: []string{rochprodaws.ProviderName}})
-	err := GCClusters(l, cld, dryrun)
+	err := cld.GCClusters(l, dryrun)
 	combinedError = errors.CombineErrors(combinedError, err)
 
 	wg.Wait()
@@ -394,9 +394,12 @@ func stsCredentials(roleArn, roleSessionName, region string) (func(), error) {
 
 // GCAWS garbage collects expired clusters, unused SSH keys for a single or multiple AWS accounts
 func GCAWS(l *logger.Logger, dryrun bool) error {
-	provider := vm.Providers[rochprodaws.ProviderName]
+	raw, ok := vm.Providers.Provider(rochprodaws.ProviderName)
+	if !ok {
+		return errors.Newf("provider %q not registered", rochprodaws.ProviderName)
+	}
 	var awsAccountIDs []string
-	if awsProviderInstance, ok := provider.(*rochprodaws.Provider); ok {
+	if awsProviderInstance, ok := raw.(*rochprodaws.Provider); ok {
 		awsAccountIDs = awsProviderInstance.AccountIDs
 	}
 

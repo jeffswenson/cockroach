@@ -312,11 +312,12 @@ func Sync(l *logger.Logger, options vm.ListOptions) (*cloud.Cloud, error) {
 	// default project).
 	refreshDNS := true
 
-	if p := vm.Providers[gce.ProviderName]; !p.Active() {
+	gceProvider, gceOK := vm.Providers.Provider(gce.ProviderName)
+	if !gceOK || !gceProvider.Active() {
 		refreshDNS = false
 	} else {
 		var defaultProjectFound bool
-		for _, prj := range p.(*gce.Provider).GetProjects() {
+		for _, prj := range gceProvider.(*gce.Provider).GetProjects() {
 			if prj == gce.DefaultProject() {
 				defaultProjectFound = true
 				break
@@ -332,8 +333,9 @@ func Sync(l *logger.Logger, options vm.ListOptions) (*cloud.Cloud, error) {
 		refreshDNS = false
 	} else {
 		// If any of the required providers is not active, we shouldn't refresh DNS.
-		for _, p := range config.DNSRequiredProviders {
-			if !vm.Providers[p].Active() {
+		for _, name := range config.DNSRequiredProviders {
+			p, ok := vm.Providers.Provider(name)
+			if !ok || !p.Active() {
 				refreshDNS = false
 				break
 			}
@@ -354,10 +356,10 @@ func Sync(l *logger.Logger, options vm.ListOptions) (*cloud.Cloud, error) {
 		}
 	}
 
-	if err := vm.ProvidersSequential(vm.AllProviderNames(), func(p vm.Provider) error {
-		return p.CleanSSH(l)
-	}); err != nil {
-		return nil, err
+	for _, p := range vm.Providers.AllProviders() {
+		if err := p.CleanSSH(l); err != nil {
+			return nil, err
+		}
 	}
 
 	return cld, nil
@@ -669,15 +671,17 @@ func SetupSSH(ctx context.Context, l *logger.Logger, clusterName string, sync bo
 	}
 
 	// Configure SSH for machines in the zones we operate on.
-	if err := vm.ProvidersSequential(providers, func(p vm.Provider) error {
-		unlock, lockErr := lock.AcquireFilesystemLock(config.DefaultLockPath)
-		if lockErr != nil {
-			return lockErr
+	for _, providerName := range providers {
+		if err := vm.ForProvider(providerName, func(p vm.Provider) error {
+			unlock, lockErr := lock.AcquireFilesystemLock(config.DefaultLockPath)
+			if lockErr != nil {
+				return lockErr
+			}
+			defer unlock()
+			return p.ConfigSSH(l, zones[p.Name()])
+		}); err != nil {
+			return err
 		}
-		defer unlock()
-		return p.ConfigSSH(l, zones[p.Name()])
-	}); err != nil {
-		return err
 	}
 
 	if err := cloudCluster.PrintDetails(l); err != nil {
@@ -1661,7 +1665,7 @@ func AddLabels(l *logger.Logger, clusterName string, labels map[string]string) e
 		return err
 	}
 
-	err = vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
+	err = vm.Providers.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
 		return p.AddLabels(l, vms, labels)
 	})
 	if err != nil {
@@ -1690,7 +1694,7 @@ func RemoveLabels(l *logger.Logger, clusterName string, labels []string) error {
 		return err
 	}
 
-	err = vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
+	err = vm.Providers.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
 		return p.RemoveLabels(l, vms, labels)
 	})
 	if err != nil {
@@ -1942,7 +1946,7 @@ func GC(l *logger.Logger, dryrun bool) error {
 	// the clusters we do have.
 	cld, _ := cloud.ListCloud(l, vm.ListOptions{IncludeEmptyClusters: true, IncludeProviders: []string{gce.ProviderName}})
 	addOpFn(func() error {
-		return cloud.GCClusters(l, cld, dryrun)
+		return cld.GCClusters(l, dryrun)
 	})
 	addOpFn(func() error {
 		return cloud.GCDNS(l, cld, dryrun)
@@ -2050,7 +2054,7 @@ func InitProviders() map[string]string {
 			providersState[prov.name] = "Inactive - " + reason
 			// We need an empty provider that emits errors or we'll
 			// crash as roachprod expects all providers to be present.
-			vm.Providers[prov.name] = flagstub.New(prov.empty, reason)
+			vm.Providers.Register(flagstub.New(prov.empty, reason))
 		} else if err := prov.init(); err != nil {
 			providersState[prov.name] = "Inactive - " + err.Error()
 		} else {
@@ -3046,7 +3050,7 @@ func CreateLoadBalancer(
 	}
 
 	// Create a load balancer for the service's port.
-	err = vm.FanOut(c.VMs, func(provider vm.Provider, vms vm.List) error {
+	err = vm.Providers.FanOut(c.VMs, func(provider vm.Provider, vms vm.List) error {
 		createErr := provider.CreateLoadBalancer(l, vms, port)
 		if createErr != nil {
 			l.Errorf("Cleaning up partially-created load balancer (prev err: %s)", createErr)
@@ -3143,7 +3147,7 @@ func DeleteLoadBalancer(l *logger.Logger, clusterName string) error {
 	}
 
 	// Delete all load balancers for the cluster (port=0 means delete all).
-	return vm.FanOut(c.VMs, func(provider vm.Provider, vms vm.List) error {
+	return vm.Providers.FanOut(c.VMs, func(provider vm.Provider, vms vm.List) error {
 		return provider.DeleteLoadBalancer(l, vms, 0)
 	})
 }

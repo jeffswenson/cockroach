@@ -129,7 +129,7 @@ func deleteCluster(name string) error {
 // another project was in use.
 func shouldIgnoreCluster(c *cloudcluster.Cluster) bool {
 	for i := range c.VMs {
-		provider, ok := vm.Providers[c.VMs[i].Provider]
+		provider, ok := vm.Providers.Provider(c.VMs[i].Provider)
 		if !ok || !provider.ProjectActive(c.VMs[i].Project) {
 			return true
 		}

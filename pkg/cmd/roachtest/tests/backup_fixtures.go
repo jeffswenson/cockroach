@@ -574,7 +574,8 @@ func GetFixtureRegistry(ctx context.Context, t test.Test, cloud spec.Cloud) *blo
 			RawQuery: "AUTH=implicit&AZURE_ACCOUNT_NAME=roachtest",
 		}
 	case spec.GCE, spec.Local:
-		account, err := vm.Providers["gce"].FindActiveAccount(t.L())
+		gceProvider, _ := vm.Providers.Provider("gce")
+		account, err := gceProvider.FindActiveAccount(t.L())
 		require.NoError(t, err)
 		t.L().Printf("using GCE account %s", account)
 

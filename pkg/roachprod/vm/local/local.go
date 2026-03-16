@@ -57,7 +57,7 @@ func Init(storage VMStorage) error {
 		storage:     storage,
 		dnsProvider: NewDNSProvider(config.DNSDir, "local-zone"),
 	}
-	vm.Providers[ProviderName] = p
+	vm.Providers.Register(p)
 	vm.DNSProviders[ProviderName] = p.dnsProvider
 	return nil
 }
@@ -65,14 +65,16 @@ func Init(storage VMStorage) error {
 // AddCluster adds the metadata of a local cluster; used when loading the saved
 // metadata for local clusters.
 func AddCluster(cluster *cloudcluster.Cluster) {
-	p := vm.Providers[ProviderName].(*Provider)
+	raw, _ := vm.Providers.Provider(ProviderName)
+	p := raw.(*Provider)
 	p.clusters[cluster.Name] = cluster
 }
 
 // DeleteCluster destroys a local cluster. It assumes that the cockroach
 // processes are stopped.
 func DeleteCluster(l *logger.Logger, name string) error {
-	p := vm.Providers[ProviderName].(*Provider)
+	raw, _ := vm.Providers.Provider(ProviderName)
+	p := raw.(*Provider)
 	c := p.clusters[name]
 	if c == nil {
 		return fmt.Errorf("local cluster %s does not exist", name)
@@ -100,7 +102,8 @@ func DeleteCluster(l *logger.Logger, name string) error {
 
 // Clusters returns a list of all known local clusters.
 func Clusters() []string {
-	p := vm.Providers[ProviderName].(*Provider)
+	raw, _ := vm.Providers.Provider(ProviderName)
+	p := raw.(*Provider)
 	return p.clusters.Names()
 }
 

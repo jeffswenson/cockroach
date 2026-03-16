@@ -104,8 +104,10 @@ func initGCEProjectDefaults() {
 func DefaultProject() string {
 	// If the provider was already initialized, read the default project from the
 	// provider.
-	if p, ok := vm.Providers[ProviderName].(*Provider); ok {
-		return p.defaultProject
+	if raw, ok := vm.Providers.Provider(ProviderName); ok {
+		if p, _ := raw.(*Provider); p != nil {
+			return p.defaultProject
+		}
 	}
 	return defaultDefaultProject
 }
@@ -134,21 +136,21 @@ func Init() error {
 	// Init the default provider
 	providerInstance, err := NewProvider(providerOpts...)
 	if err != nil {
-		vm.Providers[ProviderName] = flagstub.New(
+		vm.Providers.Register(flagstub.New(
 			&Provider{},
 			fmt.Sprintf("unable to init gce provider: %s", err),
-		)
+		))
 		return err
 	}
 
 	if _, err := exec.LookPath("gcloud"); err != nil {
-		vm.Providers[ProviderName] = flagstub.New(&Provider{}, "please install the gcloud CLI utilities "+
-			"(https://cloud.google.com/sdk/downloads)")
+		vm.Providers.Register(flagstub.New(&Provider{}, "please install the gcloud CLI utilities "+
+			"(https://cloud.google.com/sdk/downloads)"))
 		return errors.New("gcloud not found")
 	}
 
 	initialized = true
-	vm.Providers[ProviderName] = providerInstance
+	vm.Providers.Register(providerInstance)
 	vm.DNSProviders[providerInstance.dnsProvider.ProviderName()] = providerInstance.dnsProvider
 	Infrastructure = providerInstance
 

@@ -64,10 +64,10 @@ func Init() error {
 
 	providerInstance, err := NewProvider(WithOperationTimeout(10*time.Minute), WithSyncDelete(false))
 	if err != nil {
-		vm.Providers[ProviderName] = flagstub.New(
+		vm.Providers.Register(flagstub.New(
 			&Provider{},
 			fmt.Sprintf("unable to init azure provider: %s", err),
-		)
+		))
 		return err
 	}
 
@@ -75,15 +75,15 @@ func Init() error {
 	// then the authenticated CLI must be installed.
 	if !hasEnvAuth {
 		if _, err := exec.LookPath("az"); err != nil {
-			vm.Providers[ProviderName] = flagstub.New(&Provider{}, cliErr)
+			vm.Providers.Register(flagstub.New(&Provider{}, cliErr))
 			return err
 		}
 	}
 	if _, err := providerInstance.getAuthToken(); err != nil {
-		vm.Providers[ProviderName] = flagstub.New(&Provider{}, authErr)
+		vm.Providers.Register(flagstub.New(&Provider{}, authErr))
 		return err
 	}
-	vm.Providers[ProviderName] = providerInstance
+	vm.Providers.Register(providerInstance)
 	return nil
 }
 

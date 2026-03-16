@@ -1456,7 +1456,7 @@ func (c *clusterImpl) FetchVMSpecs(ctx context.Context, l *logger.Logger) error 
 		providerToVMs := bucketVMsByProvider(cachedCluster)
 
 		for provider, vms := range providerToVMs {
-			p := vm.Providers[provider]
+			p, _ := vm.Providers.Provider(provider)
 			vmSpecs, err := p.GetVMSpecs(l, vms)
 			if err != nil {
 				l.Errorf("failed to get VM spec for provider %s: %s", provider, err)
@@ -3337,7 +3337,7 @@ func (c *clusterImpl) GetPreemptedVMs(
 
 	var allPreemptedVMs []vm.PreemptedVM
 	for provider, vms := range providerToVMs {
-		p := vm.Providers[provider]
+		p, _ := vm.Providers.Provider(provider)
 		if p.SupportsSpotVMs() {
 			preemptedVMS, err := p.GetPreemptedSpotVMs(l, vms, cachedCluster.CreatedAt)
 			if err != nil {
@@ -3364,7 +3364,7 @@ func (c *clusterImpl) GetHostErrorVMs(ctx context.Context, l *logger.Logger) ([]
 
 	var allHostErrorVMs []string
 	for provider, vms := range providerToVMs {
-		p := vm.Providers[provider]
+		p, _ := vm.Providers.Provider(provider)
 		hostErrorVMS, err := p.GetHostErrorVMs(l, vms, cachedCluster.CreatedAt)
 		if err != nil {
 			l.Errorf("failed to get hostError VMs for provider %s: %s", provider, err)
@@ -3388,7 +3388,7 @@ func (c *clusterImpl) GetLiveMigrationVMs(l *logger.Logger) ([]string, error) {
 		syncutil.Mutex
 		names []string
 	}
-	clusterErr := vm.FanOut(cachedCluster.VMs, func(p vm.Provider, vms vm.List) error {
+	clusterErr := vm.Providers.FanOut(cachedCluster.VMs, func(p vm.Provider, vms vm.List) error {
 		names, err := p.GetLiveMigrationVMs(l, vms, cachedCluster.CreatedAt)
 		if err != nil {
 			return err

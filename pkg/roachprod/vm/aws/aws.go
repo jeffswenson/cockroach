@@ -75,10 +75,10 @@ func Init() error {
 
 	providerInstance, err := NewProvider()
 	if err != nil {
-		vm.Providers[ProviderName] = flagstub.New(
+		vm.Providers.Register(flagstub.New(
 			&Provider{},
 			fmt.Sprintf("unable to init aws provider: %s", err),
-		)
+		))
 		return errors.Wrap(err, "unable to init aws provider")
 	}
 
@@ -98,7 +98,7 @@ func Init() error {
 		return true
 	}
 	if !haveRequiredVersion() {
-		vm.Providers[ProviderName] = flagstub.New(&Provider{}, unimplemented)
+		vm.Providers.Register(flagstub.New(&Provider{}, unimplemented))
 		return errors.New("doesn't have the required version")
 	}
 
@@ -133,10 +133,10 @@ func Init() error {
 		return true
 	}
 	if !haveCredentials() {
-		vm.Providers[ProviderName] = flagstub.New(&Provider{}, noCredentials)
+		vm.Providers.Register(flagstub.New(&Provider{}, noCredentials))
 		return errors.New("missing/invalid credentials")
 	}
-	vm.Providers[ProviderName] = providerInstance
+	vm.Providers.Register(providerInstance)
 	return nil
 }
 

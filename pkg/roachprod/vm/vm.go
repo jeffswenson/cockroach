@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 	"golang.org/x/sync/errgroup"
@@ -654,8 +655,88 @@ type DeleteCluster interface {
 	DeleteCluster(l *logger.Logger, name string) error
 }
 
-// Providers contains all known Provider instances. This is initialized by subpackage init() functions.
-var Providers = map[string]Provider{}
+// ProviderRegistry manages registered providers.
+type ProviderRegistry struct {
+	mu        syncutil.Mutex
+	providers map[string]Provider
+}
+
+// NewProviderRegistry creates an empty ProviderRegistry.
+func NewProviderRegistry() *ProviderRegistry {
+	return &ProviderRegistry{
+		providers: make(map[string]Provider),
+	}
+}
+
+// Register adds a provider to the registry.
+func (r *ProviderRegistry) Register(p Provider) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.providers[p.Name()] = p
+}
+
+// Provider returns the Provider for the given name.
+func (r *ProviderRegistry) Provider(name string) (Provider, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p, ok := r.providers[name]
+	return p, ok
+}
+
+// AllProviders returns all registered Providers.
+func (r *ProviderRegistry) AllProviders() []Provider {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ret := make([]Provider, 0, len(r.providers))
+	for _, p := range r.providers {
+		ret = append(ret, p)
+	}
+	return ret
+}
+
+// Filter returns a new ProviderRegistry containing only the named
+// providers. Returns an error if any name is not registered.
+func (r *ProviderRegistry) Filter(names ...string) (*ProviderRegistry, error) {
+	filtered := NewProviderRegistry()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, name := range names {
+		p, ok := r.providers[name]
+		if !ok {
+			return nil, errors.AssertionFailedf(
+				"provider %q not registered", name,
+			)
+		}
+		filtered.providers[name] = p
+	}
+	return filtered, nil
+}
+
+// FanOut collates a collection of VMs by their provider and invokes
+// the action in parallel.
+func (r *ProviderRegistry) FanOut(list List, action func(Provider, List) error) error {
+	var m = map[string]List{}
+	for _, vm := range list {
+		m[vm.Provider] = append(m[vm.Provider], vm)
+	}
+
+	var g errgroup.Group
+	for name, vms := range m {
+		g.Go(func() error {
+			p, ok := r.Provider(name)
+			if !ok {
+				return errors.Errorf("unknown provider name: %s", name)
+			}
+			return action(p, vms)
+		})
+	}
+
+	return g.Wait()
+}
+
+// Providers is the global provider registry populated during
+// InitProviders() and read after that.
+var Providers = NewProviderRegistry()
 
 // DNSProviders contains all known DNS providers.
 var DNSProviders = map[string]DNSProvider{}
@@ -665,11 +746,11 @@ type ProviderOptionsContainer map[string]ProviderOpts
 
 // CreateProviderOptionsContainer returns a ProviderOptionsContainer which is
 // populated with options for all registered providers. Only call it after
-// initiliazing providers (populating vm.Providers).
+// initializing providers (populating vm.Providers).
 func CreateProviderOptionsContainer() ProviderOptionsContainer {
 	container := make(ProviderOptionsContainer)
-	for providerName, providerInstance := range Providers {
-		container[providerName] = providerInstance.CreateProviderOpts()
+	for _, p := range Providers.AllProviders() {
+		container[p.Name()] = p.CreateProviderOpts()
 	}
 	return container
 }
@@ -680,37 +761,6 @@ func (container ProviderOptionsContainer) SetProviderOpts(
 	providerName string, providerOpts ProviderOpts,
 ) {
 	container[providerName] = providerOpts
-}
-
-// AllProviderNames returns the names of all known vm Providers.  This is useful with the
-// ProvidersSequential or ProvidersParallel methods.
-func AllProviderNames() []string {
-	var ret []string
-	for name := range Providers {
-		ret = append(ret, name)
-	}
-	return ret
-}
-
-// FanOut collates a collection of VMs by their provider and invoke the callbacks in parallel.
-func FanOut(list List, action func(Provider, List) error) error {
-	var m = map[string]List{}
-	for _, vm := range list {
-		m[vm.Provider] = append(m[vm.Provider], vm)
-	}
-
-	var g errgroup.Group
-	for name, vms := range m {
-		g.Go(func() error {
-			p, ok := Providers[name]
-			if !ok {
-				return errors.Errorf("unknown provider name: %s", name)
-			}
-			return action(p, vms)
-		})
-	}
-
-	return g.Wait()
 }
 
 // Memoizes return value from FindActiveAccounts.
@@ -724,20 +774,15 @@ func FindActiveAccounts(l *logger.Logger) (map[string]string, error) {
 	if source == nil {
 		// Ask each Provider for its active account name.
 		source = map[string]string{}
-		err := ProvidersSequential(AllProviderNames(), func(p Provider) error {
+		for _, p := range Providers.AllProviders() {
 			account, err := p.FindActiveAccount(l)
 			if err != nil {
 				l.Printf("WARN: provider=%q has no active account", p.Name())
-				//nolint:returnerrcheck
-				return nil
+				continue
 			}
 			if len(account) > 0 {
 				source[p.Name()] = account
 			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
 		}
 		cachedActiveAccounts = source
 	}
@@ -754,7 +799,7 @@ func FindActiveAccounts(l *logger.Logger) (map[string]string, error) {
 // ForProvider resolves the Provider with the given name and executes the
 // action.
 func ForProvider(named string, action func(Provider) error) error {
-	p, ok := Providers[named]
+	p, ok := Providers.Provider(named)
 	if !ok {
 		return errors.Errorf("unknown vm provider: %s", named)
 	}
@@ -769,20 +814,14 @@ func ProvidersParallel(named []string, action func(Provider) error) error {
 	var g errgroup.Group
 	for _, name := range named {
 		g.Go(func() error {
-			return ForProvider(name, action)
+			p, ok := Providers.Provider(name)
+			if !ok {
+				return errors.Errorf("unknown vm provider: %s", name)
+			}
+			return action(p)
 		})
 	}
 	return g.Wait()
-}
-
-// ProvidersSequential sequentially executes actions for each named Provider.
-func ProvidersSequential(named []string, action func(Provider) error) error {
-	for _, name := range named {
-		if err := ForProvider(name, action); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // ZonePlacement allocates zones to numNodes in an equally sized groups in the

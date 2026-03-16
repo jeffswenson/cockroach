@@ -35,9 +35,8 @@ type Cloud struct {
 	// are not part of any Cluster.
 	BadInstances vm.List `json:"bad_instances"`
 
-	// providers supported for this Cloud instance
-	centralizedProviders []vm.Provider
-	localProviders       []vm.Provider
+	// registry resolves providers. Defaults to vm.Providers.
+	registry *vm.ProviderRegistry
 }
 
 // BadInstanceErrors returns all bad VM instances, grouped by error message.
@@ -65,25 +64,18 @@ func (c *Cloud) BadInstanceErrors() map[string]vm.List {
 // ListCloud returns information about all instances (across all available
 // providers).
 func ListCloud(l *logger.Logger, options vm.ListOptions) (*Cloud, error) {
-
-	// Build the list of providers to use with the static func.
-	providers := []vm.Provider{}
-	providerNames := vm.AllProviderNames()
+	registry := vm.Providers
 	if len(options.IncludeProviders) > 0 {
-		providerNames = options.IncludeProviders
+		var err error
+		registry, err = vm.Providers.Filter(options.IncludeProviders...)
+		if err != nil {
+			return nil, err
+		}
 	}
-	for _, providerName := range providerNames {
-		providers = append(providers, vm.Providers[providerName])
-	}
-
-	// Init a new Cloud struct with the computed providers.
-	cloud := NewCloud(WithProviders(providers))
-
-	err := cloud.ListCloud(context.Background(), l, options)
-	if err != nil {
+	cloud := NewCloud(WithRegistry(registry))
+	if err := cloud.ListCloud(context.Background(), l, options); err != nil {
 		return nil, err
 	}
-
 	return cloud, nil
 }
 
@@ -91,6 +83,7 @@ func NewCloud(options ...Option) *Cloud {
 	c := &Cloud{
 		Clusters:     make(cloudcluster.Clusters),
 		BadInstances: vm.List{},
+		registry:     vm.Providers,
 	}
 	for _, o := range options {
 		o.apply(c)
@@ -108,29 +101,10 @@ type OptionFunc func(*Cloud)
 
 func (o OptionFunc) apply(c *Cloud) { o(c) }
 
-// WithProviders configures the Cloud with the given providers.
-func WithProviders(providers []vm.Provider) OptionFunc {
+// WithRegistry configures the Cloud with a specific ProviderRegistry.
+func WithRegistry(r *vm.ProviderRegistry) OptionFunc {
 	return func(c *Cloud) {
-		c.addProviders(providers)
-	}
-}
-
-// addProviders adds the given providers to the Cloud struct. Local providers
-// are added to the localProviders field, while remote providers are added to
-// the providers field.
-func (c *Cloud) addProviders(providers []vm.Provider) {
-	if c.centralizedProviders == nil {
-		c.centralizedProviders = []vm.Provider{}
-	}
-	if c.localProviders == nil {
-		c.localProviders = []vm.Provider{}
-	}
-	for _, p := range providers {
-		if p.IsCentralizedProvider() {
-			c.centralizedProviders = append(c.centralizedProviders, p)
-		} else {
-			c.localProviders = append(c.localProviders, p)
-		}
+		c.registry = r
 	}
 }
 
@@ -142,7 +116,7 @@ func (c *Cloud) ListCloud(ctx context.Context, l *logger.Logger, options vm.List
 	c.Clusters = make(cloudcluster.Clusters)
 	c.BadInstances = vm.List{}
 
-	providers := append(c.centralizedProviders, c.localProviders...)
+	providers := c.registry.AllProviders()
 
 	// List all VMs across all providers in parallel.
 	providerVMs := make(map[string]vm.List)
@@ -449,7 +423,7 @@ func DestroyCluster(l *logger.Logger, c *cloudcluster.Cluster) error {
 
 	stopSpinner = ui.NewDefaultSpinner(l, "Destroying VMs").Start()
 	// Allow both DNS and VM operations to run before returning any errors.
-	clusterErr := vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
+	clusterErr := vm.Providers.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
 		// Enable a fast-path for providers that can destroy a cluster in one shot.
 		if x, ok := p.(vm.DeleteCluster); ok {
 			return x.DeleteCluster(l, c.Name)
@@ -464,7 +438,7 @@ func DestroyCluster(l *logger.Logger, c *cloudcluster.Cluster) error {
 func ExtendCluster(l *logger.Logger, c *cloudcluster.Cluster, extension time.Duration) error {
 	// Round new lifetime to nearest second.
 	newLifetime := (c.Lifetime + extension).Round(time.Second)
-	err := vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
+	err := vm.Providers.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
 		return p.Extend(l, vms, newLifetime)
 	})
 	if err != nil {
@@ -472,4 +446,47 @@ func ExtendCluster(l *logger.Logger, c *cloudcluster.Cluster, extension time.Dur
 	}
 	c.Lifetime = newLifetime
 	return nil
+}
+
+// destroyCluster destroys a cluster using the Cloud's registry to
+// resolve providers.
+func (c *Cloud) destroyCluster(l *logger.Logger, cluster *cloudcluster.Cluster) error {
+	if err := cluster.DeletePrometheusConfig(context.Background(), l); err != nil {
+		l.Printf(
+			"WARNING: failed to delete the prometheus config (already wiped?): %s",
+			err,
+		)
+	}
+
+	stopSpinner := ui.NewDefaultSpinner(l, "Destroying DNS entries").Start()
+	publicRecords := make([]string, 0, len(cluster.VMs))
+	for _, v := range cluster.VMs {
+		publicRecords = append(publicRecords, v.PublicDNS)
+	}
+	dnsErr := vm.FanOutDNS(
+		cluster.VMs,
+		func(p vm.DNSProvider, vms vm.List) error {
+			publicRecordsErr := p.DeletePublicRecordsByName(
+				context.Background(), publicRecords...,
+			)
+			srvRecordsErr := p.DeleteSRVRecordsBySubdomain(
+				context.Background(), cluster.Name,
+			)
+			return errors.CombineErrors(publicRecordsErr, srvRecordsErr)
+		},
+	)
+	stopSpinner()
+
+	stopSpinner = ui.NewDefaultSpinner(l, "Destroying VMs").Start()
+	clusterErr := c.registry.FanOut(
+		cluster.VMs,
+		func(p vm.Provider, vms vm.List) error {
+			if x, ok := p.(vm.DeleteCluster); ok {
+				return x.DeleteCluster(l, cluster.Name)
+			}
+			return p.Delete(l, vms)
+		},
+	)
+	stopSpinner()
+	return errors.CombineErrors(dnsErr, clusterErr)
 }

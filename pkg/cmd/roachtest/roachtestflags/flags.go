@@ -641,7 +641,7 @@ func AddListFlags(cmdFlags *pflag.FlagSet) {
 // command flag set.
 func AddRunFlags(cmdFlags *pflag.FlagSet) {
 	globalMan.AddFlagsToCommand(runCmdID, cmdFlags)
-	for _, provider := range vm.Providers {
+	for _, provider := range vm.Providers.AllProviders() {
 		provider.ConfigureProviderFlags(cmdFlags, vm.SingleProject)
 	}
 }
