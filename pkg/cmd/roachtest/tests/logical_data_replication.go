@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/replicationtestutils"
@@ -179,6 +180,9 @@ func registerLogicalDataReplicationTests(r registry.Registry) {
 				},
 			},
 			run: TestLDRSchemaChange,
+			// disableMixedVersion because the set of allowed schema changes changed
+			// between 24.3 and 25.2.
+			disableMixedVersion: true,
 		},
 		{
 			name: "ldr/tpcc",
@@ -215,6 +219,8 @@ func registerLogicalDataReplicationTests(r registry.Registry) {
 				createTables:       true,
 			},
 			run: TestLDRCreateTablesTPCC,
+			// CREATE LOGICALLY REPLICATED TABLES is not supported on 24.3.
+			disableMixedVersion: true,
 		},
 	}
 
@@ -232,9 +238,10 @@ func registerLogicalDataReplicationTests(r registry.Registry) {
 				rng, seed := randutil.NewPseudoRand()
 				t.L().Printf("random seed is %d", seed)
 				mc := multiCluster{
-					c:    c,
-					rng:  rng,
-					spec: sp.clusterSpec,
+					c:                   c,
+					rng:                 rng,
+					spec:                sp.clusterSpec,
+					disableMixedVersion: sp.disableMixedVersion,
 				}
 				setup, cleanup := mc.Start(ctx, t)
 				defer cleanup()
@@ -688,10 +695,11 @@ func getLogicalDataReplicationJobInfo(db *gosql.DB, jobID int) (jobInfo, error) 
 }
 
 type ldrTestSpec struct {
-	name        string
-	clusterSpec multiClusterSpec
-	run         func(context.Context, test.Test, cluster.Cluster, multiClusterSetup, ldrConfig)
-	ldrConfig   ldrConfig
+	name                string
+	clusterSpec         multiClusterSpec
+	run                 func(context.Context, test.Test, cluster.Cluster, multiClusterSetup, ldrConfig)
+	ldrConfig           ldrConfig
+	disableMixedVersion bool
 }
 
 type mode int
@@ -745,9 +753,10 @@ func (mcs *multiClusterSpec) RightNodesList() option.NodeListOption {
 }
 
 type multiCluster struct {
-	spec multiClusterSpec
-	rng  *rand.Rand
-	c    cluster.Cluster
+	spec                multiClusterSpec
+	rng                 *rand.Rand
+	c                   cluster.Cluster
+	disableMixedVersion bool
 }
 
 type multiClusterSetup struct {
@@ -762,13 +771,17 @@ func (mcs *multiClusterSetup) CRDBNodes() option.NodeListOption {
 }
 
 func (mc *multiCluster) StartCluster(
-	ctx context.Context, t test.Test, desc string, nodes option.NodeListOption, initTarget int,
+	ctx context.Context,
+	t test.Test,
+	desc string,
+	nodes option.NodeListOption,
+	initTarget int,
+	settings install.ClusterSettings,
 ) (*clusterInfo, func()) {
 	startOps := option.NewStartOpts(option.NoBackupSchedule)
 	startOps.RoachprodOpts.InitTarget = initTarget
 	roachtestutil.SetDefaultAdminUIPort(mc.c, &startOps.RoachprodOpts)
-	clusterSettings := install.MakeClusterSettings()
-	mc.c.Start(ctx, t.L(), startOps, clusterSettings, nodes)
+	mc.c.Start(ctx, t.L(), startOps, settings, nodes)
 
 	node := nodes.SeededRandNode(mc.rng)
 
@@ -784,7 +797,7 @@ func (mc *multiCluster) StartCluster(
 
 	sqlRunner.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
 
-	pgURL, err := copyPGCertsAndMakeURL(ctx, t, mc.c, node, clusterSettings.PGUrlCertsDir, addr[0])
+	pgURL, err := copyPGCertsAndMakeURL(ctx, t, mc.c, node, settings.PGUrlCertsDir, addr[0])
 	require.NoError(t, err)
 
 	cleanup := func() {
@@ -814,8 +827,47 @@ func (mc *multiCluster) Start(ctx context.Context, t test.Test) (multiClusterSet
 	rightCluster := mc.c.Range(mc.spec.leftNodes+1, mc.spec.leftNodes+mc.spec.rightNodes)
 	workloadNode := mc.c.WorkloadNode()
 
-	left, cleanupLeft := mc.StartCluster(ctx, t, "left", leftCluster, mc.spec.LeftClusterStart())
-	right, cleanupRight := mc.StartCluster(ctx, t, "right", rightCluster, mc.spec.RightClusterStart())
+	leftSettings := install.MakeClusterSettings()
+	rightSettings := install.MakeClusterSettings()
+	leftVersion, rightVersion := "current", "current"
+
+	if !mc.disableMixedVersion {
+		predecessorVersion, err := clusterupgrade.RandomReplicationPeerVersion(mc.rng)
+		require.NoError(t, err)
+		predecessorStr := predecessorVersion.String()
+		switch mc.rng.Intn(2) {
+		case 0:
+			t.L().Printf("using predecessor version %s for left cluster", predecessorStr)
+			binaryPath, err := clusterupgrade.UploadCockroach(
+				ctx, t, t.L(), mc.c, leftCluster, predecessorVersion,
+			)
+			require.NoError(t, err)
+			leftSettings.Binary = binaryPath
+			leftVersion = predecessorStr
+		case 1:
+			t.L().Printf("using predecessor version %s for right cluster", predecessorStr)
+			binaryPath, err := clusterupgrade.UploadCockroach(
+				ctx, t, t.L(), mc.c, rightCluster, predecessorVersion,
+			)
+			require.NoError(t, err)
+			rightSettings.Binary = binaryPath
+			rightVersion = predecessorStr
+		default:
+			// Both clusters run the current version.
+		}
+	}
+
+	t.L().Printf(
+		"left cluster version: %s, right cluster version: %s",
+		leftVersion, rightVersion,
+	)
+
+	left, cleanupLeft := mc.StartCluster(
+		ctx, t, "left", leftCluster, mc.spec.LeftClusterStart(), leftSettings,
+	)
+	right, cleanupRight := mc.StartCluster(
+		ctx, t, "right", rightCluster, mc.spec.RightClusterStart(), rightSettings,
+	)
 
 	return multiClusterSetup{
 			workloadNode: workloadNode,

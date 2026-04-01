@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
@@ -103,6 +104,24 @@ func CurrentVersion() *Version {
 	}
 
 	return &Version{version.MustParse(build.BinaryVersion())}
+}
+
+// RandomReplicationPeerVersion returns the latest patch release for a
+// randomly selected supported previous major version. This is useful for
+// metamorphically running one side of a replication test on a predecessor
+// binary.
+func RandomReplicationPeerVersion(rng *rand.Rand) (*Version, error) {
+	supportedReleases := clusterversion.SupportedPreviousReleases()
+	if len(supportedReleases) == 0 {
+		return nil, errors.New("no supported previous releases found")
+	}
+	selectedRelease := supportedReleases[rng.Intn(len(supportedReleases))]
+	seriesStr := selectedRelease.ReleaseSeries().String()
+	predecessorStr, err := release.LatestPatch(seriesStr)
+	if err != nil {
+		return nil, errors.Wrapf(err, "getting latest patch for series %s", seriesStr)
+	}
+	return ParseVersion(predecessorStr)
 }
 
 // MustParseVersion parses the version string given (with or without
