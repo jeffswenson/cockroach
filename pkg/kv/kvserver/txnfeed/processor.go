@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
@@ -37,6 +38,16 @@ type Processor struct {
 	span       roachpb.RSpan
 	stopper    *stop.Stopper
 
+	// rts tracks unresolved transaction records and computes the resolved
+	// timestamp. Accessed under raftMu (the same lock that serializes calls to
+	// ConsumeTxnFeedOps and ForwardClosedTS).
+	rts resolvedTimestamp
+
+	// lastEmittedRTS is the last resolved timestamp that was emitted as a
+	// checkpoint. Used to avoid re-emitting the same resolved timestamp.
+	// Accessed under raftMu.
+	lastEmittedRTS hlc.Timestamp
+
 	mu struct {
 		syncutil.RWMutex
 		stopped bool
@@ -51,14 +62,33 @@ type Config struct {
 	Stopper *stop.Stopper
 }
 
-// NewProcessor creates a new TxnFeed Processor.
+// NewProcessor creates a new TxnFeed Processor. The processor's resolved
+// timestamp is not initialized until Init is called.
 func NewProcessor(cfg Config) *Processor {
 	p := &Processor{
 		ambientCtx: cfg.AmbientContext,
 		span:       cfg.Span,
 		stopper:    cfg.Stopper,
+		rts:        makeResolvedTimestamp(),
 	}
 	return p
+}
+
+// Init initializes the processor's resolved timestamp by scanning for
+// unresolved transaction records in the provided snapshot. Must be called
+// under raftMu before any registrations are added.
+func (p *Processor) Init(ctx context.Context, snap storage.Reader) error {
+	err := ScanUnresolvedTxnRecords(
+		ctx, snap, p.span.Key, p.span.EndKey,
+		func(txnID uuid.UUID, writeTS hlc.Timestamp) {
+			p.rts.txnQ.Add(txnID, writeTS)
+		},
+	)
+	if err != nil {
+		return err
+	}
+	p.rts.Init(ctx)
+	return nil
 }
 
 // Register registers a new TxnFeed stream for the specified anchor span.
@@ -67,7 +97,7 @@ func NewProcessor(cfg Config) *Processor {
 // exits, live events are delivered directly via Stream.SendBuffered.
 //
 // The caller must hold raftMu when calling Register to ensure that no
-// CommitTxnOps are missed between the catch-up scan snapshot and the
+// TxnFeedOps are missed between the catch-up scan snapshot and the
 // start of live event delivery.
 //
 // NB: startTS is exclusive; the first possible event will have an MVCC
@@ -81,7 +111,9 @@ func (p *Processor) Register(
 ) (Disconnector, error) {
 	if startTS.IsEmpty() {
 		// No catch-up scan needed — close the snapshot immediately.
-		snap.Close()
+		if snap != nil {
+			snap.Close()
+		}
 		snap = nil
 	}
 
@@ -132,58 +164,90 @@ func (p *Processor) addRegistration(
 	return reg, nil
 }
 
-// ConsumeCommitTxnOps delivers committed transaction ops from Raft apply to
-// all matching registrations. Called under raftMu.
+// ConsumeTxnFeedOps delivers transaction record lifecycle events from Raft
+// apply to the processor. Called under raftMu.
 //
-// If a registration's catch-up buffer is full, it is marked as overflowed and
-// will be disconnected once the catch-up scan goroutine finishes. After the
-// catch-up scan, events are sent via Stream.SendBuffered (non-blocking).
-func (p *Processor) ConsumeCommitTxnOps(ctx context.Context, ops *kvserverpb.CommitTxnOps) {
+// For COMMITTED ops, the event is forwarded to all matching registrations. For
+// RECORD_WRITTEN and ABORTED ops, the unresolved transaction record queue is
+// updated. If a registration's catch-up buffer is full, it is marked as
+// overflowed and will be disconnected once the catch-up scan goroutine finishes.
+func (p *Processor) ConsumeTxnFeedOps(ctx context.Context, ops *kvserverpb.TxnFeedOps) {
 	if ops == nil {
 		return
 	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	if p.mu.stopped || len(p.mu.regs) == 0 {
+	if p.mu.stopped {
 		return
 	}
 
 	for i := range ops.Ops {
 		op := &ops.Ops[i]
-		event := &kvpb.TxnFeedEvent{
-			Committed: &kvpb.TxnFeedCommitted{
-				TxnID:           op.TxnID,
-				AnchorKey:       op.AnchorKey,
-				CommitTimestamp: op.CommitTimestamp,
-				WriteSpans:      op.WriteSpans,
-				ReadSpans:       op.ReadSpans,
-			},
-		}
-		for _, reg := range p.mu.regs {
-			if !reg.containsKey(op.AnchorKey) {
+		switch op.Type {
+		case kvserverpb.TxnFeedOp_RECORD_WRITTEN:
+			p.rts.ConsumeRecordWritten(ctx, op.TxnID, op.WriteTimestamp)
+		case kvserverpb.TxnFeedOp_COMMITTED:
+			p.rts.ConsumeCommitted(ctx, op.TxnID)
+			if len(p.mu.regs) == 0 {
 				continue
 			}
-			reg.publish(event)
+			event := &kvpb.TxnFeedEvent{
+				Committed: &kvpb.TxnFeedCommitted{
+					TxnID:           op.TxnID,
+					AnchorKey:       op.AnchorKey,
+					CommitTimestamp: op.WriteTimestamp,
+					WriteSpans:      op.WriteSpans,
+					ReadSpans:       op.ReadSpans,
+				},
+			}
+			for _, reg := range p.mu.regs {
+				if !reg.containsKey(op.AnchorKey) {
+					continue
+				}
+				reg.publish(event)
+			}
+		case kvserverpb.TxnFeedOp_ABORTED:
+			p.rts.ConsumeAborted(ctx, op.TxnID)
+		default:
+			log.KvExec.Fatalf(ctx, "unknown TxnFeedOp type %d", op.Type)
 		}
 	}
+
+	// If the resolved timestamp advanced, emit checkpoints.
+	p.maybeEmitCheckpoints(ctx)
 }
 
-// ForwardClosedTS forwards the closed timestamp to all registrations as a
-// TxnFeedCheckpoint event. Called under raftMu.
+// ForwardClosedTS forwards the closed timestamp and emits checkpoint events
+// if the resolved timestamp advances. Called under raftMu.
 func (p *Processor) ForwardClosedTS(ctx context.Context, closedTS hlc.Timestamp) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	if p.mu.stopped || len(p.mu.regs) == 0 {
+	if p.mu.stopped {
 		return
 	}
+
+	p.rts.ForwardClosedTS(ctx, closedTS)
+	p.maybeEmitCheckpoints(ctx)
+}
+
+// maybeEmitCheckpoints emits TxnFeedCheckpoint events to all registrations if
+// the resolved timestamp has advanced since the last emission. Must be called
+// with p.mu held (read or write).
+func (p *Processor) maybeEmitCheckpoints(ctx context.Context) {
+	resolvedTS := p.rts.Get()
+	if resolvedTS.IsEmpty() || !p.lastEmittedRTS.Less(resolvedTS) ||
+		len(p.mu.regs) == 0 {
+		return
+	}
+	p.lastEmittedRTS = resolvedTS
 
 	for _, reg := range p.mu.regs {
 		event := &kvpb.TxnFeedEvent{
 			Checkpoint: &kvpb.TxnFeedCheckpoint{
 				AnchorSpan: reg.span.AsRawSpanWithNoLocals(),
-				ResolvedTS: closedTS,
+				ResolvedTS: resolvedTS,
 			},
 		}
 		reg.publish(event)

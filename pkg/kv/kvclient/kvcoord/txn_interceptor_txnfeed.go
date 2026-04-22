@@ -33,7 +33,7 @@ var TrackedReadsMaxSize = settings.RegisterIntSetting(
 // txnFeedReadTracker is a txnInterceptor that tracks the read spans of a
 // transaction for TxnFeed consumers. When a transaction commits and
 // kv.txnfeed.enabled is true, the accumulated read spans are attached to the
-// EndTxnRequest so that the server can include them in CommitTxnOp events.
+// EndTxnRequest so that the server can include them in TxnFeedOp events.
 //
 // Read spans are tracked independently from the txnSpanRefresher's refresh
 // footprint because the two have different lifecycle and condensing semantics.

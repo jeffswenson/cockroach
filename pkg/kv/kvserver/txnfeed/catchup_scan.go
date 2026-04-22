@@ -15,8 +15,88 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
+
+// ScanUnresolvedTxnRecords iterates over transaction record keys in the given
+// range and collects all non-finalized (PENDING or STAGING) records. Each
+// record's txnID and WriteTimestamp are passed to the callback. This is used
+// during TxnFeed processor initialization to populate the unresolved
+// transaction record queue.
+func ScanUnresolvedTxnRecords(
+	ctx context.Context,
+	snap storage.Reader,
+	rangeStartKey, rangeEndKey roachpb.RKey,
+	fn func(txnID uuid.UUID, writeTS hlc.Timestamp),
+) error {
+	startKey := keys.MakeRangeKeyPrefix(rangeStartKey)
+	endKey := keys.MakeRangeKeyPrefix(rangeEndKey)
+
+	iter, err := snap.NewMVCCIterator(ctx, storage.MVCCKeyIterKind, storage.IterOptions{
+		KeyTypes:     storage.IterKeyTypePointsOnly,
+		LowerBound:   startKey,
+		UpperBound:   endKey,
+		ReadCategory: fs.RangefeedReadCategory,
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	iter.SeekGE(storage.MVCCKey{Key: startKey})
+	for {
+		ok, err := iter.Valid()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+
+		key := iter.UnsafeKey()
+
+		_, suffix, _, err := keys.DecodeRangeKey(key.Key)
+		if err != nil {
+			return errors.Wrap(err, "decoding range-local key")
+		}
+		if !bytes.Equal(suffix, keys.LocalTransactionSuffix.AsRawKey()) {
+			iter.NextKey()
+			continue
+		}
+
+		// We only care about the latest version of each transaction record.
+		// Skip tombstones.
+		_, isTombstone, err := iter.MVCCValueLenAndIsTombstone()
+		if err != nil {
+			return errors.Wrap(err, "checking tombstone")
+		}
+		if isTombstone {
+			iter.NextKey()
+			continue
+		}
+
+		v, err := iter.UnsafeValue()
+		if err != nil {
+			return errors.Wrap(err, "reading value")
+		}
+		mvccVal, err := storage.DecodeMVCCValue(v)
+		if err != nil {
+			return errors.Wrap(err, "decoding MVCC value")
+		}
+
+		var txn roachpb.Transaction
+		if err := mvccVal.Value.GetProto(&txn); err != nil {
+			return errors.Wrap(err, "unmarshaling transaction record")
+		}
+
+		if txn.Status == roachpb.PENDING || txn.Status == roachpb.STAGING {
+			fn(txn.ID, txn.WriteTimestamp)
+		}
+
+		iter.NextKey()
+	}
+}
 
 // CatchUpScan iterates over transaction record keys in the given range and
 // emits TxnFeedCommitted events for all COMMITTED transaction records whose

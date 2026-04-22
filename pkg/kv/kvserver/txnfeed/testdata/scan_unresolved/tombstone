@@ -1,0 +1,15 @@
+# A PENDING transaction record that is tombstoned should not be collected.
+put-txn-record anchor=b mvcc-ts=10 commit-ts=5 status=PENDING id=txn1
+----
+
+scan-unresolved
+----
+unresolved write-ts=5
+
+# Tombstone the record. It should no longer appear.
+del-txn-record anchor=b mvcc-ts=20 id=txn1
+----
+
+scan-unresolved
+----
+<no records>

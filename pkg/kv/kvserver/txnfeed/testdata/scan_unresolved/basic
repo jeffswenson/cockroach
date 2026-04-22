@@ -1,0 +1,34 @@
+# PENDING transaction is collected.
+put-txn-record anchor=b mvcc-ts=10 commit-ts=5 status=PENDING id=txn1
+----
+
+scan-unresolved
+----
+unresolved write-ts=5
+
+# STAGING transaction is collected.
+put-txn-record anchor=c mvcc-ts=15 commit-ts=12 status=STAGING id=txn2
+----
+
+scan-unresolved
+----
+unresolved write-ts=5
+unresolved write-ts=12
+
+# COMMITTED transaction is not collected.
+put-txn-record anchor=d mvcc-ts=20 commit-ts=18 status=COMMITTED id=txn3
+----
+
+scan-unresolved
+----
+unresolved write-ts=5
+unresolved write-ts=12
+
+# ABORTED transaction is not collected.
+put-txn-record anchor=e mvcc-ts=25 commit-ts=22 status=ABORTED id=txn4
+----
+
+scan-unresolved
+----
+unresolved write-ts=5
+unresolved write-ts=12

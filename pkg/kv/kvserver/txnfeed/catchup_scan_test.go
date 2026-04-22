@@ -175,6 +175,101 @@ func delTxnRecord(
 	return ""
 }
 
+// TestScanUnresolvedTxnRecords is a data-driven test for the
+// ScanUnresolvedTxnRecords function.
+//
+// Supported commands:
+//
+//	put-txn-record anchor=<key> mvcc-ts=<int> commit-ts=<int> status=<COMMITTED|ABORTED|PENDING|STAGING> [id=<name>]
+//	  Same as in TestCatchUpScan.
+//
+//	del-txn-record anchor=<key> mvcc-ts=<int> id=<name>
+//	  Same as in TestCatchUpScan.
+//
+//	scan-unresolved [range-start=<key>] [range-end=<key>]
+//	  Runs ScanUnresolvedTxnRecords and prints collected records sorted by
+//	  anchor key.
+func TestScanUnresolvedTxnRecords(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "scan_unresolved"),
+		func(t *testing.T, path string) {
+			eng := storage.NewDefaultInMemForTesting()
+			defer eng.Close()
+
+			txnIDs := make(map[string]uuid.UUID)
+
+			datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
+				switch d.Cmd {
+				case "put-txn-record":
+					return putTxnRecord(t, ctx, eng, d, txnIDs)
+				case "del-txn-record":
+					return delTxnRecord(t, ctx, eng, d, txnIDs)
+				case "scan-unresolved":
+					return runScanUnresolved(t, ctx, eng, d)
+				default:
+					t.Fatalf("unknown command: %s", d.Cmd)
+					return ""
+				}
+			})
+		})
+}
+
+func runScanUnresolved(
+	t *testing.T, ctx context.Context, eng storage.Engine, d *datadriven.TestData,
+) string {
+	t.Helper()
+
+	rangeStart := roachpb.RKey("a")
+	rangeEnd := roachpb.RKey("z")
+	if d.HasArg("range-start") {
+		var s string
+		d.ScanArgs(t, "range-start", &s)
+		rangeStart = roachpb.RKey(s)
+	}
+	if d.HasArg("range-end") {
+		var s string
+		d.ScanArgs(t, "range-end", &s)
+		rangeEnd = roachpb.RKey(s)
+	}
+
+	snap := eng.NewSnapshot()
+	defer snap.Close()
+
+	type record struct {
+		txnID   uuid.UUID
+		writeTS hlc.Timestamp
+	}
+	var records []record
+	err := ScanUnresolvedTxnRecords(ctx, snap, rangeStart, rangeEnd,
+		func(txnID uuid.UUID, writeTS hlc.Timestamp) {
+			records = append(records, record{txnID: txnID, writeTS: writeTS})
+		},
+	)
+	require.NoError(t, err)
+
+	if len(records) == 0 {
+		return "<no records>"
+	}
+
+	// Sort by write timestamp for deterministic output.
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].writeTS.Equal(records[j].writeTS) {
+			return records[i].txnID.String() < records[j].txnID.String()
+		}
+		return records[i].writeTS.Less(records[j].writeTS)
+	})
+
+	var b strings.Builder
+	for _, r := range records {
+		fmt.Fprintf(&b, "unresolved write-ts=%d\n", r.writeTS.WallTime)
+	}
+	return b.String()
+}
+
 func runCatchUpScan(
 	t *testing.T, ctx context.Context, eng storage.Engine, d *datadriven.TestData,
 ) string {

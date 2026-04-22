@@ -50,7 +50,11 @@ func (r *Replica) TxnFeed(
 	// Ensure we have a TxnFeed processor for this range.
 	p := r.getTxnFeedProcessorRaftMuLocked()
 	if p == nil {
-		p = r.initTxnFeedProcessorRaftMuLocked()
+		var err error
+		p, err = r.initTxnFeedProcessorRaftMuLocked(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Create a catch-up snapshot under raftMu. Register closes the snapshot
@@ -62,16 +66,29 @@ func (r *Replica) TxnFeed(
 }
 
 // initTxnFeedProcessorRaftMuLocked creates a new TxnFeed processor for this
-// replica and stores it. Must be called under raftMu.
-func (r *Replica) initTxnFeedProcessorRaftMuLocked() *txnfeed.Processor {
+// replica, initializes its resolved timestamp by scanning for unresolved
+// transaction records, and stores it. Must be called under raftMu.
+func (r *Replica) initTxnFeedProcessorRaftMuLocked(
+	ctx context.Context,
+) (*txnfeed.Processor, error) {
 	desc := r.Desc()
 	p := txnfeed.NewProcessor(txnfeed.Config{
 		AmbientContext: r.AmbientContext,
 		Span:           desc.RSpan(),
 		Stopper:        r.store.stopper,
 	})
+
+	// Scan for unresolved transaction records to initialize the resolved
+	// timestamp. The snapshot is taken under raftMu so no TxnFeedOps are
+	// missed between the scan and the start of live event delivery.
+	snap := r.store.StateEngine().NewSnapshot()
+	defer snap.Close()
+	if err := p.Init(ctx, snap); err != nil {
+		return nil, err
+	}
+
 	r.setTxnFeedProcessor(p)
-	return p
+	return p, nil
 }
 
 // getTxnFeedProcessorRaftMuLocked returns the current TxnFeed processor, or
@@ -88,16 +105,14 @@ func (r *Replica) setTxnFeedProcessor(p *txnfeed.Processor) {
 	r.txnFeedMu.proc = p
 }
 
-// handleCommitTxnOpsRaftMuLocked delivers committed transaction ops from Raft
-// apply to the TxnFeed processor. Called under raftMu.
-func (r *Replica) handleCommitTxnOpsRaftMuLocked(
-	ctx context.Context, ops *kvserverpb.CommitTxnOps,
-) {
+// handleTxnFeedOpsRaftMuLocked delivers transaction record lifecycle events
+// from Raft apply to the TxnFeed processor. Called under raftMu.
+func (r *Replica) handleTxnFeedOpsRaftMuLocked(ctx context.Context, ops *kvserverpb.TxnFeedOps) {
 	p := r.getTxnFeedProcessorRaftMuLocked()
 	if p == nil {
 		return
 	}
-	p.ConsumeCommitTxnOps(ctx, ops)
+	p.ConsumeTxnFeedOps(ctx, ops)
 }
 
 // forwardClosedTSForTxnFeedRaftMuLocked forwards the closed timestamp to the

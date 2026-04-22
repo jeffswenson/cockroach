@@ -314,7 +314,9 @@ func (ba *BatchRequest) Require1PC() bool {
 // request that needs to read a replica's closed timestamp that is older than
 // the state of the storage snapshot the request is evaluating over.
 //
-// NB: This is only used by QueryResolvedTimestampRequest at the moment.
+// NB: This is used by QueryResolvedTimestampRequest, EndTxnRequest, and
+// HeartbeatTxnRequest. The latter two need it when txnfeed is enabled to
+// bump new transaction record write timestamps above the closed timestamp.
 func (ba *BatchRequest) RequiresClosedTSOlderThanStorageSnapshot() bool {
 	return ba.hasFlag(requiresClosedTSOlderThanStorageSnapshot)
 }

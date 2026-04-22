@@ -1,0 +1,26 @@
+# Only transactions within the specified range are collected.
+put-txn-record anchor=b mvcc-ts=10 commit-ts=5 status=PENDING id=txn1
+----
+
+put-txn-record anchor=m mvcc-ts=15 commit-ts=12 status=PENDING id=txn2
+----
+
+put-txn-record anchor=x mvcc-ts=20 commit-ts=18 status=STAGING id=txn3
+----
+
+# Full range: all three records.
+scan-unresolved
+----
+unresolved write-ts=5
+unresolved write-ts=12
+unresolved write-ts=18
+
+# Restricted range: only the middle record.
+scan-unresolved range-start=l range-end=n
+----
+unresolved write-ts=12
+
+# Range that excludes all records.
+scan-unresolved range-start=f range-end=g
+----
+<no records>

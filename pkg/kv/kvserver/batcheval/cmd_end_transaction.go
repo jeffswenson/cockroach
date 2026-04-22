@@ -309,6 +309,21 @@ func EndTxn(
 				log.VEventf(ctx, 2, "cannot create transaction record: %v", err)
 				return result.Result{}, err
 			}
+
+			// Bump the transaction's WriteTimestamp above the closed timestamp
+			// on this range. This ensures that the TxnFeed resolved timestamp
+			// never needs to regress when a new transaction record appears.
+			if txnfeed.Enabled.Get(&cArgs.EvalCtx.ClusterSettings().SV) {
+				closedTS := cArgs.EvalCtx.GetClosedTimestampOlderThanStorageSnapshot()
+				if reply.Txn.WriteTimestamp.Forward(closedTS.Next()) {
+					// TODO(txnfeed): Change to log.VEventf(ctx, 2, ...). This is
+					// expected behavior under load, not an operator-actionable warning.
+					log.KvExec.Warningf(ctx,
+						"txn %s write timestamp pushed from %s to %s due to closed timestamp %s at record creation",
+						reply.Txn.ID, h.Txn.WriteTimestamp, reply.Txn.WriteTimestamp, closedTS,
+					)
+				}
+			}
 		}
 	} else {
 		log.VEventf(ctx, 2, "existing transaction record found: %s", existingTxn)
@@ -475,7 +490,20 @@ func EndTxn(
 			if err := updateStagingTxn(ctx, readWriter, ms, key, now, args, reply.Txn); err != nil {
 				return result.Result{}, err
 			}
-			return result.Result{}, nil
+
+			// Emit a RECORD_WRITTEN TxnFeedOp for the STAGING record.
+			var res result.Result
+			if txnfeed.Enabled.Get(&cArgs.EvalCtx.ClusterSettings().SV) {
+				res.Replicated.TxnFeedOps = &kvserverpb.TxnFeedOps{
+					Ops: []kvserverpb.TxnFeedOp{{
+						Type:           kvserverpb.TxnFeedOp_RECORD_WRITTEN,
+						TxnID:          reply.Txn.ID,
+						AnchorKey:      reply.Txn.Key,
+						WriteTimestamp: reply.Txn.WriteTimestamp,
+					}},
+				}
+			}
+			return res, nil
 		}
 
 		// Else, the transaction can be explicitly committed.
@@ -607,16 +635,31 @@ func EndTxn(
 			return result.Result{}, err
 		}
 
-		// Emit a CommitTxnOp for the TxnFeed processor. This is attached to
-		// the ReplicatedEvalResult and delivered via Raft to all replicas.
+		// Emit a COMMITTED TxnFeedOp for the TxnFeed processor. This is
+		// attached to the ReplicatedEvalResult and delivered via Raft to all
+		// replicas.
 		if txnfeed.Enabled.Get(&cArgs.EvalCtx.ClusterSettings().SV) {
-			txnResult.Replicated.CommitTxnOps = &kvserverpb.CommitTxnOps{
-				Ops: []kvserverpb.CommitTxnOp{{
-					TxnID:           reply.Txn.ID,
-					AnchorKey:       reply.Txn.Key,
-					CommitTimestamp: reply.Txn.WriteTimestamp,
-					WriteSpans:      args.LockSpans,
-					ReadSpans:       args.ReadSpans,
+			txnResult.Replicated.TxnFeedOps = &kvserverpb.TxnFeedOps{
+				Ops: []kvserverpb.TxnFeedOp{{
+					Type:           kvserverpb.TxnFeedOp_COMMITTED,
+					TxnID:          reply.Txn.ID,
+					AnchorKey:      reply.Txn.Key,
+					WriteTimestamp: reply.Txn.WriteTimestamp,
+					WriteSpans:     args.LockSpans,
+					ReadSpans:      args.ReadSpans,
+				}},
+			}
+		}
+	} else if reply.Txn.Status == roachpb.ABORTED {
+		// Emit an ABORTED TxnFeedOp so the TxnFeed processor can remove
+		// this transaction from its unresolved record tracking.
+		if txnfeed.Enabled.Get(&cArgs.EvalCtx.ClusterSettings().SV) {
+			txnResult.Replicated.TxnFeedOps = &kvserverpb.TxnFeedOps{
+				Ops: []kvserverpb.TxnFeedOp{{
+					Type:           kvserverpb.TxnFeedOp_ABORTED,
+					TxnID:          reply.Txn.ID,
+					AnchorKey:      reply.Txn.Key,
+					WriteTimestamp: reply.Txn.WriteTimestamp,
 				}},
 			}
 		}

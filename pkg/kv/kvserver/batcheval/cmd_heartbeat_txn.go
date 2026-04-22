@@ -13,12 +13,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnfeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func init() {
@@ -72,6 +75,21 @@ func HeartbeatTxn(
 		if err := CanCreateTxnRecord(ctx, cArgs.EvalCtx, &txn); err != nil {
 			return result.Result{}, err
 		}
+
+		// Bump the transaction's WriteTimestamp above the closed timestamp
+		// on this range. This ensures that the TxnFeed resolved timestamp
+		// never needs to regress when a new transaction record appears.
+		if txnfeed.Enabled.Get(&cArgs.EvalCtx.ClusterSettings().SV) {
+			closedTS := cArgs.EvalCtx.GetClosedTimestampOlderThanStorageSnapshot()
+			if txn.WriteTimestamp.Forward(closedTS.Next()) {
+				// TODO(txnfeed): Change to log.VEventf(ctx, 2, ...). This is
+				// expected behavior under load, not an operator-actionable warning.
+				log.KvExec.Warningf(ctx,
+					"txn %s write timestamp pushed from %s to %s due to closed timestamp %s at record creation",
+					txn.ID, h.Txn.WriteTimestamp, txn.WriteTimestamp, closedTS,
+				)
+			}
+		}
 	}
 
 	// If the transaction is pending, take the opportunity to determine the
@@ -85,6 +103,7 @@ func HeartbeatTxn(
 		BumpToMinTxnCommitTS(ctx, cArgs.EvalCtx, &txn)
 	}
 
+	var res result.Result
 	if !txn.Status.IsFinalized() {
 		// NOTE: this only updates the LastHeartbeat. It doesn't update any other
 		// field from h.Txn, even if it could. Whether that's a good thing or not
@@ -95,8 +114,22 @@ func HeartbeatTxn(
 			storage.MVCCWriteOptions{Stats: cArgs.Stats, Category: fs.BatchEvalReadCategory}); err != nil {
 			return result.Result{}, err
 		}
+
+		// Emit a RECORD_WRITTEN TxnFeedOp so the TxnFeed processor can track
+		// this non-finalized transaction record for resolved timestamp
+		// computation.
+		if txnfeed.Enabled.Get(&cArgs.EvalCtx.ClusterSettings().SV) {
+			res.Replicated.TxnFeedOps = &kvserverpb.TxnFeedOps{
+				Ops: []kvserverpb.TxnFeedOp{{
+					Type:           kvserverpb.TxnFeedOp_RECORD_WRITTEN,
+					TxnID:          txn.ID,
+					AnchorKey:      txn.Key,
+					WriteTimestamp: txn.WriteTimestamp,
+				}},
+			}
+		}
 	}
 
 	reply.Txn = &txn
-	return result.Result{}, nil
+	return res, nil
 }
