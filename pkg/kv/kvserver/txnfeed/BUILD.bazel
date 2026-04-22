@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "buffered_sender.go",
         "catchup_scan.go",
+        "commit_index.go",
         "event_queue.go",
         "processor.go",
         "settings.go",
@@ -28,6 +29,7 @@ go_library(
         "//pkg/util/retry",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
+        "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
     ],
@@ -37,6 +39,7 @@ go_test(
     name = "txnfeed_test",
     srcs = [
         "catchup_scan_test.go",
+        "commit_index_test.go",
         "processor_test.go",
     ],
     data = glob(["testdata/**"]),
