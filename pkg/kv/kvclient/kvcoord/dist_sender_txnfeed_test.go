@@ -578,6 +578,463 @@ func TestDistSenderTxnFeed_CatchUpScan(t *testing.T) {
 	validateEvents(t, txns, getEvents(), feedSpan)
 }
 
+// validateDetailSpanEnrichment checks that enriched write data
+// matches ground truth filtered to only writes within the detail
+// spans. This mirrors validateEnrichment but accounts for the span
+// filtering that WithDetailSpans applies.
+func validateDetailSpanEnrichment(
+	t *testing.T,
+	txns []committedTxn,
+	collectedEvents []kvcoord.TxnFeedMessage,
+	detailSpans []roachpb.Span,
+) {
+	t.Helper()
+
+	keyInDetailSpans := func(key roachpb.Key) bool {
+		for _, ds := range detailSpans {
+			if ds.ContainsKey(key) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// 1. Every committed event must have non-nil Details (the RPC
+	//    is always sent, even when no spans overlap).
+	for _, ev := range collectedEvents {
+		if ev.Committed == nil {
+			require.Nilf(t, ev.Details,
+				"non-committed event has Details set")
+			continue
+		}
+		require.NotNilf(t, ev.Details,
+			"committed txn %s missing Details", ev.Committed.TxnID.Short())
+	}
+
+	// 2. Build filtered ground truth: only writes whose keys fall
+	//    within the detail spans.
+	type expectedWrite struct {
+		key   roachpb.Key
+		value string
+	}
+	wantWrites := make(map[uuid.UUID][]expectedWrite)
+	for _, ct := range txns {
+		var writes []expectedWrite
+		for _, op := range ct.ops {
+			if !op.isGet && keyInDetailSpans(op.key) {
+				writes = append(writes, expectedWrite{key: op.key, value: op.value})
+			}
+		}
+		wantWrites[ct.id] = writes
+	}
+
+	// 3. For each workload txn, verify the enriched writes match
+	//    the filtered ground truth exactly.
+	for _, ev := range collectedEvents {
+		if ev.Committed == nil {
+			continue
+		}
+		expected, isOurs := wantWrites[ev.Committed.TxnID]
+		if !isOurs {
+			continue
+		}
+
+		gotWrites := make(map[string]string)
+		for _, w := range ev.Details.Writes {
+			val, err := w.KeyValue.Value.GetBytes()
+			if err != nil {
+				gotWrites[string(w.KeyValue.Key)] = ""
+			} else {
+				gotWrites[string(w.KeyValue.Key)] = string(val)
+			}
+		}
+
+		for _, ew := range expected {
+			gotVal, ok := gotWrites[string(ew.key)]
+			require.Truef(t, ok,
+				"txn %s: expected write at %s not found in Details.Writes",
+				ev.Committed.TxnID.Short(), ew.key)
+			require.Equalf(t, ew.value, gotVal,
+				"txn %s: wrong value at %s",
+				ev.Committed.TxnID.Short(), ew.key)
+		}
+
+		require.Equalf(t, len(expected), len(ev.Details.Writes),
+			"txn %s: write count mismatch (expected %d in detail spans, got %d)",
+			ev.Committed.TxnID.Short(), len(expected), len(ev.Details.Writes))
+	}
+
+	// 4. All write keys in Details must fall within a detail span.
+	for _, ev := range collectedEvents {
+		if ev.Committed == nil || ev.Details == nil {
+			continue
+		}
+		for _, w := range ev.Details.Writes {
+			require.Truef(t, keyInDetailSpans(w.KeyValue.Key),
+				"txn %s: write key %s outside all detail spans",
+				ev.Committed.TxnID.Short(), w.KeyValue.Key)
+		}
+	}
+
+	// 5. Checkpoint ordering through enrichment pipeline.
+	maxResolved := make(map[string]hlc.Timestamp)
+	spanByKey := make(map[string]roachpb.Span)
+	for _, ev := range collectedEvents {
+		if ev.Checkpoint != nil {
+			key := ev.Checkpoint.AnchorSpan.String()
+			maxResolved[key] = ev.Checkpoint.ResolvedTS
+			spanByKey[key] = ev.Checkpoint.AnchorSpan
+		}
+		if ev.Committed != nil {
+			anchorKey, err := keys.Addr(ev.Committed.AnchorKey)
+			if err != nil {
+				continue
+			}
+			for spanKey, resolved := range maxResolved {
+				if !spanByKey[spanKey].ContainsKey(anchorKey.AsRawKey()) {
+					continue
+				}
+				if ev.Committed.CommitTimestamp.Less(resolved) {
+					t.Errorf("committed txn %s at %s after checkpoint %s for %s",
+						ev.Committed.TxnID.Short(),
+						ev.Committed.CommitTimestamp, resolved, spanKey)
+				}
+			}
+		}
+	}
+
+	// Log distribution of inside/outside/mixed txns for visibility.
+	var insideOnly, outsideOnly, mixed int
+	for _, ct := range txns {
+		hasIn, hasOut := false, false
+		for _, op := range ct.ops {
+			if op.isGet {
+				continue
+			}
+			if keyInDetailSpans(op.key) {
+				hasIn = true
+			} else {
+				hasOut = true
+			}
+		}
+		switch {
+		case hasIn && hasOut:
+			mixed++
+		case hasIn:
+			insideOnly++
+		case hasOut:
+			outsideOnly++
+		}
+	}
+	t.Logf("detail span enrichment: validated %d txns "+
+		"(%d inside, %d outside, %d mixed)",
+		len(txns), insideOnly, outsideOnly, mixed)
+}
+
+// validateDepOnlyEnrichment checks that write spans fully contained
+// by dependency-only spans are not returned as writes in the enriched
+// Details. Writes in detail spans that are NOT dep-only should still
+// appear with correct data. This combines detail span filtering with
+// dep-only demotion.
+func validateDepOnlyEnrichment(
+	t *testing.T,
+	txns []committedTxn,
+	collectedEvents []kvcoord.TxnFeedMessage,
+	detailSpans []roachpb.Span,
+	depOnlySpans []roachpb.Span,
+) {
+	t.Helper()
+
+	keyInDetailSpans := func(key roachpb.Key) bool {
+		for _, ds := range detailSpans {
+			if ds.ContainsKey(key) {
+				return true
+			}
+		}
+		return false
+	}
+	keyInDepOnlySpans := func(key roachpb.Key) bool {
+		for _, ds := range depOnlySpans {
+			if ds.ContainsKey(key) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// 1. Every committed event must have non-nil Details.
+	for _, ev := range collectedEvents {
+		if ev.Committed == nil {
+			require.Nilf(t, ev.Details,
+				"non-committed event has Details set")
+			continue
+		}
+		require.NotNilf(t, ev.Details,
+			"committed txn %s missing Details", ev.Committed.TxnID.Short())
+	}
+
+	// 2. Build filtered ground truth: writes in detail spans but
+	//    NOT in dep-only spans.
+	type expectedWrite struct {
+		key   roachpb.Key
+		value string
+	}
+	wantWrites := make(map[uuid.UUID][]expectedWrite)
+	for _, ct := range txns {
+		var writes []expectedWrite
+		for _, op := range ct.ops {
+			if !op.isGet && keyInDetailSpans(op.key) && !keyInDepOnlySpans(op.key) {
+				writes = append(writes, expectedWrite{key: op.key, value: op.value})
+			}
+		}
+		wantWrites[ct.id] = writes
+	}
+
+	// 3. Verify enriched writes match filtered ground truth.
+	for _, ev := range collectedEvents {
+		if ev.Committed == nil {
+			continue
+		}
+		expected, isOurs := wantWrites[ev.Committed.TxnID]
+		if !isOurs {
+			continue
+		}
+
+		gotWrites := make(map[string]string)
+		for _, w := range ev.Details.Writes {
+			val, err := w.KeyValue.Value.GetBytes()
+			if err != nil {
+				gotWrites[string(w.KeyValue.Key)] = ""
+			} else {
+				gotWrites[string(w.KeyValue.Key)] = string(val)
+			}
+		}
+
+		for _, ew := range expected {
+			gotVal, ok := gotWrites[string(ew.key)]
+			require.Truef(t, ok,
+				"txn %s: expected write at %s not found in Details.Writes",
+				ev.Committed.TxnID.Short(), ew.key)
+			require.Equalf(t, ew.value, gotVal,
+				"txn %s: wrong value at %s",
+				ev.Committed.TxnID.Short(), ew.key)
+		}
+
+		require.Equalf(t, len(expected), len(ev.Details.Writes),
+			"txn %s: write count mismatch (expected %d, got %d)",
+			ev.Committed.TxnID.Short(), len(expected), len(ev.Details.Writes))
+	}
+
+	// 4. No write key in Details should be in a dep-only span.
+	for _, ev := range collectedEvents {
+		if ev.Committed == nil || ev.Details == nil {
+			continue
+		}
+		for _, w := range ev.Details.Writes {
+			require.Falsef(t, keyInDepOnlySpans(w.KeyValue.Key),
+				"txn %s: write key %s is in dep-only span but appeared in Details.Writes",
+				ev.Committed.TxnID.Short(), w.KeyValue.Key)
+		}
+	}
+
+	// 5. All write keys must be in detail spans.
+	for _, ev := range collectedEvents {
+		if ev.Committed == nil || ev.Details == nil {
+			continue
+		}
+		for _, w := range ev.Details.Writes {
+			require.Truef(t, keyInDetailSpans(w.KeyValue.Key),
+				"txn %s: write key %s outside all detail spans",
+				ev.Committed.TxnID.Short(), w.KeyValue.Key)
+		}
+	}
+
+	// 6. Checkpoint ordering.
+	maxResolved := make(map[string]hlc.Timestamp)
+	spanByKey := make(map[string]roachpb.Span)
+	for _, ev := range collectedEvents {
+		if ev.Checkpoint != nil {
+			key := ev.Checkpoint.AnchorSpan.String()
+			maxResolved[key] = ev.Checkpoint.ResolvedTS
+			spanByKey[key] = ev.Checkpoint.AnchorSpan
+		}
+		if ev.Committed != nil {
+			anchorKey, err := keys.Addr(ev.Committed.AnchorKey)
+			if err != nil {
+				continue
+			}
+			for spanKey, resolved := range maxResolved {
+				if !spanByKey[spanKey].ContainsKey(anchorKey.AsRawKey()) {
+					continue
+				}
+				if ev.Committed.CommitTimestamp.Less(resolved) {
+					t.Errorf("committed txn %s at %s after checkpoint %s for %s",
+						ev.Committed.TxnID.Short(),
+						ev.Committed.CommitTimestamp, resolved, spanKey)
+				}
+			}
+		}
+	}
+
+	// Log distribution for visibility.
+	var dataOnly, depOnly, both, neither int
+	for _, ct := range txns {
+		hasData, hasDep := false, false
+		for _, op := range ct.ops {
+			if op.isGet {
+				continue
+			}
+			if keyInDetailSpans(op.key) && !keyInDepOnlySpans(op.key) {
+				hasData = true
+			}
+			if keyInDepOnlySpans(op.key) {
+				hasDep = true
+			}
+		}
+		switch {
+		case hasData && hasDep:
+			both++
+		case hasData:
+			dataOnly++
+		case hasDep:
+			depOnly++
+		default:
+			neither++
+		}
+	}
+	t.Logf("dep-only enrichment: validated %d txns "+
+		"(%d data-only, %d dep-only, %d both, %d neither)",
+		len(txns), dataOnly, depOnly, both, neither)
+}
+
+// TestDistSenderTxnFeed_DepOnlySpans runs a concurrent workload with
+// enrichment using both detail spans and dependency-only spans. Writes
+// in the dep-only region should not appear in Details.Writes, while
+// writes in the regular detail region should appear with correct data.
+func TestDistSenderTxnFeed_DepOnlySpans(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	c, stop := setupTxnFeedTest(t, ctx, 1)
+	defer stop()
+	for _, split := range []byte{'c', 'f', 'i'} {
+		c.tc.SplitRangeOrFatal(t, append(c.scratchKey.Clone(), split))
+	}
+
+	feedSpan := roachpb.Span{
+		Key: c.scratchKey, EndKey: c.scratchKey.PrefixEnd(),
+	}
+	// Detail spans: [d, m) — keys d* through l*.
+	detailSpans := []roachpb.Span{{
+		Key:    append(c.scratchKey.Clone(), 'd'),
+		EndKey: append(c.scratchKey.Clone(), 'm'),
+	}}
+	// Dep-only spans: [d, g) — keys d*, e*, f* are dep-only
+	// (within detail spans). Keys g* through l* are regular.
+	depOnlySpans := []roachpb.Span{{
+		Key:    append(c.scratchKey.Clone(), 'd'),
+		EndKey: append(c.scratchKey.Clone(), 'g'),
+	}}
+	startTS := c.db.Clock().Now()
+
+	getEvents, cancelFeed, feedErrCh := startFeedAndDrain(
+		t, ctx, c.ds, feedSpan, startTS,
+		kvcoord.WithEnrichment(),
+		kvcoord.WithDetailSpans(detailSpans),
+		kvcoord.WithDependencyOnlySpans(depOnlySpans),
+	)
+
+	allTxns := runWorkload(t, ctx, c.db, c.scratchKey, 8, 3*time.Second)
+	txns := writingTxns(allTxns)
+	t.Logf("workload complete: %d txns total, %d with writes",
+		len(allTxns), len(txns))
+
+	waitForTxns(t, txns, getEvents, feedErrCh)
+	cancelFeed()
+
+	events := getEvents()
+	validateEvents(t, txns, events, feedSpan)
+	validateDepOnlyEnrichment(t, txns, events, detailSpans, depOnlySpans)
+}
+
+// TestDistSenderTxnFeed_DepOnlySpansValidation verifies that
+// configuring a dependency-only span outside all detail spans returns
+// a validation error.
+func TestDistSenderTxnFeed_DepOnlySpansValidation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	c, stop := setupTxnFeedTest(t, ctx, 1)
+	defer stop()
+
+	feedSpan := roachpb.Span{
+		Key: c.scratchKey, EndKey: c.scratchKey.PrefixEnd(),
+	}
+	eventCh := make(chan kvcoord.TxnFeedMessage, 1)
+
+	// Detail spans [d, g), dep-only span [m, q) — no overlap.
+	err := c.ds.TxnFeed(ctx, []kvcoord.SpanTimePair{
+		{Span: feedSpan, StartAfter: c.db.Clock().Now()},
+	}, eventCh,
+		kvcoord.WithEnrichment(),
+		kvcoord.WithDetailSpans([]roachpb.Span{{
+			Key:    append(c.scratchKey.Clone(), 'd'),
+			EndKey: append(c.scratchKey.Clone(), 'g'),
+		}}),
+		kvcoord.WithDependencyOnlySpans([]roachpb.Span{{
+			Key:    append(c.scratchKey.Clone(), 'm'),
+			EndKey: append(c.scratchKey.Clone(), 'q'),
+		}}),
+	)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "does not overlap with any detail span")
+}
+
+// TestDistSenderTxnFeed_DetailSpans runs a concurrent workload with
+// enrichment restricted to a subset of the key space via
+// WithDetailSpans, and verifies that write data is correctly filtered.
+func TestDistSenderTxnFeed_DetailSpans(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	c, stop := setupTxnFeedTest(t, ctx, 1)
+	defer stop()
+	for _, split := range []byte{'c', 'f', 'i'} {
+		c.tc.SplitRangeOrFatal(t, append(c.scratchKey.Clone(), split))
+	}
+
+	feedSpan := roachpb.Span{
+		Key: c.scratchKey, EndKey: c.scratchKey.PrefixEnd(),
+	}
+	// Detail spans cover [d, g) — roughly keys d*, e*, f* out of a-z.
+	detailSpans := []roachpb.Span{{
+		Key:    append(c.scratchKey.Clone(), 'd'),
+		EndKey: append(c.scratchKey.Clone(), 'g'),
+	}}
+	startTS := c.db.Clock().Now()
+
+	getEvents, cancelFeed, feedErrCh := startFeedAndDrain(
+		t, ctx, c.ds, feedSpan, startTS,
+		kvcoord.WithEnrichment(),
+		kvcoord.WithDetailSpans(detailSpans),
+	)
+
+	allTxns := runWorkload(t, ctx, c.db, c.scratchKey, 8, 3*time.Second)
+	txns := writingTxns(allTxns)
+	t.Logf("workload complete: %d txns total, %d with writes",
+		len(allTxns), len(txns))
+
+	waitForTxns(t, txns, getEvents, feedErrCh)
+	cancelFeed()
+
+	events := getEvents()
+	validateEvents(t, txns, events, feedSpan)
+	validateDetailSpanEnrichment(t, txns, events, detailSpans)
+}
+
 // TestDistSenderTxnFeed_Enriched runs a concurrent workload with
 // enrichment enabled and verifies that committed events carry full
 // write data from GetTxnDetails.

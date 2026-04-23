@@ -7,6 +7,7 @@ package kvcoord
 
 import (
 	"context"
+	"slices"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -23,6 +24,8 @@ func runTxnFeedEnricher(
 	ctx context.Context,
 	ds *DistSender,
 	spans []SpanTimePair,
+	detailSpans []roachpb.Span,
+	depOnlySpans []roachpb.Span,
 	rawCh <-chan TxnFeedMessage,
 	consumerCh chan<- TxnFeedMessage,
 ) error {
@@ -63,7 +66,7 @@ func runTxnFeedEnricher(
 		}
 
 	processBatch:
-		if err := enrichBatch(ctx, ds, frontier, batch); err != nil {
+		if err := enrichBatch(ctx, ds, frontier, batch, detailSpans, depOnlySpans); err != nil {
 			return err
 		}
 
@@ -95,7 +98,12 @@ func runTxnFeedEnricher(
 // GetTxnDetailsRequest per committed event in the batch and populates
 // each committed event's Details field from the response.
 func enrichBatch(
-	ctx context.Context, ds *DistSender, frontier spanpkg.ReadOnlyFrontier, batch []TxnFeedMessage,
+	ctx context.Context,
+	ds *DistSender,
+	frontier spanpkg.ReadOnlyFrontier,
+	batch []TxnFeedMessage,
+	detailSpans []roachpb.Span,
+	depOnlySpans []roachpb.Span,
 ) error {
 	var commitIndices []int
 	for i := range batch {
@@ -112,8 +120,21 @@ func enrichBatch(
 	ba := &kvpb.BatchRequest{}
 	for _, idx := range commitIndices {
 		c := batch[idx].Committed
-		allSpans := append(c.WriteSpans, c.ReadSpans...)
-		minKey, maxEndKey := computeRequestBounds(allSpans)
+		readSpans := filterOverlappingSpans(c.ReadSpans, detailSpans)
+		writeSpans := filterOverlappingSpans(c.WriteSpans, detailSpans)
+		readSpans, writeSpans = moveDepOnlyWrites(readSpans, writeSpans, depOnlySpans)
+		allSpans := slices.Concat(writeSpans, readSpans)
+
+		var minKey, maxEndKey roachpb.Key
+		if len(allSpans) > 0 {
+			minKey, maxEndKey = computeRequestBounds(allSpans)
+		} else {
+			// No spans overlap with detailSpans; send a point
+			// request at the anchor key so we still get a response.
+			minKey = c.AnchorKey
+			maxEndKey = c.AnchorKey.Next()
+		}
+
 		ba.Add(&kvpb.GetTxnDetailsRequest{
 			RequestHeader: kvpb.RequestHeader{
 				Key:    minKey,
@@ -122,8 +143,8 @@ func enrichBatch(
 			TxnID:            c.TxnID,
 			CommitTimestamp:  c.CommitTimestamp,
 			DependencyCutoff: depCutoff,
-			ReadSpans:        c.ReadSpans,
-			WriteSpans:       c.WriteSpans,
+			ReadSpans:        readSpans,
+			WriteSpans:       writeSpans,
 		})
 	}
 
@@ -141,6 +162,54 @@ func enrichBatch(
 		}
 	}
 	return nil
+}
+
+// moveDepOnlyWrites moves write spans that are fully contained by a
+// dependency-only span into the read set. Write spans that only
+// partially overlap (or don't overlap at all) stay as writes.
+func moveDepOnlyWrites(
+	readSpans, writeSpans []roachpb.Span, depOnlySpans []roachpb.Span,
+) ([]roachpb.Span, []roachpb.Span) {
+	if len(depOnlySpans) == 0 {
+		return readSpans, writeSpans
+	}
+	var keptWrites []roachpb.Span
+	for _, ws := range writeSpans {
+		if spanContainedByAny(ws, depOnlySpans) {
+			readSpans = append(readSpans, ws)
+		} else {
+			keptWrites = append(keptWrites, ws)
+		}
+	}
+	return readSpans, keptWrites
+}
+
+func spanContainedByAny(s roachpb.Span, containers []roachpb.Span) bool {
+	for _, c := range containers {
+		if c.Contains(s) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterOverlappingSpans returns the subset of spans that overlap with
+// at least one of the filter spans. If filter is empty, all spans are
+// returned unmodified.
+func filterOverlappingSpans(spans []roachpb.Span, filter []roachpb.Span) []roachpb.Span {
+	if len(filter) == 0 {
+		return spans
+	}
+	var out []roachpb.Span
+	for _, s := range spans {
+		for _, f := range filter {
+			if s.Overlaps(f) {
+				out = append(out, s)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // computeRequestBounds returns the minimum Key and maximum EndKey
