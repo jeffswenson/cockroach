@@ -154,12 +154,12 @@ func (r *Replica) disconnectTxnFeedWithErr(pErr *kvpb.Error) {
 //
 //   - MVCCCommitIntentOp in the LogicalOpLog — fired during intent resolution
 //     on every range where a 2PC transaction wrote.
-//   - CommitTxnOps in the ReplicatedEvalResult — fired for 1PC transactions
+//   - TxnFeedOps in the ReplicatedEvalResult — fired for 1PC transactions
 //     that bypass intent resolution entirely (writes go in as plain values).
 //
 // Together these cover both commit paths.
 func (r *Replica) recordCommitTimestampsRaftMuLocked(
-	ctx context.Context, logOps *kvserverpb.LogicalOpLog, commitOps *kvserverpb.CommitTxnOps,
+	ctx context.Context, logOps *kvserverpb.LogicalOpLog, commitOps *kvserverpb.TxnFeedOps,
 ) {
 	if logOps == nil && commitOps == nil {
 		return
@@ -183,7 +183,7 @@ func (r *Replica) recordCommitTimestampsRaftMuLocked(
 	if commitOps != nil {
 		for i := range commitOps.Ops {
 			op := &commitOps.Ops[i]
-			idx.Record(op.CommitTimestamp, op.TxnID)
+			idx.Record(op.WriteTimestamp, op.TxnID)
 		}
 	}
 }
