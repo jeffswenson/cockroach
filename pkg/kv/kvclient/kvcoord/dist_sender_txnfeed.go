@@ -11,6 +11,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
@@ -19,6 +22,39 @@ import (
 type TxnFeedMessage struct {
 	*kvpb.TxnFeedEvent
 	RegisteredSpan roachpb.Span
+	// Details is non-nil only for committed events when enrichment is
+	// enabled via WithEnrichment.
+	Details *TxnFeedDetails
+}
+
+// TxnFeedDetails holds the enriched write data and dependency
+// information for a committed transaction, fetched via GetTxnDetails.
+type TxnFeedDetails struct {
+	Writes       []kvpb.TxnDetailKV
+	Dependencies []uuid.UUID
+	EventHorizon hlc.Timestamp
+}
+
+// TxnFeedOption configures the behavior of DistSender.TxnFeed.
+type TxnFeedOption interface {
+	apply(*txnFeedConfig)
+}
+
+type txnFeedConfig struct {
+	enrich bool
+}
+
+type txnFeedOptionFunc func(*txnFeedConfig)
+
+func (f txnFeedOptionFunc) apply(c *txnFeedConfig) { f(c) }
+
+// WithEnrichment enables automatic GetTxnDetails enrichment. When
+// enabled, each committed event is enriched with full write data and
+// dependency information before being delivered on the event channel.
+func WithEnrichment() TxnFeedOption {
+	return txnFeedOptionFunc(func(c *txnFeedConfig) {
+		c.enrich = true
+	})
 }
 
 // TxnFeed divides TxnFeed requests across range boundaries and
@@ -26,12 +62,30 @@ type TxnFeedMessage struct {
 // eventCh. Blocks until the context is cancelled or a fatal error
 // occurs.
 func (ds *DistSender) TxnFeed(
-	ctx context.Context, spans []SpanTimePair, eventCh chan<- TxnFeedMessage,
+	ctx context.Context, spans []SpanTimePair, eventCh chan<- TxnFeedMessage, opts ...TxnFeedOption,
 ) error {
 	if len(spans) == 0 {
 		return errors.AssertionFailedf("expected at least 1 span, got none")
 	}
-	return muxTxnFeed(ctx, spans, ds, eventCh)
+	var cfg txnFeedConfig
+	for _, o := range opts {
+		o.apply(&cfg)
+	}
+	if !cfg.enrich {
+		return muxTxnFeed(ctx, spans, ds, eventCh)
+	}
+	// Buffer rawCh so the mux layer can continue producing events
+	// while the enricher is blocked on GetTxnDetails RPCs.
+	rawCh := make(chan TxnFeedMessage, 4096)
+	g := ctxgroup.WithContext(ctx)
+	g.GoCtx(func(ctx context.Context) error {
+		defer close(rawCh)
+		return muxTxnFeed(ctx, spans, ds, rawCh)
+	})
+	g.GoCtx(func(ctx context.Context) error {
+		return runTxnFeedEnricher(ctx, ds, spans, rawCh, eventCh)
+	})
+	return g.Wait()
 }
 
 // txnFeedErrorInfo describes how a txnfeed error should be handled.
