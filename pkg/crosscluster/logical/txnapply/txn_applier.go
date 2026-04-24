@@ -96,11 +96,15 @@ type Applier struct {
 		// remote applier, updated via DependencyResolver notifications.
 		remoteApplierResolvedTimes map[ldrdecoder.ApplierID]hlc.Timestamp
 
-		// watermark is a min-heap of transactions and checkpoints ordered
-		// by timestamp. The resolved time advances only when a checkpoint
-		// is popped, since checkpoints guarantee that all transactions
-		// with timestamp <= checkpoint.Timestamp have been sent.
-		watermark watermarkHeap
+		// latestCheckpoint is the highest checkpoint timestamp received. A
+		// checkpoint at timestamp T guarantees that all transactions with
+		// timestamp <= T have been sent.
+		latestCheckpoint hlc.Timestamp
+
+		// replicatedTime is a min-heap of unapplied transaction TxnIDs
+		// ordered by timestamp. It uses lazy deletion: resolved entries
+		// are popped from the top during recalculateReplicatedTimeLocked.
+		replicatedTime replicatedTimeHeap
 
 		// horizonWaiting is a min-heap of transactions that have no
 		// remaining dependencies but cannot be applied yet because the
@@ -289,10 +293,7 @@ func (a *Applier) recordTransaction(transaction ScheduledTransaction) (bool, err
 
 	transaction.remainingDeps = len(transaction.Dependencies)
 	a.mu.transactions[transaction.TxnID] = transaction
-	heap.Push(&a.mu.watermark, watermarkEntry{
-		timestamp: transaction.TxnID.Timestamp,
-		txnID:     transaction.TxnID,
-	})
+	heap.Push(&a.mu.replicatedTime, transaction.TxnID)
 
 	var newRemoteDeps []ldrdecoder.TxnID
 	for _, dep := range transaction.Dependencies {
@@ -324,9 +325,9 @@ func (a *Applier) recordTransaction(transaction ScheduledTransaction) (bool, err
 	return false, nil
 }
 
-// processCheckpoint handles a checkpoint event by pushing it onto the
-// watermark heap. Returns true if the checkpoint was recorded and the
-// caller should signal the aggregator to attempt a drain.
+// processCheckpoint handles a checkpoint event by recording it as the latest
+// checkpoint. Returns true if the checkpoint advanced past the current resolved
+// time and the caller should signal the aggregator to recalculate.
 func (a *Applier) processCheckpoint(checkpoint hlc.Timestamp) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -335,10 +336,9 @@ func (a *Applier) processCheckpoint(checkpoint hlc.Timestamp) bool {
 		return false
 	}
 
-	heap.Push(&a.mu.watermark, watermarkEntry{
-		timestamp:    checkpoint,
-		isCheckpoint: true,
-	})
+	if a.mu.latestCheckpoint.Less(checkpoint) {
+		a.mu.latestCheckpoint = checkpoint
+	}
 	return true
 }
 
@@ -440,23 +440,8 @@ func (a *Applier) recordCompletion(
 		delete(a.mu.transactions, completedID)
 	}
 
-	// Advance the resolved time by draining the watermark heap. Pop
-	// resolved transactions (they are fully applied) and checkpoints
-	// (which advance the resolved time). Stop at the first unresolved
-	// transaction.
 	prevResolvedTime := a.mu.committed.ResolvedTime()
-	for a.mu.watermark.Len() != 0 {
-		entry := a.mu.watermark.peek()
-		if entry.isCheckpoint {
-			heap.Pop(&a.mu.watermark)
-			a.mu.committed.UpdateResolvedTime(entry.timestamp)
-		} else {
-			if !a.mu.committed.IsResolved(entry.txnID) {
-				break
-			}
-			heap.Pop(&a.mu.watermark)
-		}
-	}
+	a.recalculateReplicatedTimeLocked()
 
 	resolvedTime := a.mu.committed.ResolvedTime()
 	if prevResolvedTime.Less(resolvedTime) {
@@ -523,6 +508,38 @@ func (a *Applier) getGlobalFrontierLocked() hlc.Timestamp {
 		}
 	}
 	return minFrontier
+}
+
+// recalculateReplicatedTimeLocked computes replicated time from the oldest
+// unapplied transaction and the latest checkpoint. If no unapplied
+// transactions remain, replicated time advances to the latest checkpoint.
+// Otherwise it advances to min(oldestUnapplied.Prev(), latestCheckpoint).
+//
+// Resolved entries are lazily popped from the replicatedTime heap.
+//
+// REQUIRES: a.mu is held.
+func (a *Applier) recalculateReplicatedTimeLocked() {
+	for a.mu.replicatedTime.Len() > 0 {
+		top := a.mu.replicatedTime.peek()
+		if !a.mu.committed.IsResolved(top) {
+			break
+		}
+		heap.Pop(&a.mu.replicatedTime)
+	}
+
+	var newResolved hlc.Timestamp
+	if a.mu.replicatedTime.Len() == 0 {
+		newResolved = a.mu.latestCheckpoint
+	} else {
+		oldest := a.mu.replicatedTime.peek()
+		candidateTS := oldest.Timestamp.Prev()
+		if a.mu.latestCheckpoint.Less(candidateTS) {
+			newResolved = a.mu.latestCheckpoint
+		} else {
+			newResolved = candidateTS
+		}
+	}
+	a.mu.committed.UpdateResolvedTime(newResolved)
 }
 
 // registerHorizonWaitLocked identifies which remote appliers' frontiers are
