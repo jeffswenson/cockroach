@@ -73,6 +73,7 @@ type Checkpoint struct{ Timestamp hlc.Timestamp }
 // arrive before the checkpoint that closes their time window.
 type Applier struct {
 	id          ldrdecoder.ApplierID
+	router      ldrdecoder.ApplierRouter
 	depResolver DependencyResolver
 
 	mu struct {
@@ -129,6 +130,7 @@ func NewApplier(
 	writers []txnwriter.TransactionWriter,
 	depResolver DependencyResolver,
 	allApplierIDs []ldrdecoder.ApplierID,
+	router ldrdecoder.ApplierRouter,
 ) (_ *Applier, retErr error) {
 	defer func() {
 		if retErr != nil {
@@ -143,8 +145,12 @@ func NewApplier(
 	if depResolver == nil {
 		return nil, errors.New("dependency resolver must not be nil")
 	}
+	if router == nil {
+		return nil, errors.New("applier router must not be nil")
+	}
 	a := &Applier{
 		id:                id,
+		router:            router,
 		depResolver:       depResolver,
 		txnWriters:        writers,
 		localResolvedTime: MakeLatest[hlc.Timestamp](),
@@ -238,10 +244,10 @@ func (a *Applier) recordTransaction(transaction ScheduledTransaction) (bool, err
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if transaction.TxnID.ApplierID != a.id {
+	if routedID := a.router.Route(transaction.TxnID.UUID); routedID != a.id {
 		return false, errors.AssertionFailedf(
-			"transaction %+v has ApplierID %d, expected %d",
-			transaction.TxnID, transaction.TxnID.ApplierID, a.id)
+			"transaction %+v routed to applier %d, expected %d",
+			transaction.TxnID, routedID, a.id)
 	}
 
 	if transaction.TxnID.Timestamp.LessEq(a.mu.committed.ResolvedTime()) {
@@ -264,7 +270,7 @@ func (a *Applier) recordTransaction(transaction ScheduledTransaction) (bool, err
 	transaction.Dependencies = slices.DeleteFunc(
 		transaction.Dependencies,
 		func(txnID ldrdecoder.TxnID) bool {
-			if txnID.ApplierID == a.id {
+			if a.router.Route(txnID.UUID) == a.id {
 				// Local dep: prune if already committed.
 				if a.mu.committed.IsResolved(txnID) {
 					return true
@@ -284,7 +290,8 @@ func (a *Applier) recordTransaction(transaction ScheduledTransaction) (bool, err
 			}
 			// Remote dep: prune if remote applier's resolvedTime has advanced
 			// past its timestamp.
-			resolvedTime := a.mu.remoteApplierResolvedTimes[txnID.ApplierID]
+			depApplierID := a.router.Route(txnID.UUID)
+			resolvedTime := a.mu.remoteApplierResolvedTimes[depApplierID]
 			return txnID.Timestamp.LessEq(resolvedTime)
 		})
 	if err != nil {
@@ -297,7 +304,7 @@ func (a *Applier) recordTransaction(transaction ScheduledTransaction) (bool, err
 
 	var newRemoteDeps []ldrdecoder.TxnID
 	for _, dep := range transaction.Dependencies {
-		if dep.ApplierID == a.id {
+		if a.router.Route(dep.UUID) == a.id {
 			a.mu.localWaiting[dep] = append(a.mu.localWaiting[dep], transaction.TxnID)
 		} else {
 			a.mu.remoteWaiting[dep] = append(a.mu.remoteWaiting[dep], transaction.TxnID)
@@ -451,12 +458,12 @@ func (a *Applier) recordCompletion(
 	a.drainSatisfiedHorizonWaitersLocked(readyBuffer)
 
 	if !completedTxn.isCheckpointSignal {
-		a.depResolver.Ready(completedTxn.TxnID, resolvedTime)
+		a.depResolver.Ready(a.id, completedTxn.TxnID, resolvedTime)
 	} else if prevResolvedTime.Less(resolvedTime) {
 		// Notify the dependency resolver about the frontier advancement
 		// so remote appliers waiting on horizon timestamps can proceed.
-		synthID := ldrdecoder.TxnID{ApplierID: a.id, Timestamp: resolvedTime}
-		a.depResolver.Ready(synthID, resolvedTime)
+		synthID := ldrdecoder.MakeTxnIDFromTimestamp(resolvedTime)
+		a.depResolver.Ready(a.id, synthID, resolvedTime)
 	}
 	return nil
 }
@@ -585,8 +592,9 @@ func (a *Applier) processRemoteUpdate(
 	// arrive when a WaitHorizon eager response (with an older resolvedTime)
 	// races with a Ready notification (with a newer resolvedTime) from the
 	// same remote applier.
-	if a.mu.remoteApplierResolvedTimes[update.TxnID.ApplierID].Less(update.ResolvedTime) {
-		a.mu.remoteApplierResolvedTimes[update.TxnID.ApplierID] = update.ResolvedTime
+	sourceApplierID := update.SourceApplierID
+	if a.mu.remoteApplierResolvedTimes[sourceApplierID].Less(update.ResolvedTime) {
+		a.mu.remoteApplierResolvedTimes[sourceApplierID] = update.ResolvedTime
 	}
 
 	if err := a.resolveDependencyLocked(

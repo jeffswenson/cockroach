@@ -154,8 +154,9 @@ func (p *TxnLdrCoordinator) Resume(ctx context.Context) error {
 	// NewApplier takes ownership of writers.
 	const applierID ldrdecoder.ApplierID = 1
 	allIDs := []ldrdecoder.ApplierID{applierID}
+	router := ldrdecoder.NewHashRouter(allIDs)
 	applierEvents := make(chan txnapply.ApplierEvent)
-	applier, err := txnapply.NewApplier(ctx, applierID, writers, txnapply.NewDependencyTracker(allIDs), allIDs)
+	applier, err := txnapply.NewApplier(ctx, applierID, writers, txnapply.NewDependencyTracker(allIDs, router), allIDs, router)
 	if err != nil {
 		return errors.Wrap(err, "creating applier")
 	}
@@ -199,7 +200,7 @@ func (p *TxnLdrCoordinator) Resume(ctx context.Context) error {
 		return p.stageDecode(ctx, feed, txnDecoder, batches)
 	})
 	group.GoCtx(func(ctx context.Context) error {
-		return p.stageSchedule(ctx, lockSynthesizer, scheduler, applierID, batches, applierEvents)
+		return p.stageSchedule(ctx, lockSynthesizer, scheduler, batches, applierEvents)
 	})
 	group.GoCtx(func(ctx context.Context) error {
 		return p.stageApply(ctx, applier, applierEvents)
@@ -312,7 +313,6 @@ func (p *TxnLdrCoordinator) stageSchedule(
 	ctx context.Context,
 	lockSynthesizer *txnlock.LockSynthesizer,
 	scheduler *txnscheduler.Scheduler,
-	applierID ldrdecoder.ApplierID,
 	batches chan decodedBatch,
 	applierEvents chan txnapply.ApplierEvent,
 ) error {
@@ -341,8 +341,6 @@ func (p *TxnLdrCoordinator) stageSchedule(
 			}
 
 			for i := range batch.transactions {
-				batch.transactions[i].TxnID.ApplierID = applierID
-
 				// Derive locks for the transaction.
 				lockSet, err := lockSynthesizer.DeriveLocks(ctx, batch.transactions[i].WriteSet)
 				if err != nil {

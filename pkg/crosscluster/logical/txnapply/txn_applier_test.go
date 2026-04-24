@@ -7,6 +7,7 @@ package txnapply
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"testing"
@@ -19,9 +20,35 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
+
+// makeTestTxnID creates a deterministic TxnID that encodes the applierID into
+// the UUID's first 8 bytes (for routing) and the wallTime in the next 4 bytes
+// (for uniqueness). The testRouter extracts the applierID back from the UUID.
+func makeTestTxnID(applierID ldrdecoder.ApplierID, wallTime int64) ldrdecoder.TxnID {
+	var buf [16]byte
+	binary.BigEndian.PutUint64(buf[:8], uint64(applierID))
+	binary.BigEndian.PutUint32(buf[8:12], uint32(wallTime))
+	return ldrdecoder.TxnID{
+		Timestamp: hlc.Timestamp{WallTime: wallTime},
+		UUID:      uuid.FromBytesOrNil(buf[:]),
+	}
+}
+
+// testRouter extracts the applierID encoded in the first 8 bytes of a UUID
+// created by makeTestTxnID.
+type testRouter struct{}
+
+func (testRouter) Route(id uuid.UUID) ldrdecoder.ApplierID {
+	return ldrdecoder.ApplierID(binary.BigEndian.Uint64(id[:8]))
+}
+
+func makeTestRouter(_ []txnNode) ldrdecoder.ApplierRouter {
+	return testRouter{}
+}
 
 // testWriter is a test implementation of txnwriter.TransactionWriter that
 // adds a random delay and records applied transactions to a shared log.
@@ -49,7 +76,7 @@ func (w *testWriter) ApplyBatch(
 
 	results := make([]txnwriter.ApplyResult, len(txns))
 	for i, txn := range txns {
-		w.t.Logf("applier %d applied txn at %d", txn.TxnID.ApplierID, txn.TxnID.Timestamp.WallTime)
+		w.t.Logf("applied txn %s at %d", txn.TxnID, txn.TxnID.Timestamp.WallTime)
 		w.mu.log = append(w.mu.log, txn.TxnID.Timestamp)
 		results[i] = txnwriter.ApplyResult{AppliedRows: len(txn.WriteSet)}
 	}
@@ -73,10 +100,7 @@ type depsOpt []int64
 
 func (d depsOpt) add(n *txnNode) {
 	for _, w := range d {
-		n.deps = append(n.deps, ldrdecoder.TxnID{
-			Timestamp: hlc.Timestamp{WallTime: w},
-			ApplierID: 1,
-		})
+		n.deps = append(n.deps, makeTestTxnID(1, w))
 	}
 }
 
@@ -98,10 +122,7 @@ func ddeps(pairs ...int64) ddepsOpt {
 	}
 	out := make(ddepsOpt, len(pairs)/2)
 	for i := 0; i < len(pairs); i += 2 {
-		out[i/2] = ldrdecoder.TxnID{
-			ApplierID: ldrdecoder.ApplierID(pairs[i]),
-			Timestamp: hlc.Timestamp{WallTime: pairs[i+1]},
-		}
+		out[i/2] = makeTestTxnID(ldrdecoder.ApplierID(pairs[i]), pairs[i+1])
 	}
 	return out
 }
@@ -115,10 +136,7 @@ func (h horizonOpt) add(n *txnNode) {
 func horizon(wallTime int64) horizonOpt { return horizonOpt(wallTime) }
 
 func txn(wallTime int64, opts ...txnOpt) txnNode {
-	n := txnNode{id: ldrdecoder.TxnID{
-		Timestamp: hlc.Timestamp{WallTime: wallTime},
-		ApplierID: 1,
-	}}
+	n := txnNode{id: makeTestTxnID(1, wallTime)}
 	for _, o := range opts {
 		o.add(&n)
 	}
@@ -127,10 +145,7 @@ func txn(wallTime int64, opts ...txnOpt) txnNode {
 
 // dtxn creates a txnNode assigned to a specific applier.
 func dtxn(applierID ldrdecoder.ApplierID, wallTime int64, opts ...txnOpt) txnNode {
-	n := txnNode{id: ldrdecoder.TxnID{
-		Timestamp: hlc.Timestamp{WallTime: wallTime},
-		ApplierID: applierID,
-	}}
+	n := txnNode{id: makeTestTxnID(applierID, wallTime)}
 	for _, o := range opts {
 		o.add(&n)
 	}
@@ -162,10 +177,7 @@ func generateRandomDAG(rng *rand.Rand, numTxns int, maxDeps int, numAppliers int
 		if numAppliers > 1 {
 			applierID = ldrdecoder.ApplierID(rng.Intn(numAppliers) + 1)
 		}
-		nodes[i].id = ldrdecoder.TxnID{
-			Timestamp: hlc.Timestamp{WallTime: int64(i + 1)},
-			ApplierID: applierID,
-		}
+		nodes[i].id = makeTestTxnID(applierID, int64(i+1))
 
 		if i-batchStart >= capacity {
 			// Batch is full: advance the event horizon to the timestamp of
@@ -227,9 +239,7 @@ func checkTrackerServerDrained(t testing.TB, ts *trackerServer) {
 	for txn, waiters := range ts.mu.waiters {
 		require.Empty(t, waiters, "waiters for txn %s should be empty", txn)
 	}
-	for applier, horizons := range ts.mu.horizonWaiters {
-		require.Empty(t, horizons, "horizonWaiters for applier %d should be empty", applier)
-	}
+	require.Equal(t, 0, ts.mu.horizonWaiters.Len(), "horizonWaiters should be empty")
 	require.Empty(t, ts.mu.committed.completedTxns, "completedTxns should be empty")
 }
 
@@ -374,6 +384,7 @@ func TestTxnApplierIndependent(t *testing.T) {
 // and also probabilistically sends intermediate checkpoints.
 type mockCoordinator struct {
 	rng            *rand.Rand
+	router         ldrdecoder.ApplierRouter
 	ids            []ldrdecoder.ApplierID
 	inputs         map[ldrdecoder.ApplierID]chan ApplierEvent
 	lastCheckpoint hlc.Timestamp
@@ -382,10 +393,14 @@ type mockCoordinator struct {
 }
 
 func newMockCoordinator(
-	rng *rand.Rand, ids []ldrdecoder.ApplierID, inputs map[ldrdecoder.ApplierID]chan ApplierEvent,
+	rng *rand.Rand,
+	router ldrdecoder.ApplierRouter,
+	ids []ldrdecoder.ApplierID,
+	inputs map[ldrdecoder.ApplierID]chan ApplierEvent,
 ) *mockCoordinator {
 	return &mockCoordinator{
 		rng:         rng,
+		router:      router,
 		ids:         ids,
 		inputs:      inputs,
 		extraCPProb: rng.Float64() * 0.5,
@@ -417,7 +432,7 @@ func (c *mockCoordinator) flushBuffer() {
 		c.buffer[i], c.buffer[j] = c.buffer[j], c.buffer[i]
 	})
 	for _, node := range c.buffer {
-		c.inputs[node.id.ApplierID] <- ScheduledTransaction{
+		c.inputs[c.router.Route(node.id.UUID)] <- ScheduledTransaction{
 			Transaction:  ldrdecoder.Transaction{TxnID: node.id},
 			Dependencies: node.deps,
 			EventHorizon: node.eventHorizon,
@@ -440,19 +455,27 @@ func runDistributedApplier(
 ) []hlc.Timestamp {
 	t.Helper()
 
-	// Group txns per applier, preserving order.
-	txnsByApplier := make(map[ldrdecoder.ApplierID][]txnNode)
+	// Collect applier IDs from the DAG. Use a map for dedup while preserving
+	// the set of IDs referenced.
+	idSet := make(map[ldrdecoder.ApplierID]bool)
+	router := makeTestRouter(dag)
 	for _, node := range dag {
-		txnsByApplier[node.id.ApplierID] = append(
-			txnsByApplier[node.id.ApplierID], node)
+		idSet[router.Route(node.id.UUID)] = true
 	}
 
-	ids := make([]ldrdecoder.ApplierID, 0, len(txnsByApplier))
-	for id := range txnsByApplier {
+	ids := make([]ldrdecoder.ApplierID, 0, len(idSet))
+	for id := range idSet {
 		ids = append(ids, id)
 	}
 
-	depTracker := NewDependencyTracker(ids)
+	// Group txns per applier, preserving order.
+	txnsByApplier := make(map[ldrdecoder.ApplierID][]txnNode)
+	for _, node := range dag {
+		txnsByApplier[router.Route(node.id.UUID)] = append(
+			txnsByApplier[router.Route(node.id.UUID)], node)
+	}
+
+	depTracker := NewDependencyTracker(ids, router)
 
 	// Shared writer so all appliers record to one log, giving us a global
 	// application order.
@@ -483,14 +506,14 @@ func runDistributedApplier(
 		for i := range writers {
 			writers[i] = sharedWriter
 		}
-		a, err := NewApplier(ctx, id, writers, depTracker, ids)
+		a, err := NewApplier(ctx, id, writers, depTracker, ids, router)
 		require.NoError(t, err)
 
 		inputs[id] = make(chan ApplierEvent, 2*len(dag)+len(ids)+1)
 		appliers[id] = a
 	}
 
-	coord := newMockCoordinator(rng, ids, inputs)
+	coord := newMockCoordinator(rng, router, ids, inputs)
 	for _, node := range dag {
 		coord.send(node)
 	}
@@ -600,18 +623,25 @@ func BenchmarkTxnApplier(b *testing.B) {
 func runBenchApplier(b *testing.B, dag []txnNode, numWritersPerApplier int, rngSeed int64) {
 	b.Helper()
 
-	txnsByApplier := make(map[ldrdecoder.ApplierID][]txnNode)
+	router := makeTestRouter(dag)
+
+	idSet := make(map[ldrdecoder.ApplierID]bool)
 	for _, node := range dag {
-		txnsByApplier[node.id.ApplierID] = append(
-			txnsByApplier[node.id.ApplierID], node)
+		idSet[router.Route(node.id.UUID)] = true
 	}
 
-	ids := make([]ldrdecoder.ApplierID, 0, len(txnsByApplier))
-	for id := range txnsByApplier {
+	ids := make([]ldrdecoder.ApplierID, 0, len(idSet))
+	for id := range idSet {
 		ids = append(ids, id)
 	}
 
-	depTracker := NewDependencyTracker(ids)
+	txnsByApplier := make(map[ldrdecoder.ApplierID][]txnNode)
+	for _, node := range dag {
+		txnsByApplier[router.Route(node.id.UUID)] = append(
+			txnsByApplier[router.Route(node.id.UUID)], node)
+	}
+
+	depTracker := NewDependencyTracker(ids, router)
 
 	sharedWriter := &benchWriter{}
 
@@ -635,13 +665,13 @@ func runBenchApplier(b *testing.B, dag []txnNode, numWritersPerApplier int, rngS
 		for i := range writers {
 			writers[i] = sharedWriter
 		}
-		a, err := NewApplier(ctx, id, writers, depTracker, ids)
+		a, err := NewApplier(ctx, id, writers, depTracker, ids, router)
 		require.NoError(b, err)
 		inputs[id] = make(chan ApplierEvent, 2*len(dag)+len(ids)+1)
 		appliers[id] = a
 	}
 
-	coord := newMockCoordinator(rng, ids, inputs)
+	coord := newMockCoordinator(rng, router, ids, inputs)
 	for _, node := range dag {
 		coord.send(node)
 	}

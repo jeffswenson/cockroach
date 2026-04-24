@@ -7,12 +7,14 @@ package ldrdecoder
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
@@ -21,11 +23,12 @@ import (
 // dependencies.
 type ApplierID int32
 
-// TxnID uniquely identifies a transaction. Comparison methods (Less, LessEq)
+// TxnID uniquely identifies a transaction. The UUID is the primary identity,
+// while the Timestamp provides ordering. Comparison methods (Less, LessEq)
 // delegate to the underlying Timestamp, so TxnIDs are ordered by timestamp.
 type TxnID struct {
 	Timestamp hlc.Timestamp
-	ApplierID ApplierID
+	UUID      uuid.UUID
 }
 
 func (t TxnID) Less(s TxnID) bool { return t.Timestamp.Less(s.Timestamp) }
@@ -35,7 +38,41 @@ func (t TxnID) LessEq(s TxnID) bool { return t.Timestamp.LessEq(s.Timestamp) }
 func (t TxnID) IsSet() bool { return t.Timestamp.IsSet() }
 
 func (t TxnID) String() string {
-	return fmt.Sprintf("(%d,%d)", t.ApplierID, t.Timestamp.WallTime)
+	return fmt.Sprintf("(%s,%d)", t.UUID.Short(), t.Timestamp.WallTime)
+}
+
+// ApplierRouter determines which applier owns a transaction based on its UUID.
+type ApplierRouter interface {
+	Route(id uuid.UUID) ApplierID
+}
+
+// HashRouter routes transactions to appliers by hashing the UUID.
+type HashRouter struct {
+	applierIDs []ApplierID
+}
+
+// NewHashRouter creates a router that distributes transactions across appliers
+// using a hash of the UUID.
+func NewHashRouter(ids []ApplierID) *HashRouter {
+	return &HashRouter{applierIDs: ids}
+}
+
+// Route picks an applier for the given UUID by hashing.
+func (r *HashRouter) Route(id uuid.UUID) ApplierID {
+	h := binary.BigEndian.Uint64(id[:8])
+	return r.applierIDs[h%uint64(len(r.applierIDs))]
+}
+
+// MakeTxnIDFromTimestamp creates a deterministic TxnID from an MVCC timestamp.
+// Used by the scheduler-based path where transactions don't have source UUIDs.
+func MakeTxnIDFromTimestamp(ts hlc.Timestamp) TxnID {
+	var buf [16]byte
+	binary.BigEndian.PutUint64(buf[:8], uint64(ts.WallTime))
+	binary.BigEndian.PutUint32(buf[8:12], uint32(ts.Logical))
+	return TxnID{
+		Timestamp: ts,
+		UUID:      uuid.FromBytesOrNil(buf[:]),
+	}
 }
 
 type Transaction struct {
@@ -67,7 +104,7 @@ func (t *TxnDecoder) DecodeTxn(
 	}
 
 	var result Transaction
-	result.TxnID.Timestamp = transaction[0].KeyValue.Value.Timestamp
+	result.TxnID = MakeTxnIDFromTimestamp(transaction[0].KeyValue.Value.Timestamp)
 	result.WriteSet = make([]DecodedRow, 0, len(transaction))
 
 	for _, event := range transaction {
