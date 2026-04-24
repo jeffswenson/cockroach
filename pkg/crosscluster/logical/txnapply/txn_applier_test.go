@@ -213,7 +213,7 @@ func checkApplierDrained(t testing.TB, applier *Applier) {
 	require.Empty(t, applier.mu.transactions, "transactions map should be empty")
 	require.Empty(t, applier.mu.localWaiting, "local waiting map should be empty")
 	require.Empty(t, applier.mu.remoteWaiting, "remote waiting map should be empty")
-	require.Equal(t, 0, applier.mu.txnIDs.Len(), "txnIDs buffer should be empty")
+	require.Equal(t, 0, applier.mu.watermark.Len(), "watermark heap should be empty")
 	require.Empty(t, applier.mu.horizonWaiting, "horizonWaiting should be empty")
 }
 
@@ -377,6 +377,7 @@ type mockCoordinator struct {
 	inputs         map[ldrdecoder.ApplierID]chan ApplierEvent
 	lastCheckpoint hlc.Timestamp
 	extraCPProb    float64
+	buffer         []txnNode
 }
 
 func newMockCoordinator(
@@ -401,18 +402,31 @@ func (c *mockCoordinator) sendCheckpoint(ts hlc.Timestamp) {
 func (c *mockCoordinator) send(node txnNode) {
 	cpTs := hlc.Timestamp{WallTime: node.id.Timestamp.WallTime - 1}
 	if c.lastCheckpoint.Less(node.eventHorizon) {
+		c.flushBuffer()
 		c.sendCheckpoint(cpTs)
 	} else if c.rng.Float64() < c.extraCPProb {
+		c.flushBuffer()
 		c.sendCheckpoint(cpTs)
 	}
-	c.inputs[node.id.ApplierID] <- ScheduledTransaction{
-		Transaction:  ldrdecoder.Transaction{TxnID: node.id},
-		Dependencies: node.deps,
-		EventHorizon: node.eventHorizon,
+	c.buffer = append(c.buffer, node)
+}
+
+func (c *mockCoordinator) flushBuffer() {
+	c.rng.Shuffle(len(c.buffer), func(i, j int) {
+		c.buffer[i], c.buffer[j] = c.buffer[j], c.buffer[i]
+	})
+	for _, node := range c.buffer {
+		c.inputs[node.id.ApplierID] <- ScheduledTransaction{
+			Transaction:  ldrdecoder.Transaction{TxnID: node.id},
+			Dependencies: node.deps,
+			EventHorizon: node.eventHorizon,
+		}
 	}
+	c.buffer = c.buffer[:0]
 }
 
 func (c *mockCoordinator) finalize(maxCheckpoint hlc.Timestamp) {
+	c.flushBuffer()
 	c.sendCheckpoint(maxCheckpoint)
 }
 

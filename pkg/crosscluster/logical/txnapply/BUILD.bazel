@@ -8,6 +8,7 @@ go_library(
         "horizon_heap.go",
         "latest.go",
         "txn_applier.go",
+        "watermark_heap.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/crosscluster/logical/txnapply",
     visibility = ["//visibility:public"],
@@ -29,11 +30,13 @@ go_test(
     srcs = [
         "committed_set_test.go",
         "txn_applier_test.go",
+        "watermark_heap_test.go",
     ],
     embed = [":txnapply"],
     deps = [
         "//pkg/crosscluster/logical/ldrdecoder",
         "//pkg/crosscluster/logical/txnwriter",
+        "//pkg/util/container/heap",
         "//pkg/util/ctxgroup",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
