@@ -22,7 +22,8 @@ import (
 
 type appliedTransaction struct {
 	ldrdecoder.Transaction
-	applyResult txnwriter.ApplyResult
+	applyResult        txnwriter.ApplyResult
+	isCheckpointSignal bool // true for checkpoint drain signals, no txn data
 }
 
 type ScheduledTransaction struct {
@@ -68,8 +69,8 @@ type Checkpoint struct{ Timestamp hlc.Timestamp }
 // both t2 and t4 have been applied and after the replicated time advances past
 // t1. Since t5 doesn't depend on t3, t5 can be applied before t3 completes.
 //
-// Also note that the applier assumes it is sent transactions in increasing
-// timestamp order.
+// Transactions may arrive out of order, but all transactions are guaranteed to
+// arrive before the checkpoint that closes their time window.
 type Applier struct {
 	id          ldrdecoder.ApplierID
 	depResolver DependencyResolver
@@ -95,9 +96,11 @@ type Applier struct {
 		// remote applier, updated via DependencyResolver notifications.
 		remoteApplierResolvedTimes map[ldrdecoder.ApplierID]hlc.Timestamp
 
-		// txnIDs buffers TxnIDs of transactions in the order they were
-		// received, to help with replicatedTime tracking.
-		txnIDs ring.Buffer[ldrdecoder.TxnID]
+		// watermark is a min-heap of transactions and checkpoints ordered
+		// by timestamp. The resolved time advances only when a checkpoint
+		// is popped, since checkpoints guarantee that all transactions
+		// with timestamp <= checkpoint.Timestamp have been sent.
+		watermark watermarkHeap
 
 		// horizonWaiting is a min-heap of transactions that have no
 		// remaining dependencies but cannot be applied yet because the
@@ -215,12 +218,11 @@ func (a *Applier) coordinator(
 					}
 				}
 			case Checkpoint:
-				synthTxn, ok := a.processCheckpoint(e.Timestamp)
-				if ok {
+				if a.processCheckpoint(e.Timestamp) {
 					select {
 					case <-ctx.Done():
 						return ctx.Err()
-					case applied <- synthTxn:
+					case applied <- appliedTransaction{isCheckpointSignal: true}:
 					}
 				}
 			}
@@ -238,6 +240,17 @@ func (a *Applier) recordTransaction(transaction ScheduledTransaction) (bool, err
 			transaction.TxnID, transaction.TxnID.ApplierID, a.id)
 	}
 
+	if transaction.TxnID.Timestamp.LessEq(a.mu.committed.ResolvedTime()) {
+		return false, errors.AssertionFailedf(
+			"transaction %s arrived after resolved time %s",
+			transaction.TxnID, a.mu.committed.ResolvedTime())
+	}
+
+	// Deduplicate: skip if already recorded or already committed.
+	if _, exists := a.mu.transactions[transaction.TxnID]; exists {
+		return false, nil
+	}
+
 	var err error
 	// Clone the slice to avoid mutating the caller's slice.
 	//
@@ -252,8 +265,16 @@ func (a *Applier) recordTransaction(transaction ScheduledTransaction) (bool, err
 				if a.mu.committed.IsResolved(txnID) {
 					return true
 				}
+				// The dep may not have arrived yet due to out-of-order
+				// delivery. But if its timestamp is at or below the resolved
+				// time and it is not committed, the checkpoint contract was
+				// violated — the dep should have been sent before the
+				// checkpoint that advanced the resolved time past it.
 				if _, ok := a.mu.transactions[txnID]; !ok {
-					err = errors.AssertionFailedf("missing dependency %+v", txnID)
+					if txnID.Timestamp.LessEq(a.mu.committed.ResolvedTime()) {
+						err = errors.AssertionFailedf(
+							"local dep %+v below resolved time but not committed", txnID)
+					}
 				}
 				return false
 			}
@@ -268,12 +289,10 @@ func (a *Applier) recordTransaction(transaction ScheduledTransaction) (bool, err
 
 	transaction.remainingDeps = len(transaction.Dependencies)
 	a.mu.transactions[transaction.TxnID] = transaction
-	if a.mu.txnIDs.Len() != 0 && transaction.TxnID.LessEq(a.mu.txnIDs.GetLast()) {
-		return false, errors.AssertionFailedf(
-			"transactions must be sent in increasing timestamp order: got %s, last was %s",
-			transaction.TxnID.Timestamp, a.mu.txnIDs.GetLast().Timestamp)
-	}
-	a.mu.txnIDs.AddLast(transaction.TxnID)
+	heap.Push(&a.mu.watermark, watermarkEntry{
+		timestamp: transaction.TxnID.Timestamp,
+		txnID:     transaction.TxnID,
+	})
 
 	var newRemoteDeps []ldrdecoder.TxnID
 	for _, dep := range transaction.Dependencies {
@@ -305,35 +324,22 @@ func (a *Applier) recordTransaction(transaction ScheduledTransaction) (bool, err
 	return false, nil
 }
 
-// processCheckpoint handles a checkpoint event. If the checkpoint is beyond the
-// last recorded txn, it synthesizes an already-applied transaction to advance
-// the frontier.
-func (a *Applier) processCheckpoint(checkpoint hlc.Timestamp) (appliedTransaction, bool) {
+// processCheckpoint handles a checkpoint event by pushing it onto the
+// watermark heap. Returns true if the checkpoint was recorded and the
+// caller should signal the aggregator to attempt a drain.
+func (a *Applier) processCheckpoint(checkpoint hlc.Timestamp) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// Drop if checkpoint ts ≤ last txnID ts (no synthetic txn needed;
-	// the real txn's completion will advance the frontier).
-	if a.mu.txnIDs.Len() != 0 &&
-		checkpoint.LessEq(a.mu.txnIDs.GetLast().Timestamp) {
-		return appliedTransaction{}, false
-	}
-
-	// Also drop if checkpoint ts ≤ current resolved time (the aggregator
-	// may have already drained txnIDs past this point).
 	if checkpoint.LessEq(a.mu.committed.ResolvedTime()) {
-		return appliedTransaction{}, false
+		return false
 	}
 
-	// Synthesize an already-applied txn at the checkpoint timestamp.
-	// Only added to txnIDs (not transactions) since it is already resolved.
-	synthID := ldrdecoder.TxnID{ApplierID: a.id, Timestamp: checkpoint}
-	a.mu.committed.Resolve(synthID)
-	a.mu.txnIDs.AddLast(synthID)
-
-	return appliedTransaction{
-		Transaction: ldrdecoder.Transaction{TxnID: synthID},
-	}, true
+	heap.Push(&a.mu.watermark, watermarkEntry{
+		timestamp:    checkpoint,
+		isCheckpoint: true,
+	})
+	return true
 }
 
 func (a *Applier) writer(
@@ -421,34 +427,35 @@ func (a *Applier) recordCompletion(
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	completedID := completedTxn.TxnID
-	if err := a.resolveDependencyLocked(
-		completedID, a.mu.localWaiting[completedID], readyBuffer,
-	); err != nil {
-		return err
-	}
-	delete(a.mu.localWaiting, completedID)
-
-	a.mu.committed.Resolve(completedID)
-	delete(a.mu.transactions, completedID)
-
-	// Advance the resolved time by draining applied txns from the front
-	// of the ordered txnIDs buffer.
-	prevResolvedTime := a.mu.committed.ResolvedTime()
-	for a.mu.txnIDs.Len() != 0 {
-		id := a.mu.txnIDs.GetFirst()
-		if !a.mu.committed.IsResolved(id) {
-			// Advance the resolved time through the gap before this
-			// unapplied txn. Since the coordinator records txns in
-			// timestamp order, if txnIDs contains a txn at timestamp T,
-			// there are no txns for this applier in the interval
-			// (resolvedTime, T). The resolved time can safely advance
-			// to T-1.
-			a.mu.committed.UpdateResolvedTime(id.Timestamp.FloorPrev())
-			break
+	if !completedTxn.isCheckpointSignal {
+		completedID := completedTxn.TxnID
+		if err := a.resolveDependencyLocked(
+			completedID, a.mu.localWaiting[completedID], readyBuffer,
+		); err != nil {
+			return err
 		}
-		a.mu.committed.UpdateResolvedTime(id.Timestamp)
-		a.mu.txnIDs.RemoveFirst()
+		delete(a.mu.localWaiting, completedID)
+
+		a.mu.committed.Resolve(completedID)
+		delete(a.mu.transactions, completedID)
+	}
+
+	// Advance the resolved time by draining the watermark heap. Pop
+	// resolved transactions (they are fully applied) and checkpoints
+	// (which advance the resolved time). Stop at the first unresolved
+	// transaction.
+	prevResolvedTime := a.mu.committed.ResolvedTime()
+	for a.mu.watermark.Len() != 0 {
+		entry := a.mu.watermark.peek()
+		if entry.isCheckpoint {
+			heap.Pop(&a.mu.watermark)
+			a.mu.committed.UpdateResolvedTime(entry.timestamp)
+		} else {
+			if !a.mu.committed.IsResolved(entry.txnID) {
+				break
+			}
+			heap.Pop(&a.mu.watermark)
+		}
 	}
 
 	resolvedTime := a.mu.committed.ResolvedTime()
@@ -457,7 +464,15 @@ func (a *Applier) recordCompletion(
 	}
 
 	a.drainSatisfiedHorizonWaitersLocked(readyBuffer)
-	a.depResolver.Ready(completedTxn.TxnID, resolvedTime)
+
+	if !completedTxn.isCheckpointSignal {
+		a.depResolver.Ready(completedTxn.TxnID, resolvedTime)
+	} else if prevResolvedTime.Less(resolvedTime) {
+		// Notify the dependency resolver about the frontier advancement
+		// so remote appliers waiting on horizon timestamps can proceed.
+		synthID := ldrdecoder.TxnID{ApplierID: a.id, Timestamp: resolvedTime}
+		a.depResolver.Ready(synthID, resolvedTime)
+	}
 	return nil
 }
 
