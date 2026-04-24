@@ -3494,6 +3494,27 @@ message TxnFeedEvent {
   TxnFeedError      error      = 3;
 }
 
+// TxnFeedMessage wraps a TxnFeedEvent with the registered span it was
+// produced for and optional enrichment details.
+message TxnFeedMessage {
+  TxnFeedEvent event = 1 [(gogoproto.nullable) = false];
+  roachpb.Span registered_span = 2 [(gogoproto.nullable) = false];
+  // Set only for committed events when enrichment is enabled.
+  TxnFeedDetails details = 3;
+}
+
+// TxnFeedDetails holds the enriched write data and dependency
+// information for a committed transaction, fetched via GetTxnDetails.
+message TxnFeedDetails {
+  repeated RangeFeedValue writes = 1 [(gogoproto.nullable) = false];
+  repeated bytes dependencies = 2 [
+    (gogoproto.customname) = "Dependencies",
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"
+  ];
+  util.hlc.Timestamp event_horizon = 3 [
+    (gogoproto.nullable) = false];
+}
+
 // MuxTxnFeedEvent wraps a TxnFeedEvent with routing metadata for multiplexed
 // streams, following the MuxRangeFeedEvent pattern.
 message MuxTxnFeedEvent {
@@ -3540,7 +3561,7 @@ message GetTxnDetailsRequest {
 message GetTxnDetailsResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // The KV writes this transaction performed on this range.
-  repeated TxnDetailKV writes = 2 [(gogoproto.nullable) = false];
+  repeated RangeFeedValue writes = 2 [(gogoproto.nullable) = false];
   // UUIDs of transactions that this transaction depends on within the
   // (dependency_cutoff, commit_timestamp] window.
   repeated bytes dependencies = 3 [
@@ -3554,12 +3575,6 @@ message GetTxnDetailsResponse {
   // transactions with timestamps at or before event_horizon must be
   // assumed to be dependencies of this transaction.
   util.hlc.Timestamp event_horizon = 4 [(gogoproto.nullable) = false];
-}
-
-// TxnDetailKV represents a single KV write within a transaction on a range.
-message TxnDetailKV {
-  KeyValue key_value = 1 [(gogoproto.nullable) = false];
-  Value prev_value = 2 [(gogoproto.nullable) = false];
 }
 
 // ResetQuorumRequest makes a range that is unavailable due to lost quorum

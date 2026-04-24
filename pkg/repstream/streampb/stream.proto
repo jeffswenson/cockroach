@@ -391,3 +391,33 @@ message StreamIngestionStats {
   // has been recorded yet.
   ReplicationLagInfo replication_lag_info = 5;
 }
+
+// TxnFeedPartitionSpec specifies parameters for a txnfeed partition stream
+// started via crdb_internal.txn_feed_partition. The subscriber serializes
+// this and sends it as the spec argument.
+message TxnFeedPartitionSpec {
+  // Spans to subscribe to, each paired with a start-after timestamp.
+  // The timestamp on each ResolvedSpan is exclusive: the first possible
+  // emitted event will be strictly after that timestamp.
+  repeated cockroach.sql.jobs.jobspb.ResolvedSpan spans = 1 [(gogoproto.nullable) = false];
+
+  // When true, the producer enriches committed events with write data
+  // and dependency information via GetTxnDetails.
+  bool enrich = 2;
+
+  // Restrict enrichment to spans overlapping at least one detail span.
+  // Empty means all spans are included.
+  repeated roachpb.Span detail_spans = 3 [(gogoproto.nullable) = false];
+
+  // Spans for which only dependency information is needed (not write
+  // data). Write spans fully contained by a dep-only span are moved to
+  // the read set in the GetTxnDetails request.
+  repeated roachpb.Span dep_only_spans = 4 [(gogoproto.nullable) = false];
+}
+
+// TxnFeedBatch is the unit of data returned by each Next() call of the
+// txn_feed_partition generator. It contains one or more messages that
+// have accumulated since the subscriber last polled.
+message TxnFeedBatch {
+  repeated roachpb.TxnFeedMessage messages = 1 [(gogoproto.nullable) = false];
+}

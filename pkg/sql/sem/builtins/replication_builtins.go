@@ -261,6 +261,42 @@ var replicationBuiltins = map[string]builtinDefinition{
 		),
 	),
 
+	"crdb_internal.txn_feed_partition": makeBuiltin(
+		tree.FunctionProperties{
+			Category:           builtinconstants.CategoryClusterReplication,
+			Undocumented:       true,
+			DistsqlBlocklist:   false,
+			VectorizeStreaming: true,
+		},
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "stream_id", Typ: types.Int},
+				{Name: "spec", Typ: types.Bytes},
+			},
+			types.MakeLabeledTuple(
+				[]*types.T{types.Bytes},
+				[]string{"txn_feed_event"},
+			),
+			func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+				mgr, err := evalCtx.StreamManagerFactory.GetReplicationStreamManager(ctx)
+				if err != nil {
+					return nil, err
+				}
+				streamID := streampb.StreamID(tree.MustBeDInt(args[0]))
+				if err := mgr.AuthorizeViaJob(ctx, streamID); err != nil {
+					return nil, err
+				}
+				return mgr.TxnFeedPartition(
+					ctx,
+					streamID,
+					[]byte(tree.MustBeDBytes(args[1])),
+				)
+			},
+			"Stream txn feed partition data",
+			volatility.Volatile,
+		),
+	),
+
 	"crdb_internal.replication_stream_spec": makeBuiltin(
 		tree.FunctionProperties{
 			Category:         builtinconstants.CategoryClusterReplication,

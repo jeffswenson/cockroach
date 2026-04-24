@@ -240,9 +240,9 @@ func startFeedAndDrain(
 	span roachpb.Span,
 	startAfter hlc.Timestamp,
 	opts ...kvcoord.TxnFeedOption,
-) (getEvents func() []kvcoord.TxnFeedMessage, cancel func(), feedErrCh <-chan error) {
+) (getEvents func() []kvpb.TxnFeedMessage, cancel func(), feedErrCh <-chan error) {
 	t.Helper()
-	eventCh := make(chan kvcoord.TxnFeedMessage, 1024)
+	eventCh := make(chan kvpb.TxnFeedMessage, 1024)
 	errCh := make(chan error, 1)
 	feedCtx, feedCancel := context.WithCancel(ctx)
 
@@ -254,7 +254,7 @@ func startFeedAndDrain(
 
 	var (
 		mu     sync.Mutex
-		events []kvcoord.TxnFeedMessage
+		events []kvpb.TxnFeedMessage
 	)
 	go func() {
 		for {
@@ -269,10 +269,10 @@ func startFeedAndDrain(
 		}
 	}()
 
-	return func() []kvcoord.TxnFeedMessage {
+	return func() []kvpb.TxnFeedMessage {
 		mu.Lock()
 		defer mu.Unlock()
-		cp := make([]kvcoord.TxnFeedMessage, len(events))
+		cp := make([]kvpb.TxnFeedMessage, len(events))
 		copy(cp, events)
 		return cp
 	}, feedCancel, errCh
@@ -280,10 +280,7 @@ func startFeedAndDrain(
 
 // waitForTxns waits until all expected transactions appear in the feed.
 func waitForTxns(
-	t *testing.T,
-	txns []committedTxn,
-	getEvents func() []kvcoord.TxnFeedMessage,
-	feedErrCh <-chan error,
+	t *testing.T, txns []committedTxn, getEvents func() []kvpb.TxnFeedMessage, feedErrCh <-chan error,
 ) {
 	t.Helper()
 	testutils.SucceedsSoon(t, func() error {
@@ -295,8 +292,8 @@ func waitForTxns(
 		evs := getEvents()
 		seen := make(map[uuid.UUID]struct{})
 		for _, ev := range evs {
-			if ev.Committed != nil {
-				seen[ev.Committed.TxnID] = struct{}{}
+			if ev.Event.Committed != nil {
+				seen[ev.Event.Committed.TxnID] = struct{}{}
 			}
 		}
 		missing := 0
@@ -316,10 +313,7 @@ func waitForTxns(
 // validateEvents checks completeness, checkpoint ordering, and event
 // validity on the collected events.
 func validateEvents(
-	t *testing.T,
-	txns []committedTxn,
-	collectedEvents []kvcoord.TxnFeedMessage,
-	feedSpan roachpb.Span,
+	t *testing.T, txns []committedTxn, collectedEvents []kvpb.TxnFeedMessage, feedSpan roachpb.Span,
 ) {
 	t.Helper()
 
@@ -330,8 +324,8 @@ func validateEvents(
 
 	committedEvents := make(map[uuid.UUID]*kvpb.TxnFeedCommitted)
 	for _, ev := range collectedEvents {
-		if ev.Committed != nil {
-			committedEvents[ev.Committed.TxnID] = ev.Committed
+		if ev.Event.Committed != nil {
+			committedEvents[ev.Event.Committed.TxnID] = ev.Event.Committed
 		}
 	}
 
@@ -347,17 +341,17 @@ func validateEvents(
 	maxResolved := make(map[string]hlc.Timestamp)
 	spanByKey := make(map[string]roachpb.Span)
 	for _, ev := range collectedEvents {
-		if ev.Checkpoint != nil {
-			key := ev.Checkpoint.AnchorSpan.String()
-			if ev.Checkpoint.ResolvedTS.Less(maxResolved[key]) {
+		if ev.Event.Checkpoint != nil {
+			key := ev.Event.Checkpoint.AnchorSpan.String()
+			if ev.Event.Checkpoint.ResolvedTS.Less(maxResolved[key]) {
 				t.Errorf("checkpoint went backwards for %s: %s < %s",
-					key, ev.Checkpoint.ResolvedTS, maxResolved[key])
+					key, ev.Event.Checkpoint.ResolvedTS, maxResolved[key])
 			}
-			maxResolved[key] = ev.Checkpoint.ResolvedTS
-			spanByKey[key] = ev.Checkpoint.AnchorSpan
+			maxResolved[key] = ev.Event.Checkpoint.ResolvedTS
+			spanByKey[key] = ev.Event.Checkpoint.AnchorSpan
 		}
-		if ev.Committed != nil {
-			anchorKey, err := keys.Addr(ev.Committed.AnchorKey)
+		if ev.Event.Committed != nil {
+			anchorKey, err := keys.Addr(ev.Event.Committed.AnchorKey)
 			if err != nil {
 				continue
 			}
@@ -365,10 +359,10 @@ func validateEvents(
 				if !spanByKey[spanKey].ContainsKey(anchorKey.AsRawKey()) {
 					continue
 				}
-				if ev.Committed.CommitTimestamp.Less(resolved) {
+				if ev.Event.Committed.CommitTimestamp.Less(resolved) {
 					t.Errorf("committed txn %s at %s after checkpoint %s for %s",
-						ev.Committed.TxnID.Short(),
-						ev.Committed.CommitTimestamp, resolved, spanKey)
+						ev.Event.Committed.TxnID.Short(),
+						ev.Event.Committed.CommitTimestamp, resolved, spanKey)
 				}
 			}
 		}
@@ -390,10 +384,7 @@ func validateEvents(
 // validateEnrichment checks that enriched events carry correct write
 // data matching the ground truth from the workload.
 func validateEnrichment(
-	t *testing.T,
-	txns []committedTxn,
-	collectedEvents []kvcoord.TxnFeedMessage,
-	feedSpan roachpb.Span,
+	t *testing.T, txns []committedTxn, collectedEvents []kvpb.TxnFeedMessage, feedSpan roachpb.Span,
 ) {
 	t.Helper()
 
@@ -415,21 +406,21 @@ func validateEnrichment(
 
 	// 1. Every committed event must have Details.
 	for _, ev := range collectedEvents {
-		if ev.Committed == nil {
+		if ev.Event.Committed == nil {
 			require.Nilf(t, ev.Details,
 				"non-committed event has Details set")
 			continue
 		}
 		require.NotNilf(t, ev.Details,
-			"committed txn %s missing Details", ev.Committed.TxnID.Short())
+			"committed txn %s missing Details", ev.Event.Committed.TxnID.Short())
 	}
 
 	// 2. For workload txns, verify write data matches ground truth.
 	for _, ev := range collectedEvents {
-		if ev.Committed == nil {
+		if ev.Event.Committed == nil {
 			continue
 		}
-		expected, isOurs := wantWrites[ev.Committed.TxnID]
+		expected, isOurs := wantWrites[ev.Event.Committed.TxnID]
 		if !isOurs {
 			continue
 		}
@@ -437,12 +428,12 @@ func validateEnrichment(
 		// Build a map of actual writes by key.
 		gotWrites := make(map[string]string)
 		for _, w := range ev.Details.Writes {
-			val, err := w.KeyValue.Value.GetBytes()
+			val, err := w.Value.GetBytes()
 			if err != nil {
 				// Tombstone — value is empty.
-				gotWrites[string(w.KeyValue.Key)] = ""
+				gotWrites[string(w.Key)] = ""
 			} else {
-				gotWrites[string(w.KeyValue.Key)] = string(val)
+				gotWrites[string(w.Key)] = string(val)
 			}
 		}
 
@@ -451,25 +442,25 @@ func validateEnrichment(
 			gotVal, ok := gotWrites[string(ew.key)]
 			require.Truef(t, ok,
 				"txn %s: expected write at %s not found in Details.Writes",
-				ev.Committed.TxnID.Short(), ew.key)
+				ev.Event.Committed.TxnID.Short(), ew.key)
 			require.Equalf(t, ew.value, gotVal,
-				"txn %s: wrong value at %s", ev.Committed.TxnID.Short(), ew.key)
+				"txn %s: wrong value at %s", ev.Event.Committed.TxnID.Short(), ew.key)
 		}
 
 		// Verify write count matches (no unexpected extra writes).
 		require.Equalf(t, len(expected), len(ev.Details.Writes),
-			"txn %s: unexpected write count", ev.Committed.TxnID.Short())
+			"txn %s: unexpected write count", ev.Event.Committed.TxnID.Short())
 	}
 
 	// 3. All write keys in Details must be within the feed span.
 	for _, ev := range collectedEvents {
-		if ev.Committed == nil || ev.Details == nil {
+		if ev.Event.Committed == nil || ev.Details == nil {
 			continue
 		}
 		for _, w := range ev.Details.Writes {
-			require.Truef(t, feedSpan.ContainsKey(w.KeyValue.Key),
+			require.Truef(t, feedSpan.ContainsKey(w.Key),
 				"txn %s: write key %s outside feed span %s",
-				ev.Committed.TxnID.Short(), w.KeyValue.Key, feedSpan)
+				ev.Event.Committed.TxnID.Short(), w.Key, feedSpan)
 		}
 	}
 
@@ -479,13 +470,13 @@ func validateEnrichment(
 	maxResolved := make(map[string]hlc.Timestamp)
 	spanByKey := make(map[string]roachpb.Span)
 	for _, ev := range collectedEvents {
-		if ev.Checkpoint != nil {
-			key := ev.Checkpoint.AnchorSpan.String()
-			maxResolved[key] = ev.Checkpoint.ResolvedTS
-			spanByKey[key] = ev.Checkpoint.AnchorSpan
+		if ev.Event.Checkpoint != nil {
+			key := ev.Event.Checkpoint.AnchorSpan.String()
+			maxResolved[key] = ev.Event.Checkpoint.ResolvedTS
+			spanByKey[key] = ev.Event.Checkpoint.AnchorSpan
 		}
-		if ev.Committed != nil {
-			anchorKey, err := keys.Addr(ev.Committed.AnchorKey)
+		if ev.Event.Committed != nil {
+			anchorKey, err := keys.Addr(ev.Event.Committed.AnchorKey)
 			if err != nil {
 				continue
 			}
@@ -493,10 +484,10 @@ func validateEnrichment(
 				if !spanByKey[spanKey].ContainsKey(anchorKey.AsRawKey()) {
 					continue
 				}
-				if ev.Committed.CommitTimestamp.Less(resolved) {
+				if ev.Event.Committed.CommitTimestamp.Less(resolved) {
 					t.Errorf("enriched committed txn %s at %s after checkpoint %s for %s",
-						ev.Committed.TxnID.Short(),
-						ev.Committed.CommitTimestamp, resolved, spanKey)
+						ev.Event.Committed.TxnID.Short(),
+						ev.Event.Committed.CommitTimestamp, resolved, spanKey)
 				}
 			}
 		}
@@ -585,7 +576,7 @@ func TestDistSenderTxnFeed_CatchUpScan(t *testing.T) {
 func validateDetailSpanEnrichment(
 	t *testing.T,
 	txns []committedTxn,
-	collectedEvents []kvcoord.TxnFeedMessage,
+	collectedEvents []kvpb.TxnFeedMessage,
 	detailSpans []roachpb.Span,
 ) {
 	t.Helper()
@@ -602,13 +593,13 @@ func validateDetailSpanEnrichment(
 	// 1. Every committed event must have non-nil Details (the RPC
 	//    is always sent, even when no spans overlap).
 	for _, ev := range collectedEvents {
-		if ev.Committed == nil {
+		if ev.Event.Committed == nil {
 			require.Nilf(t, ev.Details,
 				"non-committed event has Details set")
 			continue
 		}
 		require.NotNilf(t, ev.Details,
-			"committed txn %s missing Details", ev.Committed.TxnID.Short())
+			"committed txn %s missing Details", ev.Event.Committed.TxnID.Short())
 	}
 
 	// 2. Build filtered ground truth: only writes whose keys fall
@@ -631,21 +622,21 @@ func validateDetailSpanEnrichment(
 	// 3. For each workload txn, verify the enriched writes match
 	//    the filtered ground truth exactly.
 	for _, ev := range collectedEvents {
-		if ev.Committed == nil {
+		if ev.Event.Committed == nil {
 			continue
 		}
-		expected, isOurs := wantWrites[ev.Committed.TxnID]
+		expected, isOurs := wantWrites[ev.Event.Committed.TxnID]
 		if !isOurs {
 			continue
 		}
 
 		gotWrites := make(map[string]string)
 		for _, w := range ev.Details.Writes {
-			val, err := w.KeyValue.Value.GetBytes()
+			val, err := w.Value.GetBytes()
 			if err != nil {
-				gotWrites[string(w.KeyValue.Key)] = ""
+				gotWrites[string(w.Key)] = ""
 			} else {
-				gotWrites[string(w.KeyValue.Key)] = string(val)
+				gotWrites[string(w.Key)] = string(val)
 			}
 		}
 
@@ -653,26 +644,26 @@ func validateDetailSpanEnrichment(
 			gotVal, ok := gotWrites[string(ew.key)]
 			require.Truef(t, ok,
 				"txn %s: expected write at %s not found in Details.Writes",
-				ev.Committed.TxnID.Short(), ew.key)
+				ev.Event.Committed.TxnID.Short(), ew.key)
 			require.Equalf(t, ew.value, gotVal,
 				"txn %s: wrong value at %s",
-				ev.Committed.TxnID.Short(), ew.key)
+				ev.Event.Committed.TxnID.Short(), ew.key)
 		}
 
 		require.Equalf(t, len(expected), len(ev.Details.Writes),
 			"txn %s: write count mismatch (expected %d in detail spans, got %d)",
-			ev.Committed.TxnID.Short(), len(expected), len(ev.Details.Writes))
+			ev.Event.Committed.TxnID.Short(), len(expected), len(ev.Details.Writes))
 	}
 
 	// 4. All write keys in Details must fall within a detail span.
 	for _, ev := range collectedEvents {
-		if ev.Committed == nil || ev.Details == nil {
+		if ev.Event.Committed == nil || ev.Details == nil {
 			continue
 		}
 		for _, w := range ev.Details.Writes {
-			require.Truef(t, keyInDetailSpans(w.KeyValue.Key),
+			require.Truef(t, keyInDetailSpans(w.Key),
 				"txn %s: write key %s outside all detail spans",
-				ev.Committed.TxnID.Short(), w.KeyValue.Key)
+				ev.Event.Committed.TxnID.Short(), w.Key)
 		}
 	}
 
@@ -680,13 +671,13 @@ func validateDetailSpanEnrichment(
 	maxResolved := make(map[string]hlc.Timestamp)
 	spanByKey := make(map[string]roachpb.Span)
 	for _, ev := range collectedEvents {
-		if ev.Checkpoint != nil {
-			key := ev.Checkpoint.AnchorSpan.String()
-			maxResolved[key] = ev.Checkpoint.ResolvedTS
-			spanByKey[key] = ev.Checkpoint.AnchorSpan
+		if ev.Event.Checkpoint != nil {
+			key := ev.Event.Checkpoint.AnchorSpan.String()
+			maxResolved[key] = ev.Event.Checkpoint.ResolvedTS
+			spanByKey[key] = ev.Event.Checkpoint.AnchorSpan
 		}
-		if ev.Committed != nil {
-			anchorKey, err := keys.Addr(ev.Committed.AnchorKey)
+		if ev.Event.Committed != nil {
+			anchorKey, err := keys.Addr(ev.Event.Committed.AnchorKey)
 			if err != nil {
 				continue
 			}
@@ -694,10 +685,10 @@ func validateDetailSpanEnrichment(
 				if !spanByKey[spanKey].ContainsKey(anchorKey.AsRawKey()) {
 					continue
 				}
-				if ev.Committed.CommitTimestamp.Less(resolved) {
+				if ev.Event.Committed.CommitTimestamp.Less(resolved) {
 					t.Errorf("committed txn %s at %s after checkpoint %s for %s",
-						ev.Committed.TxnID.Short(),
-						ev.Committed.CommitTimestamp, resolved, spanKey)
+						ev.Event.Committed.TxnID.Short(),
+						ev.Event.Committed.CommitTimestamp, resolved, spanKey)
 				}
 			}
 		}
@@ -739,7 +730,7 @@ func validateDetailSpanEnrichment(
 func validateDepOnlyEnrichment(
 	t *testing.T,
 	txns []committedTxn,
-	collectedEvents []kvcoord.TxnFeedMessage,
+	collectedEvents []kvpb.TxnFeedMessage,
 	detailSpans []roachpb.Span,
 	depOnlySpans []roachpb.Span,
 ) {
@@ -764,13 +755,13 @@ func validateDepOnlyEnrichment(
 
 	// 1. Every committed event must have non-nil Details.
 	for _, ev := range collectedEvents {
-		if ev.Committed == nil {
+		if ev.Event.Committed == nil {
 			require.Nilf(t, ev.Details,
 				"non-committed event has Details set")
 			continue
 		}
 		require.NotNilf(t, ev.Details,
-			"committed txn %s missing Details", ev.Committed.TxnID.Short())
+			"committed txn %s missing Details", ev.Event.Committed.TxnID.Short())
 	}
 
 	// 2. Build filtered ground truth: writes in detail spans but
@@ -792,21 +783,21 @@ func validateDepOnlyEnrichment(
 
 	// 3. Verify enriched writes match filtered ground truth.
 	for _, ev := range collectedEvents {
-		if ev.Committed == nil {
+		if ev.Event.Committed == nil {
 			continue
 		}
-		expected, isOurs := wantWrites[ev.Committed.TxnID]
+		expected, isOurs := wantWrites[ev.Event.Committed.TxnID]
 		if !isOurs {
 			continue
 		}
 
 		gotWrites := make(map[string]string)
 		for _, w := range ev.Details.Writes {
-			val, err := w.KeyValue.Value.GetBytes()
+			val, err := w.Value.GetBytes()
 			if err != nil {
-				gotWrites[string(w.KeyValue.Key)] = ""
+				gotWrites[string(w.Key)] = ""
 			} else {
-				gotWrites[string(w.KeyValue.Key)] = string(val)
+				gotWrites[string(w.Key)] = string(val)
 			}
 		}
 
@@ -814,38 +805,38 @@ func validateDepOnlyEnrichment(
 			gotVal, ok := gotWrites[string(ew.key)]
 			require.Truef(t, ok,
 				"txn %s: expected write at %s not found in Details.Writes",
-				ev.Committed.TxnID.Short(), ew.key)
+				ev.Event.Committed.TxnID.Short(), ew.key)
 			require.Equalf(t, ew.value, gotVal,
 				"txn %s: wrong value at %s",
-				ev.Committed.TxnID.Short(), ew.key)
+				ev.Event.Committed.TxnID.Short(), ew.key)
 		}
 
 		require.Equalf(t, len(expected), len(ev.Details.Writes),
 			"txn %s: write count mismatch (expected %d, got %d)",
-			ev.Committed.TxnID.Short(), len(expected), len(ev.Details.Writes))
+			ev.Event.Committed.TxnID.Short(), len(expected), len(ev.Details.Writes))
 	}
 
 	// 4. No write key in Details should be in a dep-only span.
 	for _, ev := range collectedEvents {
-		if ev.Committed == nil || ev.Details == nil {
+		if ev.Event.Committed == nil || ev.Details == nil {
 			continue
 		}
 		for _, w := range ev.Details.Writes {
-			require.Falsef(t, keyInDepOnlySpans(w.KeyValue.Key),
+			require.Falsef(t, keyInDepOnlySpans(w.Key),
 				"txn %s: write key %s is in dep-only span but appeared in Details.Writes",
-				ev.Committed.TxnID.Short(), w.KeyValue.Key)
+				ev.Event.Committed.TxnID.Short(), w.Key)
 		}
 	}
 
 	// 5. All write keys must be in detail spans.
 	for _, ev := range collectedEvents {
-		if ev.Committed == nil || ev.Details == nil {
+		if ev.Event.Committed == nil || ev.Details == nil {
 			continue
 		}
 		for _, w := range ev.Details.Writes {
-			require.Truef(t, keyInDetailSpans(w.KeyValue.Key),
+			require.Truef(t, keyInDetailSpans(w.Key),
 				"txn %s: write key %s outside all detail spans",
-				ev.Committed.TxnID.Short(), w.KeyValue.Key)
+				ev.Event.Committed.TxnID.Short(), w.Key)
 		}
 	}
 
@@ -853,13 +844,13 @@ func validateDepOnlyEnrichment(
 	maxResolved := make(map[string]hlc.Timestamp)
 	spanByKey := make(map[string]roachpb.Span)
 	for _, ev := range collectedEvents {
-		if ev.Checkpoint != nil {
-			key := ev.Checkpoint.AnchorSpan.String()
-			maxResolved[key] = ev.Checkpoint.ResolvedTS
-			spanByKey[key] = ev.Checkpoint.AnchorSpan
+		if ev.Event.Checkpoint != nil {
+			key := ev.Event.Checkpoint.AnchorSpan.String()
+			maxResolved[key] = ev.Event.Checkpoint.ResolvedTS
+			spanByKey[key] = ev.Event.Checkpoint.AnchorSpan
 		}
-		if ev.Committed != nil {
-			anchorKey, err := keys.Addr(ev.Committed.AnchorKey)
+		if ev.Event.Committed != nil {
+			anchorKey, err := keys.Addr(ev.Event.Committed.AnchorKey)
 			if err != nil {
 				continue
 			}
@@ -867,10 +858,10 @@ func validateDepOnlyEnrichment(
 				if !spanByKey[spanKey].ContainsKey(anchorKey.AsRawKey()) {
 					continue
 				}
-				if ev.Committed.CommitTimestamp.Less(resolved) {
+				if ev.Event.Committed.CommitTimestamp.Less(resolved) {
 					t.Errorf("committed txn %s at %s after checkpoint %s for %s",
-						ev.Committed.TxnID.Short(),
-						ev.Committed.CommitTimestamp, resolved, spanKey)
+						ev.Event.Committed.TxnID.Short(),
+						ev.Event.Committed.CommitTimestamp, resolved, spanKey)
 				}
 			}
 		}
@@ -972,7 +963,7 @@ func TestDistSenderTxnFeed_DepOnlySpansValidation(t *testing.T) {
 	feedSpan := roachpb.Span{
 		Key: c.scratchKey, EndKey: c.scratchKey.PrefixEnd(),
 	}
-	eventCh := make(chan kvcoord.TxnFeedMessage, 1)
+	eventCh := make(chan kvpb.TxnFeedMessage, 1)
 
 	// Detail spans [d, g), dep-only span [m, q) — no overlap.
 	err := c.ds.TxnFeed(ctx, []kvcoord.SpanTimePair{
