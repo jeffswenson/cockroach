@@ -301,7 +301,7 @@ message TransactionEvent {
   // Transactions that this transaction depends on. Transaction A depends on
   // B if A's write set overlaps B's write set, or A's read set overlaps B's
   // write set. Populated from GetTxnDetails results.
-  repeated TransactionDependency dependencies = 5 [(gogoproto.nullable) = false];
+  repeated cockroach.kv.kvpb.TxnDependency dependencies = 5 [(gogoproto.nullable) = false];
   // The MVCC timestamp up to which dependencies have been fully enumerated.
   // The dependencies list contains all transactions that committed in
   // (event_horizon, commit_timestamp]. There may be additional dependent
@@ -316,15 +316,6 @@ message TransactionEvent {
   util.hlc.Timestamp event_horizon = 6 [(gogoproto.nullable) = false];
 }
 
-// TransactionDependency identifies a single transaction that another
-// transaction depends on.
-message TransactionDependency {
-  bytes txn_id = 1 [
-    (gogoproto.customname) = "TxnID",
-    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID",
-    (gogoproto.nullable) = false
-  ];
-}
 
 // TransactionCheckpoint represents a resolved timestamp for a set of anchor
 // key spans in the transactional LDR stream. All transactions with anchor keys

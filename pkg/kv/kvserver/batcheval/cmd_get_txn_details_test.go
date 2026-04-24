@@ -292,14 +292,14 @@ func TestCollectWrites(t *testing.T) {
 				"wrong number of writes")
 
 			for i, w := range resp.Writes {
-				require.Equal(t, tc.expectedKeys[i], string(w.KeyValue.Key),
+				require.Equal(t, tc.expectedKeys[i], string(w.Key),
 					"wrong key at index %d", i)
 
 				if tc.expectedValues[i] == "" {
-					require.Len(t, w.KeyValue.Value.RawBytes, 0,
+					require.Len(t, w.Value.RawBytes, 0,
 						"expected tombstone at index %d", i)
 				} else {
-					v, err := w.KeyValue.Value.GetBytes()
+					v, err := w.Value.GetBytes()
 					require.NoError(t, err)
 					require.Equal(t, tc.expectedValues[i], string(v),
 						"wrong value at index %d", i)
@@ -384,7 +384,8 @@ func TestCollectDependencies(t *testing.T) {
 			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
-		require.Equal(t, writerA, resp.Dependencies[0])
+		require.Equal(t, writerA, resp.Dependencies[0].TxnID)
+		require.Equal(t, ts(5), resp.Dependencies[0].CommitTimestamp)
 		require.Equal(t, ts(1), resp.EventHorizon)
 	})
 
@@ -476,7 +477,7 @@ func TestCollectDependencies(t *testing.T) {
 		require.Len(t, resp.Dependencies, 2)
 		depSet := make(map[uuid.UUID]struct{})
 		for _, d := range resp.Dependencies {
-			depSet[d] = struct{}{}
+			depSet[d.TxnID] = struct{}{}
 		}
 		require.Contains(t, depSet, writerA)
 		require.Contains(t, depSet, writerB)
@@ -499,7 +500,7 @@ func TestCollectDependencies(t *testing.T) {
 			[]roachpb.Span{mkSpan("a", "c")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
-		require.Equal(t, writerA, resp.Dependencies[0])
+		require.Equal(t, writerA, resp.Dependencies[0].TxnID)
 	})
 
 	t.Run("tombstone version is not a dependency", func(t *testing.T) {
@@ -539,7 +540,7 @@ func TestCollectDependencies(t *testing.T) {
 			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
-		require.Equal(t, writerB, resp.Dependencies[0])
+		require.Equal(t, writerB, resp.Dependencies[0].TxnID)
 	})
 
 	t.Run("own write at commitTS looks through to prior version", func(t *testing.T) {
@@ -562,7 +563,7 @@ func TestCollectDependencies(t *testing.T) {
 			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
-		require.Equal(t, writerA, resp.Dependencies[0])
+		require.Equal(t, writerA, resp.Dependencies[0].TxnID)
 		require.Equal(t, ts(1), resp.EventHorizon)
 	})
 
@@ -626,7 +627,7 @@ func TestCollectDependencies(t *testing.T) {
 			[]roachpb.Span{mkSpan("a", "c")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
-		require.Equal(t, writerA, resp.Dependencies[0])
+		require.Equal(t, writerA, resp.Dependencies[0].TxnID)
 		// event_horizon should be ts=7 (the missed timestamp).
 		require.Equal(t, ts(7), resp.EventHorizon)
 	})
@@ -651,7 +652,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		require.Len(t, resp.Writes, 1)
 		require.Len(t, resp.Dependencies, 1)
-		require.Equal(t, writerA, resp.Dependencies[0])
+		require.Equal(t, writerA, resp.Dependencies[0].TxnID)
 		require.Equal(t, ts(1), resp.EventHorizon)
 	})
 
@@ -720,6 +721,6 @@ func TestCollectDependencies(t *testing.T) {
 
 		require.Len(t, resp.Writes, 1)
 		require.Len(t, resp.Dependencies, 1)
-		require.Equal(t, writerA, resp.Dependencies[0])
+		require.Equal(t, writerA, resp.Dependencies[0].TxnID)
 	})
 }
