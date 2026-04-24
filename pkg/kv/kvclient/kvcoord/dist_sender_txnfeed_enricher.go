@@ -142,6 +142,7 @@ func enrichBatch(
 			},
 			TxnID:            c.TxnID,
 			CommitTimestamp:  c.CommitTimestamp,
+			ReadTimestamp:    c.ReadTimestamp,
 			DependencyCutoff: depCutoff,
 			ReadSpans:        readSpans,
 			WriteSpans:       writeSpans,

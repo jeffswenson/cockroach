@@ -3464,6 +3464,8 @@ message TxnFeedCommitted {
   repeated Span read_spans = 4 [(gogoproto.nullable) = false];
   // The key spans that the transaction wrote.
   repeated Span write_spans = 5 [(gogoproto.nullable) = false];
+  // The MVCC timestamp at which the transaction performed reads.
+  util.hlc.Timestamp read_timestamp = 6 [(gogoproto.nullable) = false];
 }
 
 // TxnFeedCheckpoint is a TxnFeedEvent variant representing the guarantee that
@@ -3533,6 +3535,9 @@ message GetTxnDetailsRequest {
   // The requesting transaction's write spans, pre-clipped to the target range.
   // Used to find write-write conflicts against other transactions' writes.
   repeated Span write_spans = 6 [(gogoproto.nullable) = false];
+  // The transaction's read timestamp. Used as the upper bound when
+  // scanning read spans for dependencies.
+  util.hlc.Timestamp read_timestamp = 7 [(gogoproto.nullable) = false];
 }
 
 // GetTxnDetailsResponse returns a transaction's writes and dependencies on the

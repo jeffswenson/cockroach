@@ -508,6 +508,7 @@ func (p *Processor) publishCommitted(ctx context.Context, op *kvserverpb.TxnFeed
 			TxnID:           op.TxnID,
 			AnchorKey:       op.AnchorKey,
 			CommitTimestamp: op.WriteTimestamp,
+			ReadTimestamp:   op.ReadTimestamp,
 			WriteSpans:      op.WriteSpans,
 			ReadSpans:       op.ReadSpans,
 		},
