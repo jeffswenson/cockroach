@@ -73,7 +73,9 @@ func GetTxnDetails(
 		}
 	}
 
-	// Collect read dependencies using the CommitIndex.
+	// Collect dependencies using the CommitIndex. Dependencies come from
+	// two sources: read spans (the values we read) and write spans (the
+	// previous values we overwrote).
 	commitIndex := cArgs.EvalCtx.GetCommitIndex()
 	if commitIndex == nil || args.DependencyCutoff.IsEmpty() {
 		reply.EventHorizon = args.CommitTimestamp
@@ -91,6 +93,12 @@ func GetTxnDetails(
 				args.TxnID, commitIndex, deps, &reply.EventHorizon,
 			); err != nil {
 				return result.Result{}, err
+			}
+		}
+		for i := range reply.Writes {
+			prevTS := reply.Writes[i].PrevValue.Timestamp
+			if !prevTS.IsEmpty() && args.DependencyCutoff.Less(prevTS) {
+				addDep(prevTS, args.TxnID, commitIndex, deps, &reply.EventHorizon)
 			}
 		}
 		for id := range deps {

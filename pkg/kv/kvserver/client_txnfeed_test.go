@@ -592,7 +592,7 @@ func verifyWriteSet(t *testing.T, writes []kvpb.TxnDetailKV, expected []expected
 // pipeline: CommitIndex population during Raft apply, followed by
 // GetTxnDetails resolving read dependencies via the CommitIndex.
 //
-// The test uses two ranges and six transactions:
+// The test uses two ranges and seven transactions:
 //
 //   - Txn A (1PC): writes keyA on range 1. No dependencies.
 //   - Txn B (2PC): reads keyA on range 1, writes keyB1 on range 1 and
@@ -608,10 +608,13 @@ func verifyWriteSet(t *testing.T, writes []kvpb.TxnDetailKV, expected []expected
 //   - Txn F (1PC): reads keyE2 on range 2, writes keyF on range 1.
 //     Depends on txn E. The dependency is only discoverable on range 2
 //     via the asynchronously resolved intent.
+//   - Txn G (1PC): blind-overwrites keyA, writes keyG. Depends on txn A
+//     via the write set's previous value (keyA is not in read spans).
 //
 // This exercises 1PC and 2PC CommitIndex population, cross-range
 // GetTxnDetails via DistSender, dependency chaining, multi-range
-// dependency merging, and async intent resolution.
+// dependency merging, async intent resolution, and write-write
+// dependencies.
 func TestGetTxnDetailsDependencies(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -881,6 +884,34 @@ func TestGetTxnDetailsDependencies(t *testing.T) {
 		"txn F should depend on txn E (via keyE2 on range 2, async-resolved)")
 	verifyWriteSet(t, detailsF.Writes, []expectedWrite{
 		{key: keyF, value: "from-txn-f"},
+	})
+
+	// --- Txn G: blind overwrite of keyA (no read), writes keyG ---
+	// Txn G overwrites keyA without reading it first, so keyA is NOT
+	// in the read spans. The dependency on txn A should be discovered
+	// from the write set's previous value.
+	keyG := append(scratchKey.Clone(), 'g')
+	var txnGID uuid.UUID
+	err = db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		txnGID = txn.ID()
+		b := txn.NewBatch()
+		b.Put(keyA, "overwritten-by-txn-g")
+		b.Put(keyG, "from-txn-g")
+		return txn.CommitInBatch(ctx, b)
+	})
+	require.NoError(t, err)
+
+	committedG := waitForCommittedEvent(t, stream, txnGID)
+	logCommitted(t, "txn G (1PC)", committedG)
+
+	// --- Verify txn G depends on txn A via write prev value ---
+	detailsG := getTxnDetails(t, committedG)
+	logDetails(t, "txn G", detailsG)
+	require.Contains(t, detailsG.Dependencies, txnAID,
+		"txn G should depend on txn A (via overwriting keyA)")
+	verifyWriteSet(t, detailsG.Writes, []expectedWrite{
+		{key: keyA, value: "overwritten-by-txn-g", prevVal: "from-txn-a"},
+		{key: keyG, value: "from-txn-g"},
 	})
 }
 
