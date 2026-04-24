@@ -726,7 +726,7 @@ func TestGetTxnDetailsDependencies(t *testing.T) {
 			t.Logf("  write: %s", w.Key)
 		}
 		for _, dep := range d.Dependencies {
-			t.Logf("  depends on: %s", dep.Short())
+			t.Logf("  depends on: %s @ %s", dep.TxnID.Short(), dep.CommitTimestamp)
 		}
 	}
 
@@ -791,7 +791,7 @@ func TestGetTxnDetailsDependencies(t *testing.T) {
 	// --- Verify txn B depends on txn A ---
 	detailsB := getTxnDetails(t, committedB)
 	logDetails(t, "txn B", detailsB)
-	require.Contains(t, detailsB.Dependencies, txnAID,
+	require.True(t, containsDep(detailsB.Dependencies, txnAID),
 		"txn B should depend on txn A; got deps=%v", detailsB.Dependencies)
 	verifyWriteSet(t, detailsB.Writes, []expectedWrite{
 		{key: keyB1, value: "from-txn-b"},
@@ -801,7 +801,7 @@ func TestGetTxnDetailsDependencies(t *testing.T) {
 	// --- Verify txn C depends on txn B ---
 	detailsC := getTxnDetails(t, committedC)
 	logDetails(t, "txn C", detailsC)
-	require.Contains(t, detailsC.Dependencies, txnBID,
+	require.True(t, containsDep(detailsC.Dependencies, txnBID),
 		"txn C should depend on txn B; got deps=%v", detailsC.Dependencies)
 	verifyWriteSet(t, detailsC.Writes, []expectedWrite{
 		{key: keyC, value: "from-txn-c"},
@@ -832,9 +832,9 @@ func TestGetTxnDetailsDependencies(t *testing.T) {
 	logDetails(t, "txn D", detailsD)
 	require.Len(t, detailsD.Dependencies, 2,
 		"txn D should depend on txn B and txn C; got deps=%v", detailsD.Dependencies)
-	require.Contains(t, detailsD.Dependencies, txnCID,
+	require.True(t, containsDep(detailsD.Dependencies, txnCID),
 		"txn D should depend on txn C (via keyC on range 1)")
-	require.Contains(t, detailsD.Dependencies, txnBID,
+	require.True(t, containsDep(detailsD.Dependencies, txnBID),
 		"txn D should depend on txn B (via keyB2 on range 2)")
 	verifyWriteSet(t, detailsD.Writes, []expectedWrite{
 		{key: keyD1, value: "from-txn-d"},
@@ -880,7 +880,7 @@ func TestGetTxnDetailsDependencies(t *testing.T) {
 	// --- Verify txn F depends on txn E ---
 	detailsF := getTxnDetails(t, committedF)
 	logDetails(t, "txn F", detailsF)
-	require.Contains(t, detailsF.Dependencies, txnEID,
+	require.True(t, containsDep(detailsF.Dependencies, txnEID),
 		"txn F should depend on txn E (via keyE2 on range 2, async-resolved)")
 	verifyWriteSet(t, detailsF.Writes, []expectedWrite{
 		{key: keyF, value: "from-txn-f"},
@@ -907,7 +907,7 @@ func TestGetTxnDetailsDependencies(t *testing.T) {
 	// --- Verify txn G depends on txn A via write prev value ---
 	detailsG := getTxnDetails(t, committedG)
 	logDetails(t, "txn G", detailsG)
-	require.Contains(t, detailsG.Dependencies, txnAID,
+	require.True(t, containsDep(detailsG.Dependencies, txnAID),
 		"txn G should depend on txn A (via overwriting keyA)")
 	verifyWriteSet(t, detailsG.Writes, []expectedWrite{
 		{key: keyA, value: "overwritten-by-txn-g", prevVal: "from-txn-a"},
@@ -996,9 +996,18 @@ func TestGetTxnDetailsResolvesIntents(t *testing.T) {
 	require.True(t, found, "trace should contain intent resolution;\n%s", rec)
 	t.Logf("trace confirmed intent resolution: %s", msg)
 
-	require.Contains(t, details.Dependencies, txnWID,
+	require.True(t, containsDep(details.Dependencies, txnWID),
 		"expected dependency on txn W after intent resolution")
 	t.Logf("found dependency on txn W (%s)", txnWID.Short())
+}
+
+func containsDep(deps []kvpb.TxnDependency, txnID uuid.UUID) bool {
+	for _, d := range deps {
+		if d.TxnID == txnID {
+			return true
+		}
+	}
+	return false
 }
 
 type missingTxnFeedEventsError struct {

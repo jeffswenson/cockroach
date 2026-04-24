@@ -80,7 +80,7 @@ func GetTxnDetails(
 	if commitIndex == nil || args.DependencyCutoff.IsEmpty() {
 		reply.EventHorizon = args.CommitTimestamp
 	} else {
-		deps := make(map[uuid.UUID]struct{})
+		deps := make(map[uuid.UUID]hlc.Timestamp)
 		reply.EventHorizon = args.DependencyCutoff
 		for _, rs := range args.ReadSpans {
 			clipped := rs.Intersect(rangeBounds)
@@ -101,8 +101,11 @@ func GetTxnDetails(
 				addDep(prevTS, args.TxnID, commitIndex, deps, &reply.EventHorizon)
 			}
 		}
-		for id := range deps {
-			reply.Dependencies = append(reply.Dependencies, id)
+		for id, commitTS := range deps {
+			reply.Dependencies = append(reply.Dependencies, kvpb.TxnDependency{
+				TxnID:           id,
+				CommitTimestamp: commitTS,
+			})
 		}
 	}
 
@@ -238,7 +241,7 @@ func collectDependencies(
 	commitTS, dependencyCutoff hlc.Timestamp,
 	selfTxnID uuid.UUID,
 	commitIndex *txnfeed.CommitIndex,
-	deps map[uuid.UUID]struct{},
+	deps map[uuid.UUID]hlc.Timestamp,
 	eventHorizon *hlc.Timestamp,
 ) error {
 	startKey := span.Key
@@ -330,19 +333,20 @@ func collectDependencies(
 }
 
 // addDep looks up ts in the CommitIndex and adds all txnIDs except
-// selfTxnID to deps. If ts is not found, eventHorizon is forwarded.
+// selfTxnID to deps along with their commit timestamp. If ts is not
+// found, eventHorizon is forwarded.
 func addDep(
 	ts hlc.Timestamp,
 	selfTxnID uuid.UUID,
 	commitIndex *txnfeed.CommitIndex,
-	deps map[uuid.UUID]struct{},
+	deps map[uuid.UUID]hlc.Timestamp,
 	eventHorizon *hlc.Timestamp,
 ) {
 	txnIDs, found := commitIndex.Lookup(ts)
 	if found {
 		for _, id := range txnIDs {
 			if id != selfTxnID {
-				deps[id] = struct{}{}
+				deps[id] = ts
 			}
 		}
 	} else {

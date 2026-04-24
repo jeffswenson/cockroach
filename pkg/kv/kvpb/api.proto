@@ -3507,12 +3507,21 @@ message TxnFeedMessage {
 // information for a committed transaction, fetched via GetTxnDetails.
 message TxnFeedDetails {
   repeated RangeFeedValue writes = 1 [(gogoproto.nullable) = false];
-  repeated bytes dependencies = 2 [
-    (gogoproto.customname) = "Dependencies",
-    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"
-  ];
+  repeated TxnDependency dependencies = 2 [(gogoproto.nullable) = false];
   util.hlc.Timestamp event_horizon = 3 [
     (gogoproto.nullable) = false];
+}
+
+// TxnDependency identifies a single transaction dependency along with its
+// commit timestamp. The commit timestamp allows consumers to order
+// dependencies without additional lookups.
+message TxnDependency {
+  bytes txn_id = 1 [
+    (gogoproto.customname) = "TxnID",
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID",
+    (gogoproto.nullable) = false
+  ];
+  util.hlc.Timestamp commit_timestamp = 2 [(gogoproto.nullable) = false];
 }
 
 // MuxTxnFeedEvent wraps a TxnFeedEvent with routing metadata for multiplexed
@@ -3562,12 +3571,10 @@ message GetTxnDetailsResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // The KV writes this transaction performed on this range.
   repeated RangeFeedValue writes = 2 [(gogoproto.nullable) = false];
-  // UUIDs of transactions that this transaction depends on within the
-  // (dependency_cutoff, commit_timestamp] window.
-  repeated bytes dependencies = 3 [
-    (gogoproto.customname) = "Dependencies",
-    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"
-  ];
+  // Transactions that this transaction depends on within the
+  // (dependency_cutoff, commit_timestamp] window, along with their commit
+  // timestamps.
+  repeated TxnDependency dependencies = 3 [(gogoproto.nullable) = false];
   // The MVCC timestamp up to which dependencies have been fully enumerated.
   // The dependencies list contains all transactions that committed in
   // (event_horizon, commit_timestamp] on this range. There may be
