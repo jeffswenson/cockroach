@@ -110,9 +110,9 @@ func GetTxnDetails(
 }
 
 // collectWrites scans a single span for MVCC values written at exactly
-// commitTS and appends TxnDetailKV entries to the response. For each write
-// found, it also retrieves the previous value by stepping to the next older
-// MVCC version using NextIgnoringTime.
+// commitTS and appends RangeFeedValue entries to the response. For each
+// write found, it also retrieves the previous value by stepping to the
+// next older MVCC version using NextIgnoringTime.
 func collectWrites(
 	ctx context.Context,
 	reader storage.Reader,
@@ -168,14 +168,11 @@ func collectWrites(
 		// Clone the key and value before advancing the iterator, since
 		// UnsafeKey/UnsafeValue share the iterator's internal buffer.
 		clonedKey := key.Key.Clone()
-		var kv roachpb.KeyValue
-		kv.Key = clonedKey
+		write := kvpb.RangeFeedValue{Key: clonedKey}
 		if !mvccVal.IsTombstone() {
-			kv.Value.RawBytes = append([]byte(nil), mvccVal.Value.RawBytes...)
-			kv.Value.Timestamp = key.Timestamp
+			write.Value.RawBytes = append([]byte(nil), mvccVal.Value.RawBytes...)
+			write.Value.Timestamp = key.Timestamp
 		}
-
-		detail := kvpb.TxnDetailKV{KeyValue: kv}
 
 		// Step to the next MVCC version to get the previous value. We use
 		// NextIgnoringTime since the previous version is outside our time
@@ -198,13 +195,13 @@ func collectWrites(
 					return err
 				}
 				if !prevMVCC.IsTombstone() {
-					detail.PrevValue.RawBytes = append([]byte(nil), prevMVCC.Value.RawBytes...)
-					detail.PrevValue.Timestamp = prevKey.Timestamp
+					write.PrevValue.RawBytes = append([]byte(nil), prevMVCC.Value.RawBytes...)
+					write.PrevValue.Timestamp = prevKey.Timestamp
 				}
 			}
 		}
 
-		reply.Writes = append(reply.Writes, detail)
+		reply.Writes = append(reply.Writes, write)
 
 		// After NextIgnoringTime, the iterator is in "ignoring time" mode.
 		// We must re-enter time-bounded iteration without skipping keys.

@@ -319,6 +319,35 @@ func (r *replicationStreamManagerImpl) StreamPartition(
 	return streamPartition(r.evalCtx, streamID, opaqueSpec)
 }
 
+// TxnFeedPartition implements eval.ReplicationStreamManager.
+func (r *replicationStreamManagerImpl) TxnFeedPartition(
+	ctx context.Context, streamID streampb.StreamID, opaqueSpec []byte,
+) (eval.ValueGenerator, error) {
+
+	if err := r.Authorized("TxnFeedPartition"); err != nil {
+		return nil, err
+	}
+
+	if !r.evalCtx.SessionData().AvoidBuffering {
+		return nil, errors.New(
+			"txn feed partition streaming requires " +
+				"'SET avoid_buffering = true' option")
+	}
+
+	if !r.evalCtx.TxnIsSingleStmt {
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue,
+			"crdb_internal.txn_feed_partition not allowed in "+
+				"explicit or multi-statement transaction")
+	}
+
+	r.txn.Descriptors().ReleaseAll(ctx)
+
+	if err := r.txn.KV().Commit(ctx); err != nil {
+		return nil, err
+	}
+	return txnFeedPartition(r.evalCtx, streamID, opaqueSpec)
+}
+
 // GetPhysicalReplicationStreamSpec implements streaming.ReplicationStreamManager interface.
 func (r *replicationStreamManagerImpl) GetPhysicalReplicationStreamSpec(
 	ctx context.Context, streamID streampb.StreamID,

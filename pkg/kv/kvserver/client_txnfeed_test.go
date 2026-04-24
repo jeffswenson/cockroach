@@ -551,13 +551,13 @@ type expectedWrite struct {
 
 // verifyWriteSet asserts that the response contains exactly the expected
 // writes, matched by key.
-func verifyWriteSet(t *testing.T, writes []kvpb.TxnDetailKV, expected []expectedWrite) {
+func verifyWriteSet(t *testing.T, writes []kvpb.RangeFeedValue, expected []expectedWrite) {
 	t.Helper()
 	require.Len(t, writes, len(expected), "wrong number of writes")
 
-	byKey := make(map[string]kvpb.TxnDetailKV, len(writes))
+	byKey := make(map[string]kvpb.RangeFeedValue, len(writes))
 	for _, w := range writes {
-		byKey[string(w.KeyValue.Key)] = w
+		byKey[string(w.Key)] = w
 	}
 
 	for _, exp := range expected {
@@ -565,10 +565,10 @@ func verifyWriteSet(t *testing.T, writes []kvpb.TxnDetailKV, expected []expected
 		require.True(t, ok, "missing write for key %s", exp.key)
 
 		if exp.value == "" {
-			require.Len(t, w.KeyValue.Value.RawBytes, 0,
+			require.Len(t, w.Value.RawBytes, 0,
 				"key %s: expected tombstone", exp.key)
 		} else {
-			v, err := w.KeyValue.Value.GetBytes()
+			v, err := w.Value.GetBytes()
 			require.NoError(t, err)
 			require.Equal(t, exp.value, string(v),
 				"key %s: wrong value", exp.key)
@@ -723,7 +723,7 @@ func TestGetTxnDetailsDependencies(t *testing.T) {
 		t.Logf("%s details: %d writes, %d deps, event_horizon=%s",
 			name, len(d.Writes), len(d.Dependencies), d.EventHorizon)
 		for _, w := range d.Writes {
-			t.Logf("  write: %s", w.KeyValue.Key)
+			t.Logf("  write: %s", w.Key)
 		}
 		for _, dep := range d.Dependencies {
 			t.Logf("  depends on: %s", dep.Short())

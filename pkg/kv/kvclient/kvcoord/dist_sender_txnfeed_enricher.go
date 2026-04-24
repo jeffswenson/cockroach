@@ -26,8 +26,8 @@ func runTxnFeedEnricher(
 	spans []SpanTimePair,
 	detailSpans []roachpb.Span,
 	depOnlySpans []roachpb.Span,
-	rawCh <-chan TxnFeedMessage,
-	consumerCh chan<- TxnFeedMessage,
+	rawCh <-chan kvpb.TxnFeedMessage,
+	consumerCh chan<- kvpb.TxnFeedMessage,
 ) error {
 	registeredSpans := make([]roachpb.Span, len(spans))
 	for i, stp := range spans {
@@ -39,7 +39,7 @@ func runTxnFeedEnricher(
 	}
 	defer frontier.Release()
 
-	batch := make([]TxnFeedMessage, 0, enrichBatchSize)
+	batch := make([]kvpb.TxnFeedMessage, 0, enrichBatchSize)
 	for {
 		// Block until at least one event is available.
 		select {
@@ -81,9 +81,9 @@ func runTxnFeedEnricher(
 
 		// Update frontier from checkpoints (for next batch's cutoff).
 		for _, msg := range batch {
-			if msg.Checkpoint != nil {
+			if msg.Event.Checkpoint != nil {
 				if _, err := frontier.Forward(
-					msg.Checkpoint.AnchorSpan, msg.Checkpoint.ResolvedTS,
+					msg.Event.Checkpoint.AnchorSpan, msg.Event.Checkpoint.ResolvedTS,
 				); err != nil {
 					return err
 				}
@@ -101,13 +101,13 @@ func enrichBatch(
 	ctx context.Context,
 	ds *DistSender,
 	frontier spanpkg.ReadOnlyFrontier,
-	batch []TxnFeedMessage,
+	batch []kvpb.TxnFeedMessage,
 	detailSpans []roachpb.Span,
 	depOnlySpans []roachpb.Span,
 ) error {
 	var commitIndices []int
 	for i := range batch {
-		if batch[i].Committed != nil {
+		if batch[i].Event.Committed != nil {
 			commitIndices = append(commitIndices, i)
 		}
 	}
@@ -119,7 +119,7 @@ func enrichBatch(
 
 	ba := &kvpb.BatchRequest{}
 	for _, idx := range commitIndices {
-		c := batch[idx].Committed
+		c := batch[idx].Event.Committed
 		readSpans := filterOverlappingSpans(c.ReadSpans, detailSpans)
 		writeSpans := filterOverlappingSpans(c.WriteSpans, detailSpans)
 		readSpans, writeSpans = moveDepOnlyWrites(readSpans, writeSpans, depOnlySpans)
@@ -155,7 +155,7 @@ func enrichBatch(
 
 	for i, idx := range commitIndices {
 		resp := br.Responses[i].GetGetTxnDetails()
-		batch[idx].Details = &TxnFeedDetails{
+		batch[idx].Details = &kvpb.TxnFeedDetails{
 			Writes:       resp.Writes,
 			Dependencies: resp.Dependencies,
 			EventHorizon: resp.EventHorizon,

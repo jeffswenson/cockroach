@@ -12,28 +12,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
-
-// TxnFeedMessage wraps a TxnFeedEvent with the anchor span it was
-// registered for.
-type TxnFeedMessage struct {
-	*kvpb.TxnFeedEvent
-	RegisteredSpan roachpb.Span
-	// Details is non-nil only for committed events when enrichment is
-	// enabled via WithEnrichment.
-	Details *TxnFeedDetails
-}
-
-// TxnFeedDetails holds the enriched write data and dependency
-// information for a committed transaction, fetched via GetTxnDetails.
-type TxnFeedDetails struct {
-	Writes       []kvpb.TxnDetailKV
-	Dependencies []uuid.UUID
-	EventHorizon hlc.Timestamp
-}
 
 // TxnFeedOption configures the behavior of DistSender.TxnFeed.
 type TxnFeedOption interface {
@@ -44,6 +24,29 @@ type txnFeedConfig struct {
 	enrich       bool
 	detailSpans  []roachpb.Span
 	depOnlySpans []roachpb.Span
+}
+
+// TxnFeedConfig holds the resolved configuration from a set of
+// TxnFeedOption. It is used by the remote subscriber to serialize
+// options into a TxnFeedPartitionSpec.
+type TxnFeedConfig struct {
+	Enrich       bool
+	DetailSpans  []roachpb.Span
+	DepOnlySpans []roachpb.Span
+}
+
+// ApplyTxnFeedOptions applies the given options and returns the
+// resolved configuration.
+func ApplyTxnFeedOptions(opts []TxnFeedOption) TxnFeedConfig {
+	var cfg txnFeedConfig
+	for _, o := range opts {
+		o.apply(&cfg)
+	}
+	return TxnFeedConfig{
+		Enrich:       cfg.enrich,
+		DetailSpans:  cfg.detailSpans,
+		DepOnlySpans: cfg.depOnlySpans,
+	}
 }
 
 type txnFeedOptionFunc func(*txnFeedConfig)
@@ -113,7 +116,10 @@ func WithDependencyOnlySpans(spans []roachpb.Span) TxnFeedOption {
 // eventCh. Blocks until the context is cancelled or a fatal error
 // occurs.
 func (ds *DistSender) TxnFeed(
-	ctx context.Context, spans []SpanTimePair, eventCh chan<- TxnFeedMessage, opts ...TxnFeedOption,
+	ctx context.Context,
+	spans []SpanTimePair,
+	eventCh chan<- kvpb.TxnFeedMessage,
+	opts ...TxnFeedOption,
 ) error {
 	if len(spans) == 0 {
 		return errors.AssertionFailedf("expected at least 1 span, got none")
@@ -130,7 +136,7 @@ func (ds *DistSender) TxnFeed(
 	}
 	// Buffer rawCh so the mux layer can continue producing events
 	// while the enricher is blocked on GetTxnDetails RPCs.
-	rawCh := make(chan TxnFeedMessage, 4096)
+	rawCh := make(chan kvpb.TxnFeedMessage, 4096)
 	g := ctxgroup.WithContext(ctx)
 	g.GoCtx(func(ctx context.Context) error {
 		defer close(rawCh)

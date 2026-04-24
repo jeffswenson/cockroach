@@ -28,7 +28,7 @@ import (
 type txnfeedMuxer struct {
 	g       ctxgroup.Group
 	ds      *DistSender
-	eventCh chan<- TxnFeedMessage
+	eventCh chan<- kvpb.TxnFeedMessage
 	seqID   int64 // atomically incremented stream ID
 
 	muxClients syncutil.Map[roachpb.NodeID, future.Future[muxTxnFeedStreamOrError]]
@@ -88,7 +88,7 @@ func (s *activeMuxTxnFeed) resetRouting(ctx context.Context, newToken rangecache
 // muxTxnFeed is the entry point. Creates the muxer, divides spans,
 // and waits for completion.
 func muxTxnFeed(
-	ctx context.Context, spans []SpanTimePair, ds *DistSender, eventCh chan<- TxnFeedMessage,
+	ctx context.Context, spans []SpanTimePair, ds *DistSender, eventCh chan<- kvpb.TxnFeedMessage,
 ) error {
 	m := &txnfeedMuxer{
 		g:       ctxgroup.WithContext(ctx),
@@ -295,8 +295,8 @@ func (m *txnfeedMuxer) receiveEventsFromNode(
 			continue
 		}
 
-		msg := TxnFeedMessage{
-			TxnFeedEvent:   &event.TxnFeedEvent,
+		msg := kvpb.TxnFeedMessage{
+			Event:          event.TxnFeedEvent,
 			RegisteredSpan: active.span,
 		}
 		select {

@@ -1077,6 +1077,14 @@ type ReplicationStreamManager interface {
 		req streampb.ReplicationProducerRequest,
 	) (streampb.ReplicationProducerSpec, error)
 
+	// TxnFeedPartition starts a txnfeed partition stream for the specified
+	// stream. opaqueSpec contains a serialized TxnFeedPartitionSpec.
+	TxnFeedPartition(
+		ctx context.Context,
+		streamID streampb.StreamID,
+		opaqueSpec []byte,
+	) (ValueGenerator, error)
+
 	AuthorizeViaJob(ctx context.Context, streamID streampb.StreamID) error
 	AuthorizeViaReplicationPriv(ctx context.Context, tableNames ...string) error
 }

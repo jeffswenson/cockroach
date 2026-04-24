@@ -67,6 +67,14 @@ func NewPartitionedStreamClient(
 
 var _ Client = &partitionedStreamClient{}
 
+// NewTxnFeedClient returns a TxnFeedClient that streams
+// TxnFeedMessages from the source cluster for the given stream. The
+// returned client opens its own pgx connection using the same
+// connection config as this partitioned stream client.
+func (p *partitionedStreamClient) NewTxnFeedClient(streamID streampb.StreamID) TxnFeedClient {
+	return NewRemoteTxnFeedClient(p.pgxConfig, streamID)
+}
+
 // CreateForTenant implements Client interface.
 func (p *partitionedStreamClient) CreateForTenant(
 	ctx context.Context, tenantName roachpb.TenantName, req streampb.ReplicationProducerRequest,
