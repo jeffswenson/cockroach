@@ -640,6 +640,7 @@ func EndTxn(
 					TxnID:          reply.Txn.ID,
 					AnchorKey:      reply.Txn.Key,
 					WriteTimestamp: reply.Txn.WriteTimestamp,
+					ReadTimestamp:  reply.Txn.ReadTimestamp,
 					WriteSpans:     args.LockSpans,
 					ReadSpans:      args.ReadSpans,
 				}},

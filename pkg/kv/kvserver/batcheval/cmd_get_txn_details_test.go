@@ -327,17 +327,22 @@ func ts(wall int64) hlc.Timestamp {
 
 // evalGetTxnDetailsWithDeps calls GetTxnDetails with read/write spans
 // and a CommitIndex, returning the full response including dependencies.
+// readTS is the transaction's read timestamp; if 0, it defaults to commitTS.
 func evalGetTxnDetailsWithDeps(
 	t *testing.T,
 	eng storage.Engine,
 	rangeStart, rangeEnd string,
 	selfTxnID uuid.UUID,
-	commitTS, depCutoff int64,
+	commitTS, readTS, depCutoff int64,
 	readSpans []roachpb.Span,
 	writeSpans []roachpb.Span,
 	commitIndex *txnfeed.CommitIndex,
 ) *kvpb.GetTxnDetailsResponse {
 	t.Helper()
+	readTimestamp := ts(readTS)
+	if readTS == 0 {
+		readTimestamp = ts(commitTS)
+	}
 	resp := &kvpb.GetTxnDetailsResponse{}
 	_, err := GetTxnDetails(context.Background(), eng, CommandArgs{
 		EvalCtx: (&MockEvalCtx{
@@ -351,6 +356,7 @@ func evalGetTxnDetailsWithDeps(
 		Args: &kvpb.GetTxnDetailsRequest{
 			TxnID:            selfTxnID,
 			CommitTimestamp:  ts(commitTS),
+			ReadTimestamp:    readTimestamp,
 			DependencyCutoff: ts(depCutoff),
 			ReadSpans:        readSpans,
 			WriteSpans:       writeSpans,
@@ -380,7 +386,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(5), writerA)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
@@ -399,7 +405,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(5), selfID)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Empty(t, resp.Dependencies)
@@ -418,7 +424,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(3), writerA)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 5,
+			t, eng, "a", "z", selfID, 10, 0, 5,
 			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Empty(t, resp.Dependencies)
@@ -436,7 +442,7 @@ func TestCollectDependencies(t *testing.T) {
 		require.NoError(t, err)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Empty(t, resp.Dependencies)
@@ -450,7 +456,7 @@ func TestCollectDependencies(t *testing.T) {
 		putVal(t, eng, "a", 5, "val-a")
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			[]roachpb.Span{mkSpan("a", "b")}, nil, nil)
 
 		require.Empty(t, resp.Dependencies)
@@ -470,7 +476,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(7), writerB)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			[]roachpb.Span{mkSpan("a", "b"), mkSpan("c", "d")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 2)
@@ -495,7 +501,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(5), writerA)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			[]roachpb.Span{mkSpan("a", "c")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
@@ -513,7 +519,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(5), writerA)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Empty(t, resp.Dependencies)
@@ -535,7 +541,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(7), writerB)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
@@ -558,7 +564,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(10), selfID)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
@@ -579,7 +585,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(10), selfID)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Empty(t, resp.Dependencies)
@@ -602,7 +608,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(10), selfID)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 5,
+			t, eng, "a", "z", selfID, 10, 0, 5,
 			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Empty(t, resp.Dependencies)
@@ -622,7 +628,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(3), writerA)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			[]roachpb.Span{mkSpan("a", "c")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
@@ -646,7 +652,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(10), selfID)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			nil, []roachpb.Span{mkSpan("a", "b")}, idx)
 
 		require.Len(t, resp.Writes, 1)
@@ -670,7 +676,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(10), selfID)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 5,
+			t, eng, "a", "z", selfID, 10, 0, 5,
 			nil, []roachpb.Span{mkSpan("a", "b")}, idx)
 
 		require.Len(t, resp.Writes, 1)
@@ -690,7 +696,7 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(10), selfID)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			nil, []roachpb.Span{mkSpan("a", "b")}, idx)
 
 		require.Len(t, resp.Writes, 1)
@@ -714,11 +720,102 @@ func TestCollectDependencies(t *testing.T) {
 		idx.Record(ts(10), selfID)
 
 		resp := evalGetTxnDetailsWithDeps(
-			t, eng, "a", "z", selfID, 10, 1,
+			t, eng, "a", "z", selfID, 10, 0, 1,
 			[]roachpb.Span{mkSpan("a", "b")},
 			[]roachpb.Span{mkSpan("a", "b")}, idx)
 
 		require.Len(t, resp.Writes, 1)
+		require.Len(t, resp.Dependencies, 1)
+		require.Equal(t, writerA, resp.Dependencies[0])
+	})
+
+	t.Run("read dep at readTS is found", func(t *testing.T) {
+		eng := storage.NewDefaultInMemForTesting()
+		defer eng.Close()
+
+		// Writer A wrote key "a" at ts=8. ReadTS=10, commitTS=15.
+		// Version at ts=8 is within (cutoff=1, readTS=10].
+		putVal(t, eng, "a", 8, "val-a")
+
+		idx, err := txnfeed.NewCommitIndex()
+		require.NoError(t, err)
+		idx.Record(ts(8), writerA)
+
+		resp := evalGetTxnDetailsWithDeps(
+			t, eng, "a", "z", selfID, 15, 10, 1,
+			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
+
+		require.Len(t, resp.Dependencies, 1)
+		require.Equal(t, writerA, resp.Dependencies[0])
+		require.Equal(t, ts(1), resp.EventHorizon)
+	})
+
+	t.Run("version between readTS and commitTS excluded from read deps", func(t *testing.T) {
+		eng := storage.NewDefaultInMemForTesting()
+		defer eng.Close()
+
+		// Writer A wrote key "a" at ts=12. ReadTS=10, commitTS=15.
+		// Version at ts=12 is in (readTS, commitTS] — the txn never
+		// read it, so it should not be a dependency.
+		putVal(t, eng, "a", 12, "val-a")
+
+		idx, err := txnfeed.NewCommitIndex()
+		require.NoError(t, err)
+		idx.Record(ts(12), writerA)
+
+		resp := evalGetTxnDetailsWithDeps(
+			t, eng, "a", "z", selfID, 15, 10, 1,
+			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
+
+		require.Empty(t, resp.Dependencies)
+		require.Equal(t, ts(1), resp.EventHorizon)
+	})
+
+	t.Run("write-set deps still use commitTS not readTS", func(t *testing.T) {
+		eng := storage.NewDefaultInMemForTesting()
+		defer eng.Close()
+
+		// Writer A wrote key "a" at ts=12 (between readTS=10 and
+		// commitTS=15). Our txn overwrote at ts=15. The previous
+		// value at ts=12 should still be tracked as a dependency
+		// because write-set deps use commitTS, not readTS.
+		putVal(t, eng, "a", 12, "old")
+		putVal(t, eng, "a", 15, "new")
+
+		idx, err := txnfeed.NewCommitIndex()
+		require.NoError(t, err)
+		idx.Record(ts(12), writerA)
+		idx.Record(ts(15), selfID)
+
+		resp := evalGetTxnDetailsWithDeps(
+			t, eng, "a", "z", selfID, 15, 10, 1,
+			nil, []roachpb.Span{mkSpan("a", "b")}, idx)
+
+		require.Len(t, resp.Writes, 1)
+		require.Len(t, resp.Dependencies, 1)
+		require.Equal(t, writerA, resp.Dependencies[0])
+	})
+
+	t.Run("self-write outside read scan window when readTS < commitTS", func(t *testing.T) {
+		eng := storage.NewDefaultInMemForTesting()
+		defer eng.Close()
+
+		// Writer A wrote key "a" at ts=5. Self wrote at ts=15
+		// (commitTS). ReadTS=10. The scan window is (1, 10], so
+		// self-write at ts=15 is not visible, and the version at
+		// ts=5 (writerA) is the dependency.
+		putVal(t, eng, "a", 5, "old")
+		putVal(t, eng, "a", 15, "new")
+
+		idx, err := txnfeed.NewCommitIndex()
+		require.NoError(t, err)
+		idx.Record(ts(5), writerA)
+		idx.Record(ts(15), selfID)
+
+		resp := evalGetTxnDetailsWithDeps(
+			t, eng, "a", "z", selfID, 15, 10, 1,
+			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
+
 		require.Len(t, resp.Dependencies, 1)
 		require.Equal(t, writerA, resp.Dependencies[0])
 	})

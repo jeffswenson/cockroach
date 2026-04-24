@@ -375,6 +375,9 @@ message TxnFeedOp {
   // tracking). All code paths that emit COMMITTED ops must ensure
   // read_spans are populated from the transaction record or request.
   repeated roachpb.Span read_spans = 6 [(gogoproto.nullable) = false];
+  // The transaction's ReadTimestamp. For COMMITTED ops, this is the
+  // timestamp at which the transaction's reads were performed.
+  util.hlc.Timestamp read_timestamp = 7 [(gogoproto.nullable) = false];
 }
 
 // RaftCommand is the message written to the raft log. It contains some metadata

@@ -45,8 +45,12 @@ func declareKeysGetTxnDetails(
 		latchSpans.AddMVCC(spanset.SpanReadOnly, ws, args.CommitTimestamp)
 		lockSpans.Add(lock.None, ws)
 	}
+	readLatchTS := args.ReadTimestamp
+	if readLatchTS.IsEmpty() {
+		readLatchTS = args.CommitTimestamp
+	}
 	for _, rs := range args.ReadSpans {
-		latchSpans.AddMVCC(spanset.SpanReadOnly, rs, args.CommitTimestamp)
+		latchSpans.AddMVCC(spanset.SpanReadOnly, rs, readLatchTS)
 		lockSpans.Add(lock.None, rs)
 	}
 	return nil
@@ -75,11 +79,18 @@ func GetTxnDetails(
 
 	// Collect dependencies using the CommitIndex. Dependencies come from
 	// two sources: read spans (the values we read) and write spans (the
-	// previous values we overwrote).
+	// previous values we overwrote). Read-span deps use readTS as the
+	// upper bound since the transaction reads at its read timestamp.
+	// Write-set deps use commitTS since overwrites are relative to the
+	// write timestamp.
 	commitIndex := cArgs.EvalCtx.GetCommitIndex()
 	if commitIndex == nil || args.DependencyCutoff.IsEmpty() {
 		reply.EventHorizon = args.CommitTimestamp
 	} else {
+		readTS := args.ReadTimestamp
+		if readTS.IsEmpty() {
+			readTS = args.CommitTimestamp
+		}
 		deps := make(map[uuid.UUID]struct{})
 		reply.EventHorizon = args.DependencyCutoff
 		for _, rs := range args.ReadSpans {
@@ -89,7 +100,7 @@ func GetTxnDetails(
 			}
 			if err := collectDependencies(
 				ctx, reader, &clipped,
-				args.CommitTimestamp, args.DependencyCutoff,
+				readTS, args.DependencyCutoff,
 				args.TxnID, commitIndex, deps, &reply.EventHorizon,
 			); err != nil {
 				return result.Result{}, err
@@ -221,15 +232,18 @@ func collectWrites(
 }
 
 // collectDependencies scans a single read span for the latest MVCC version of
-// each key within (dependencyCutoff, commitTS]. For each such version, it looks
+// each key within (dependencyCutoff, readTS]. For each such version, it looks
 // up the writing transaction in the CommitIndex and adds it to deps. Tombstones
 // are skipped since they represent deletes, not values the transaction read.
 //
-// When the latest version has timestamp == commitTS, it may be our own write.
-// In that case the value we actually read is the prior version. Rather than
-// inspecting the CommitIndex to determine authorship, we simply process both
-// versions — the self-exclusion filter (id != selfTxnID) prevents us from
-// adding ourselves, and overstating deps is acceptable.
+// readTS is the transaction's read timestamp — the timestamp at which reads
+// were performed. When readTS < commitTS, versions in (readTS, commitTS] were
+// never visible to the transaction and are excluded from dependency scanning.
+//
+// When the latest version has timestamp == readTS, it may be our own write
+// (in the readTS == commitTS case). We process both that version and the
+// prior version; the self-exclusion filter (id != selfTxnID) prevents us
+// from adding ourselves.
 //
 // If a timestamp is not found in the CommitIndex, eventHorizon is forwarded to
 // that timestamp. The caller uses eventHorizon to communicate which portion of
@@ -238,7 +252,7 @@ func collectDependencies(
 	ctx context.Context,
 	reader storage.Reader,
 	span *roachpb.Span,
-	commitTS, dependencyCutoff hlc.Timestamp,
+	readTS, dependencyCutoff hlc.Timestamp,
 	selfTxnID uuid.UUID,
 	commitIndex *txnfeed.CommitIndex,
 	deps map[uuid.UUID]struct{},
@@ -260,7 +274,7 @@ func collectDependencies(
 		StartKey:     startKey,
 		EndKey:       endKey,
 		StartTime:    dependencyCutoff,
-		EndTime:      commitTS,
+		EndTime:      readTS,
 		IntentPolicy: storage.MVCCIncrementalIterIntentPolicyError,
 		ReadCategory: fs.BatchEvalReadCategory,
 	})
@@ -298,7 +312,7 @@ func collectDependencies(
 			addDep(key.Timestamp, selfTxnID, commitIndex, deps, eventHorizon)
 		}
 
-		if key.Timestamp == commitTS {
+		if key.Timestamp == readTS {
 			// This version may be our own write. The value we actually
 			// read is the prior version, so also check it. If it turns
 			// out this wasn't our write, we harmlessly overstate deps.
