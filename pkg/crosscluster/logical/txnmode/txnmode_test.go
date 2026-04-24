@@ -29,7 +29,7 @@ func TestTxnModeSmoketest(t *testing.T) {
 	ctx := context.Background()
 
 	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TestDoesNotWorkWithExternalProcessMode(134857),
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(134857),
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		},
@@ -39,11 +39,11 @@ func TestTxnModeSmoketest(t *testing.T) {
 	s := srv.ApplicationLayer()
 	runner := sqlutils.MakeSQLRunner(conn)
 
-	// Configure low latency replication settings
+	// Configure low latency replication settings.
 	sysRunner := sqlutils.MakeSQLRunner(srv.SystemLayer().SQLConn(t))
 	ldrtestutils.ApplyLowLatencyReplicationSettings(t, sysRunner, runner)
 
-	// Create source and destination databases
+	// Create source and destination databases.
 	runner.Exec(t, "CREATE DATABASE source_db")
 	runner.Exec(t, "CREATE DATABASE dest_db")
 
@@ -97,7 +97,7 @@ func TestTxnModeUniqueConstraintUpdate(t *testing.T) {
 	ctx := context.Background()
 
 	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TestDoesNotWorkWithExternalProcessMode(134857),
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(134857),
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		},
@@ -164,7 +164,7 @@ func TestTxnModeCreateLogicallyReplicated(t *testing.T) {
 	ctx := context.Background()
 
 	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TestDoesNotWorkWithExternalProcessMode(134857),
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(134857),
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		},

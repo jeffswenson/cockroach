@@ -104,6 +104,13 @@ type Client interface {
 	Close(ctx context.Context) error
 }
 
+// TxnFeedClientProvider is an optional interface implemented by Client
+// implementations that support the TxnFeed path. Use a type assertion
+// to check whether the Client supports it.
+type TxnFeedClientProvider interface {
+	NewTxnFeedClient(streamID streampb.StreamID) TxnFeedClient
+}
+
 type subscribeConfig struct {
 	// withFiltering controls whether the producer-side rangefeeds
 	// should be started with the WithFiltering option which

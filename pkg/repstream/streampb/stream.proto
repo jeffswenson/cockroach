@@ -301,7 +301,7 @@ message TransactionEvent {
   // Transactions that this transaction depends on. Transaction A depends on
   // B if A's write set overlaps B's write set, or A's read set overlaps B's
   // write set. Populated from GetTxnDetails results.
-  repeated cockroach.kv.kvpb.TxnDependency dependencies = 5 [(gogoproto.nullable) = false];
+  repeated cockroach.roachpb.TxnDependency dependencies = 5 [(gogoproto.nullable) = false];
   // The MVCC timestamp up to which dependencies have been fully enumerated.
   // The dependencies list contains all transactions that committed in
   // (event_horizon, commit_timestamp]. There may be additional dependent

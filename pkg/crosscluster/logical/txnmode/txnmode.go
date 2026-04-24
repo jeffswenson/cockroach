@@ -21,7 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -33,8 +36,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
@@ -69,6 +74,15 @@ var txnBatchFlushInterval = settings.RegisterDurationSetting(
 	"the maximum time to wait before flushing a partial batch of "+
 		"decoded transactions",
 	50*time.Millisecond,
+)
+
+var txnFeedEnabled = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"logical_replication.consumer.txn_feed.enabled",
+	"when true, transactional LDR uses the TxnFeed producer path with "+
+		"pre-computed dependencies instead of the local scheduler pipeline",
+	metamorphic.ConstantWithTestBool(
+		"logical_replication.consumer.txn_feed.enabled", false),
 )
 
 // decodedBatch carries either a slice of decoded transactions or a checkpoint
@@ -109,6 +123,16 @@ func NewTxnLdrCoordinator(
 }
 
 func (p *TxnLdrCoordinator) Resume(ctx context.Context) error {
+	sv := &p.execCtx.ExecCfg().Settings.SV
+	if txnFeedEnabled.Get(sv) {
+		return p.resumeWithTxnFeed(ctx)
+	}
+	return p.resumeWithScheduler(ctx)
+}
+
+// resumeWithScheduler runs the existing pipeline: subscribe → merge →
+// decode → schedule → apply → checkpoint.
+func (p *TxnLdrCoordinator) resumeWithScheduler(ctx context.Context) error {
 	group := ctxgroup.WithContext(ctx)
 
 	plan, asOf, err := p.planReplication(ctx)
@@ -121,7 +145,7 @@ func (p *TxnLdrCoordinator) Resume(ctx context.Context) error {
 		return errors.Wrap(err, "building table mappings")
 	}
 
-	feed, err := p.createTxnFeed(ctx, plan, asOf)
+	feed, err := p.createMergeFeed(ctx, plan, asOf)
 	if err != nil {
 		return errors.Wrap(err, "creating txn feed")
 	}
@@ -201,6 +225,111 @@ func (p *TxnLdrCoordinator) Resume(ctx context.Context) error {
 	})
 	group.GoCtx(func(ctx context.Context) error {
 		return p.stageSchedule(ctx, lockSynthesizer, scheduler, batches, applierEvents)
+	})
+	group.GoCtx(func(ctx context.Context) error {
+		return p.stageApply(ctx, applier, applierEvents)
+	})
+	group.GoCtx(func(ctx context.Context) error {
+		return p.stageCheckpoint(ctx, applier)
+	})
+
+	return group.Wait()
+}
+
+// resumeWithTxnFeed runs the TxnFeed pipeline: txnfeed stream → decode →
+// apply → checkpoint. Dependencies are pre-computed by the source cluster,
+// bypassing the local merge feed, lock synthesizer, and scheduler.
+func (p *TxnLdrCoordinator) resumeWithTxnFeed(ctx context.Context) error {
+	group := ctxgroup.WithContext(ctx)
+
+	plan, asOf, err := p.planReplication(ctx)
+	if err != nil {
+		return err
+	}
+
+	tables, err := p.buildTableMappings(ctx, plan)
+	if err != nil {
+		return errors.Wrap(err, "building table mappings")
+	}
+
+	// Get a TxnFeedClient from the stream client.
+	provider, ok := p.client.(streamclient.TxnFeedClientProvider)
+	if !ok {
+		return errors.New(
+			"stream client does not support TxnFeed; " +
+				"disable logical_replication.consumer.txn_feed.enabled")
+	}
+	txnFeedClient := provider.NewTxnFeedClient(
+		streampb.StreamID(p.payload.StreamID))
+
+	heartbeatSender := streamclient.NewHeartbeatSender(
+		ctx,
+		p.client,
+		streampb.StreamID(p.payload.StreamID),
+		p.heartbeatInterval,
+	)
+	defer besteffort.Cleanup(ctx, "ldr-stop-heartbeat", heartbeatSender.Stop)
+
+	// Create multiple writers for parallel application.
+	sv := &p.execCtx.ExecCfg().Settings.SV
+	numWriters := int(txnNumWriters.Get(sv))
+	var writers []txnwriter.TransactionWriter
+	for range numWriters {
+		writer, err := txnwriter.NewTransactionWriter(ctx, p.execCtx.ExecCfg().InternalDB, p.execCtx.ExecCfg().LeaseManager, p.execCtx.ExecCfg().Settings)
+		if err != nil {
+			for _, w := range writers {
+				w.Close(ctx)
+			}
+			return errors.Wrap(err, "creating txn writer")
+		}
+		writers = append(writers, writer)
+	}
+
+	const applierID ldrdecoder.ApplierID = 1
+	allIDs := []ldrdecoder.ApplierID{applierID}
+	router := ldrdecoder.NewHashRouter(allIDs)
+	applierEvents := make(chan txnapply.ApplierEvent)
+	applier, err := txnapply.NewApplier(ctx, applierID, writers, txnapply.NewDependencyTracker(allIDs, router), allIDs, router)
+	if err != nil {
+		return errors.Wrap(err, "creating applier")
+	}
+	defer applier.Close(ctx)
+
+	txnDecoder, err := ldrdecoder.NewTxnDecoder(
+		ctx,
+		p.execCtx.ExecCfg().DistSQLSrv.DB,
+		p.execCtx.ExecCfg().Settings,
+		tables,
+	)
+	if err != nil {
+		return errors.Wrap(err, "creating txn decoder")
+	}
+
+	// Build spans for the TxnFeed from the plan's source spans.
+	spans := make([]kvcoord.SpanTimePair, len(plan.SourceSpans))
+	for i, s := range plan.SourceSpans {
+		spans[i] = kvcoord.SpanTimePair{Span: s, StartAfter: asOf}
+	}
+
+	// Convert source spans to roachpb.Span for detail/dep filtering.
+	detailSpans := make([]roachpb.Span, len(plan.SourceSpans))
+	copy(detailSpans, plan.SourceSpans)
+
+	eventCh := make(chan kvpb.TxnFeedMessage, 128)
+
+	group.GoCtx(func(ctx context.Context) error {
+		heartbeatSender.Start(ctx, timeutil.DefaultTimeSource{})
+		return heartbeatSender.Wait()
+	})
+	group.GoCtx(func(ctx context.Context) error {
+		defer close(eventCh)
+		return txnFeedClient.TxnFeed(ctx, spans, eventCh,
+			kvcoord.WithEnrichment(),
+			kvcoord.WithDetailSpans(detailSpans),
+		)
+	})
+	group.GoCtx(func(ctx context.Context) error {
+		return p.stageTxnFeedDecode(ctx, eventCh, txnDecoder, applierEvents)
 	})
 	group.GoCtx(func(ctx context.Context) error {
 		return p.stageApply(ctx, applier, applierEvents)
@@ -376,6 +505,100 @@ func (p *TxnLdrCoordinator) stageSchedule(
 	}
 }
 
+// stageTxnFeedDecode reads TxnFeedMessages from the event channel and
+// converts them into ApplierEvents. Committed events with enrichment
+// details are decoded into ScheduledTransactions with pre-computed
+// dependencies. Checkpoint events are forwarded directly.
+func (p *TxnLdrCoordinator) stageTxnFeedDecode(
+	ctx context.Context,
+	eventCh <-chan kvpb.TxnFeedMessage,
+	decoder *ldrdecoder.TxnDecoder,
+	applierEvents chan txnapply.ApplierEvent,
+) error {
+	defer close(applierEvents)
+
+	// uuidToTxnID tracks the full TxnID for each committed transaction so
+	// that dependency UUIDs can be resolved to full TxnIDs. Entries below
+	// the most recent event horizon are pruned to bound memory usage —
+	// dependencies never reference transactions at or below the event
+	// horizon.
+	uuidToTxnID := make(map[uuid.UUID]ldrdecoder.TxnID)
+	var lastEventHorizon hlc.Timestamp
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case msg, ok := <-eventCh:
+			if !ok {
+				return nil
+			}
+
+			event := msg.Event
+			if committed := event.Committed; committed != nil {
+				details := msg.Details
+				if details == nil {
+					return errors.AssertionFailedf(
+						"committed event without enrichment details for txn %s",
+						committed.TxnID)
+				}
+
+				txnID := ldrdecoder.TxnID{
+					Timestamp: committed.CommitTimestamp,
+					UUID:      committed.TxnID,
+				}
+				uuidToTxnID[committed.TxnID] = txnID
+
+				txn, err := decoder.DecodeTxnFromWrites(ctx, txnID, details.Writes)
+				if err != nil {
+					return errors.Wrapf(err, "decoding txn %s", committed.TxnID)
+				}
+
+				deps := make([]ldrdecoder.TxnID, 0, len(details.Dependencies))
+				for _, dep := range details.Dependencies {
+					depTxnID, ok := uuidToTxnID[dep.TxnID]
+					if !ok {
+						return errors.AssertionFailedf(
+							"dependency %s for txn %s not found in committed set",
+							dep.TxnID, committed.TxnID)
+					}
+					deps = append(deps, depTxnID)
+				}
+
+				// Prune entries at or below the new event horizon since
+				// no future dependency can reference them.
+				if lastEventHorizon.Less(details.EventHorizon) {
+					lastEventHorizon = details.EventHorizon
+					for u, id := range uuidToTxnID {
+						if id.Timestamp.LessEq(lastEventHorizon) {
+							delete(uuidToTxnID, u)
+						}
+					}
+				}
+
+				scheduled := txnapply.ScheduledTransaction{
+					Transaction:  txn,
+					Dependencies: deps,
+					EventHorizon: details.EventHorizon,
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case applierEvents <- scheduled:
+				}
+			} else if checkpoint := event.Checkpoint; checkpoint != nil {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case applierEvents <- txnapply.Checkpoint{Timestamp: checkpoint.ResolvedTS}:
+				}
+			} else if feedErr := event.Error; feedErr != nil {
+				return feedErr.Error.GoError()
+			}
+		}
+	}
+}
+
 // stageApply runs the applier which writes transactions to the destination
 // cluster in parallel while respecting dependency ordering.
 func (p *TxnLdrCoordinator) stageApply(
@@ -471,7 +694,7 @@ func (p *TxnLdrCoordinator) buildTableMappings(
 	return tableMappings, nil
 }
 
-func (p *TxnLdrCoordinator) createTxnFeed(
+func (p *TxnLdrCoordinator) createMergeFeed(
 	ctx context.Context, plan streamclient.LogicalReplicationPlan, asOf hlc.Timestamp,
 ) (streamclient.Subscription, error) {
 	coveringSpan := plan.SourceSpans[0]
