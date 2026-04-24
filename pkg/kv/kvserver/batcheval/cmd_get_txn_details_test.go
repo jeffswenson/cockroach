@@ -325,8 +325,8 @@ func ts(wall int64) hlc.Timestamp {
 	return hlc.Timestamp{WallTime: wall}
 }
 
-// evalGetTxnDetailsWithDeps calls GetTxnDetails with read spans and a
-// CommitIndex, returning the full response including dependencies.
+// evalGetTxnDetailsWithDeps calls GetTxnDetails with read/write spans
+// and a CommitIndex, returning the full response including dependencies.
 func evalGetTxnDetailsWithDeps(
 	t *testing.T,
 	eng storage.Engine,
@@ -334,6 +334,7 @@ func evalGetTxnDetailsWithDeps(
 	selfTxnID uuid.UUID,
 	commitTS, depCutoff int64,
 	readSpans []roachpb.Span,
+	writeSpans []roachpb.Span,
 	commitIndex *txnfeed.CommitIndex,
 ) *kvpb.GetTxnDetailsResponse {
 	t.Helper()
@@ -352,6 +353,7 @@ func evalGetTxnDetailsWithDeps(
 			CommitTimestamp:  ts(commitTS),
 			DependencyCutoff: ts(depCutoff),
 			ReadSpans:        readSpans,
+			WriteSpans:       writeSpans,
 		},
 	}, resp)
 	require.NoError(t, err)
@@ -379,7 +381,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 1,
-			[]roachpb.Span{mkSpan("a", "b")}, idx)
+			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
 		require.Equal(t, writerA, resp.Dependencies[0])
@@ -398,7 +400,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 1,
-			[]roachpb.Span{mkSpan("a", "b")}, idx)
+			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Empty(t, resp.Dependencies)
 		require.Equal(t, ts(1), resp.EventHorizon)
@@ -417,7 +419,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 5,
-			[]roachpb.Span{mkSpan("a", "b")}, idx)
+			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Empty(t, resp.Dependencies)
 		require.Equal(t, ts(5), resp.EventHorizon)
@@ -435,7 +437,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 1,
-			[]roachpb.Span{mkSpan("a", "b")}, idx)
+			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Empty(t, resp.Dependencies)
 		require.Equal(t, ts(5), resp.EventHorizon)
@@ -449,7 +451,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 1,
-			[]roachpb.Span{mkSpan("a", "b")}, nil)
+			[]roachpb.Span{mkSpan("a", "b")}, nil, nil)
 
 		require.Empty(t, resp.Dependencies)
 		require.Equal(t, ts(10), resp.EventHorizon)
@@ -469,7 +471,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 1,
-			[]roachpb.Span{mkSpan("a", "b"), mkSpan("c", "d")}, idx)
+			[]roachpb.Span{mkSpan("a", "b"), mkSpan("c", "d")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 2)
 		depSet := make(map[uuid.UUID]struct{})
@@ -494,7 +496,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 1,
-			[]roachpb.Span{mkSpan("a", "c")}, idx)
+			[]roachpb.Span{mkSpan("a", "c")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
 		require.Equal(t, writerA, resp.Dependencies[0])
@@ -512,7 +514,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 1,
-			[]roachpb.Span{mkSpan("a", "b")}, idx)
+			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Empty(t, resp.Dependencies)
 		require.Equal(t, ts(1), resp.EventHorizon)
@@ -534,7 +536,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 1,
-			[]roachpb.Span{mkSpan("a", "b")}, idx)
+			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
 		require.Equal(t, writerB, resp.Dependencies[0])
@@ -557,7 +559,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 1,
-			[]roachpb.Span{mkSpan("a", "b")}, idx)
+			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
 		require.Equal(t, writerA, resp.Dependencies[0])
@@ -578,7 +580,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 1,
-			[]roachpb.Span{mkSpan("a", "b")}, idx)
+			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Empty(t, resp.Dependencies)
 		require.Equal(t, ts(1), resp.EventHorizon)
@@ -601,7 +603,7 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 5,
-			[]roachpb.Span{mkSpan("a", "b")}, idx)
+			[]roachpb.Span{mkSpan("a", "b")}, nil, idx)
 
 		require.Empty(t, resp.Dependencies)
 		require.Equal(t, ts(5), resp.EventHorizon)
@@ -621,11 +623,103 @@ func TestCollectDependencies(t *testing.T) {
 
 		resp := evalGetTxnDetailsWithDeps(
 			t, eng, "a", "z", selfID, 10, 1,
-			[]roachpb.Span{mkSpan("a", "c")}, idx)
+			[]roachpb.Span{mkSpan("a", "c")}, nil, idx)
 
 		require.Len(t, resp.Dependencies, 1)
 		require.Equal(t, writerA, resp.Dependencies[0])
 		// event_horizon should be ts=7 (the missed timestamp).
 		require.Equal(t, ts(7), resp.EventHorizon)
+	})
+
+	t.Run("write prev value generates dependency", func(t *testing.T) {
+		eng := storage.NewDefaultInMemForTesting()
+		defer eng.Close()
+
+		// Writer A wrote key "a" at ts=5. Our txn overwrote at ts=10.
+		// The previous value (ts=5) should produce a dependency on writerA.
+		putVal(t, eng, "a", 5, "old")
+		putVal(t, eng, "a", 10, "new")
+
+		idx, err := txnfeed.NewCommitIndex()
+		require.NoError(t, err)
+		idx.Record(ts(5), writerA)
+		idx.Record(ts(10), selfID)
+
+		resp := evalGetTxnDetailsWithDeps(
+			t, eng, "a", "z", selfID, 10, 1,
+			nil, []roachpb.Span{mkSpan("a", "b")}, idx)
+
+		require.Len(t, resp.Writes, 1)
+		require.Len(t, resp.Dependencies, 1)
+		require.Equal(t, writerA, resp.Dependencies[0])
+		require.Equal(t, ts(1), resp.EventHorizon)
+	})
+
+	t.Run("write prev value below cutoff not tracked", func(t *testing.T) {
+		eng := storage.NewDefaultInMemForTesting()
+		defer eng.Close()
+
+		// Writer A wrote key "a" at ts=2, our txn overwrote at ts=10.
+		// Cutoff is ts=5, so the prev value at ts=2 is excluded.
+		putVal(t, eng, "a", 2, "old")
+		putVal(t, eng, "a", 10, "new")
+
+		idx, err := txnfeed.NewCommitIndex()
+		require.NoError(t, err)
+		idx.Record(ts(2), writerA)
+		idx.Record(ts(10), selfID)
+
+		resp := evalGetTxnDetailsWithDeps(
+			t, eng, "a", "z", selfID, 10, 5,
+			nil, []roachpb.Span{mkSpan("a", "b")}, idx)
+
+		require.Len(t, resp.Writes, 1)
+		require.Empty(t, resp.Dependencies)
+		require.Equal(t, ts(5), resp.EventHorizon)
+	})
+
+	t.Run("write with no prev value produces no dependency", func(t *testing.T) {
+		eng := storage.NewDefaultInMemForTesting()
+		defer eng.Close()
+
+		// Our txn wrote key "a" at ts=10 with no prior version.
+		putVal(t, eng, "a", 10, "new")
+
+		idx, err := txnfeed.NewCommitIndex()
+		require.NoError(t, err)
+		idx.Record(ts(10), selfID)
+
+		resp := evalGetTxnDetailsWithDeps(
+			t, eng, "a", "z", selfID, 10, 1,
+			nil, []roachpb.Span{mkSpan("a", "b")}, idx)
+
+		require.Len(t, resp.Writes, 1)
+		require.Empty(t, resp.Dependencies)
+		require.Equal(t, ts(1), resp.EventHorizon)
+	})
+
+	t.Run("write prev value deduplicates with read dependency", func(t *testing.T) {
+		eng := storage.NewDefaultInMemForTesting()
+		defer eng.Close()
+
+		// Writer A wrote key "a" at ts=5. Our txn read it, then overwrote
+		// at ts=10. Both read span and write span cover key "a". The
+		// dependency on writerA should appear only once.
+		putVal(t, eng, "a", 5, "old")
+		putVal(t, eng, "a", 10, "new")
+
+		idx, err := txnfeed.NewCommitIndex()
+		require.NoError(t, err)
+		idx.Record(ts(5), writerA)
+		idx.Record(ts(10), selfID)
+
+		resp := evalGetTxnDetailsWithDeps(
+			t, eng, "a", "z", selfID, 10, 1,
+			[]roachpb.Span{mkSpan("a", "b")},
+			[]roachpb.Span{mkSpan("a", "b")}, idx)
+
+		require.Len(t, resp.Writes, 1)
+		require.Len(t, resp.Dependencies, 1)
+		require.Equal(t, writerA, resp.Dependencies[0])
 	})
 }
