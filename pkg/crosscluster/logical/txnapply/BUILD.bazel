@@ -7,8 +7,8 @@ go_library(
         "dependency_resolver.go",
         "horizon_heap.go",
         "latest.go",
+        "replicated_time_heap.go",
         "txn_applier.go",
-        "watermark_heap.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/crosscluster/logical/txnapply",
     visibility = ["//visibility:public"],
@@ -29,8 +29,8 @@ go_test(
     name = "txnapply_test",
     srcs = [
         "committed_set_test.go",
+        "replicated_time_heap_test.go",
         "txn_applier_test.go",
-        "watermark_heap_test.go",
     ],
     embed = [":txnapply"],
     deps = [

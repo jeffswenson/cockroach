@@ -213,7 +213,8 @@ func checkApplierDrained(t testing.TB, applier *Applier) {
 	require.Empty(t, applier.mu.transactions, "transactions map should be empty")
 	require.Empty(t, applier.mu.localWaiting, "local waiting map should be empty")
 	require.Empty(t, applier.mu.remoteWaiting, "remote waiting map should be empty")
-	require.Equal(t, 0, applier.mu.watermark.Len(), "watermark heap should be empty")
+	require.Equal(t, 0, applier.mu.replicatedTime.Len(),
+		"replicatedTime heap should be empty")
 	require.Empty(t, applier.mu.horizonWaiting, "horizonWaiting should be empty")
 }
 
