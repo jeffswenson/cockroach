@@ -18,6 +18,7 @@ go_library(
         "//pkg/crosscluster/logical/sqlwriter",
         "//pkg/jobs/jobspb",
         "//pkg/keys",
+        "//pkg/kv/kvpb",
         "//pkg/repstream/streampb",
         "//pkg/roachpb",
         "//pkg/settings/cluster",

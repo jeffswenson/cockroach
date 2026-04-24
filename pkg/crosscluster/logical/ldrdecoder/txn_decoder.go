@@ -10,7 +10,9 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -119,5 +121,39 @@ func (t *TxnDecoder) DecodeTxn(
 		result.WriteSet = append(result.WriteSet, decoded)
 	}
 
+	return result, nil
+}
+
+// DecodeTxnFromWrites decodes a transaction from RangeFeedValue writes, as
+// delivered by the TxnFeed producer path. The caller provides the TxnID (from
+// the TxnFeedCommitted event) since the writes don't carry a transaction-level
+// identity.
+func (t *TxnDecoder) DecodeTxnFromWrites(
+	ctx context.Context, txnID TxnID, writes []kvpb.RangeFeedValue,
+) (Transaction, error) {
+	if len(writes) == 0 {
+		return Transaction{}, errors.AssertionFailedf("empty transaction")
+	}
+
+	events := make([]streampb.StreamEvent_KV, len(writes))
+	for i, w := range writes {
+		events[i] = streampb.StreamEvent_KV{
+			KeyValue: roachpb.KeyValue{
+				Key:   w.Key,
+				Value: w.Value,
+			},
+			PrevValue: w.PrevValue,
+		}
+	}
+
+	result := Transaction{TxnID: txnID}
+	result.WriteSet = make([]DecodedRow, 0, len(events))
+	for _, event := range events {
+		decoded, _, err := t.decoder.decodeEvent(ctx, event)
+		if err != nil {
+			return Transaction{}, err
+		}
+		result.WriteSet = append(result.WriteSet, decoded)
+	}
 	return result, nil
 }
