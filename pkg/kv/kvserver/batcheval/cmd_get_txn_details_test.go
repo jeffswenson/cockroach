@@ -9,6 +9,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnfeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -444,7 +445,7 @@ func TestCollectDependencies(t *testing.T) {
 		require.Equal(t, ts(5), resp.EventHorizon)
 	})
 
-	t.Run("nil commit index sets event horizon to commit timestamp", func(t *testing.T) {
+	t.Run("nil commit index caps event horizon to commit timestamp prev", func(t *testing.T) {
 		eng := storage.NewDefaultInMemForTesting()
 		defer eng.Close()
 
@@ -455,7 +456,7 @@ func TestCollectDependencies(t *testing.T) {
 			[]roachpb.Span{mkSpan("a", "b")}, nil, nil)
 
 		require.Empty(t, resp.Dependencies)
-		require.Equal(t, ts(10), resp.EventHorizon)
+		require.Equal(t, ts(10).Prev(), resp.EventHorizon)
 	})
 
 	t.Run("multiple read spans with different writers", func(t *testing.T) {
@@ -722,5 +723,46 @@ func TestCollectDependencies(t *testing.T) {
 		require.Len(t, resp.Writes, 1)
 		require.Len(t, resp.Dependencies, 1)
 		require.Equal(t, writerA, resp.Dependencies[0].TxnID)
+	})
+}
+
+func TestFilterLocalSpans(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	localKey := keys.TransactionKey(roachpb.Key("a"), uuid.MakeV4())
+	localSpan := roachpb.Span{Key: localKey, EndKey: localKey.Next()}
+	globalSpan := mkSpan("a", "b")
+
+	t.Run("filters local spans from mixed input", func(t *testing.T) {
+		result := filterLocalSpans(
+			[]roachpb.Span{localSpan, globalSpan})
+		require.Len(t, result, 1)
+		require.Equal(t, globalSpan, result[0])
+	})
+
+	t.Run("returns nil for all-local input", func(t *testing.T) {
+		result := filterLocalSpans([]roachpb.Span{localSpan})
+		require.Nil(t, result)
+	})
+
+	t.Run("returns all spans when none are local", func(t *testing.T) {
+		spans := []roachpb.Span{mkSpan("a", "b"), mkSpan("c", "d")}
+		result := filterLocalSpans(spans)
+		require.Equal(t, spans, result)
+	})
+
+	t.Run("local write spans ignored in GetTxnDetails", func(t *testing.T) {
+		eng := storage.NewDefaultInMemForTesting()
+		defer eng.Close()
+
+		putVal(t, eng, "a", 10, "val")
+
+		// Pass both a local span and a global span as write spans.
+		// Only the global span's write should appear.
+		resp := evalGetTxnDetails(t, eng, "a", "z", 10,
+			[]roachpb.Span{localSpan, mkSpan("a", "b")})
+		require.Len(t, resp.Writes, 1)
+		require.Equal(t, "a", string(resp.Writes[0].Key))
 	})
 }

@@ -36,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -81,8 +80,7 @@ var txnFeedEnabled = settings.RegisterBoolSetting(
 	"logical_replication.consumer.txn_feed.enabled",
 	"when true, transactional LDR uses the TxnFeed producer path with "+
 		"pre-computed dependencies instead of the local scheduler pipeline",
-	metamorphic.ConstantWithTestBool(
-		"logical_replication.consumer.txn_feed.enabled", false),
+	true,
 )
 
 // decodedBatch carries either a slice of decoded transactions or a checkpoint
@@ -305,13 +303,28 @@ func (p *TxnLdrCoordinator) resumeWithTxnFeed(ctx context.Context) error {
 		return errors.Wrap(err, "creating txn decoder")
 	}
 
+	lockSynthesizer, err := txnlock.NewLockSynthesizer(
+		ctx,
+		&eval.Context{},
+		p.execCtx.ExecCfg().LeaseManager,
+		p.execCtx.ExecCfg().Clock,
+		tables,
+	)
+	if err != nil {
+		return errors.Wrap(err, "creating lock synthesizer")
+	}
+
 	// Build spans for the TxnFeed from the plan's source spans.
+	// SourceSpans are primary index spans when UseTableSpan is not set.
 	spans := make([]kvcoord.SpanTimePair, len(plan.SourceSpans))
 	for i, s := range plan.SourceSpans {
 		spans[i] = kvcoord.SpanTimePair{Span: s, StartAfter: asOf}
 	}
 
-	// Convert source spans to roachpb.Span for detail/dep filtering.
+	// Use primary index spans for write collection (detail spans).
+	// The enricher filters write spans against these to collect only
+	// primary key writes. Read spans are passed through unfiltered
+	// for complete dependency tracking.
 	detailSpans := make([]roachpb.Span, len(plan.SourceSpans))
 	copy(detailSpans, plan.SourceSpans)
 
@@ -329,7 +342,7 @@ func (p *TxnLdrCoordinator) resumeWithTxnFeed(ctx context.Context) error {
 		)
 	})
 	group.GoCtx(func(ctx context.Context) error {
-		return p.stageTxnFeedDecode(ctx, eventCh, txnDecoder, applierEvents)
+		return p.stageTxnFeedDecode(ctx, eventCh, txnDecoder, lockSynthesizer, applierEvents)
 	})
 	group.GoCtx(func(ctx context.Context) error {
 		return p.stageApply(ctx, applier, applierEvents)
@@ -513,6 +526,7 @@ func (p *TxnLdrCoordinator) stageTxnFeedDecode(
 	ctx context.Context,
 	eventCh <-chan kvpb.TxnFeedMessage,
 	decoder *ldrdecoder.TxnDecoder,
+	lockSynthesizer *txnlock.LockSynthesizer,
 	applierEvents chan txnapply.ApplierEvent,
 ) error {
 	defer close(applierEvents)
@@ -536,6 +550,10 @@ func (p *TxnLdrCoordinator) stageTxnFeedDecode(
 
 			event := msg.Event
 			if committed := event.Committed; committed != nil {
+				log.Dev.Infof(ctx,
+					"consumer: COMMITTED txn=%s ts=%s anchor=%s hasDetails=%v",
+					committed.TxnID.Short(), committed.CommitTimestamp,
+					committed.AnchorKey, msg.Details != nil)
 				details := msg.Details
 				if details == nil {
 					return errors.AssertionFailedf(
@@ -553,6 +571,15 @@ func (p *TxnLdrCoordinator) stageTxnFeedDecode(
 				if err != nil {
 					return errors.Wrapf(err, "decoding txn %s", committed.TxnID)
 				}
+
+				// Sort writes within the transaction using lock synthesis
+				// to ensure correct ordering (e.g. deletes before inserts
+				// when unique constraints are involved).
+				lockSet, err := lockSynthesizer.DeriveLocks(ctx, txn.WriteSet)
+				if err != nil {
+					return errors.Wrapf(err, "deriving locks for txn %s", committed.TxnID)
+				}
+				txn.WriteSet = lockSet.SortedRows
 
 				deps := make([]ldrdecoder.TxnID, 0, len(details.Dependencies))
 				for _, dep := range details.Dependencies {
@@ -587,6 +614,8 @@ func (p *TxnLdrCoordinator) stageTxnFeedDecode(
 				case applierEvents <- scheduled:
 				}
 			} else if checkpoint := event.Checkpoint; checkpoint != nil {
+				log.Dev.Infof(ctx, "consumer: CHECKPOINT span=%s resolved=%s",
+					checkpoint.AnchorSpan, checkpoint.ResolvedTS)
 				select {
 				case <-ctx.Done():
 					return ctx.Err()

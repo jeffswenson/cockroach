@@ -138,8 +138,8 @@ func TestTxnModeUniqueConstraintUpdate(t *testing.T) {
 
 	// Update the UUID (primary key) of the row with unique_value = 1337
 	// This tests that lock synthesis correctly orders the delete and insert operations
-	now := s.Clock().Now()
 	sourceDB.Exec(t, "UPDATE test_table SET uuid = gen_random_uuid() WHERE unique_value = 1337")
+	now := s.Clock().Now()
 
 	ldrtestutils.WaitUntilReplicatedTime(t, now, destDB, jobID)
 

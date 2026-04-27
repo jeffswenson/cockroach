@@ -31,7 +31,6 @@ go_library(
         "//pkg/util/ctxgroup",
         "//pkg/util/hlc",
         "//pkg/util/log",
-        "//pkg/util/metamorphic",
         "//pkg/util/span",
         "//pkg/util/timeutil",
         "//pkg/util/uuid",

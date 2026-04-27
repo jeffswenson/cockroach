@@ -10,6 +10,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
@@ -41,11 +42,11 @@ func declareKeysGetTxnDetails(
 	_ time.Duration,
 ) error {
 	args := req.(*kvpb.GetTxnDetailsRequest)
-	for _, ws := range args.WriteSpans {
+	for _, ws := range filterLocalSpans(args.WriteSpans) {
 		latchSpans.AddMVCC(spanset.SpanReadOnly, ws, args.CommitTimestamp)
 		lockSpans.Add(lock.None, ws)
 	}
-	for _, rs := range args.ReadSpans {
+	for _, rs := range filterLocalSpans(args.ReadSpans) {
 		latchSpans.AddMVCC(spanset.SpanReadOnly, rs, args.CommitTimestamp)
 		lockSpans.Add(lock.None, rs)
 	}
@@ -63,7 +64,7 @@ func GetTxnDetails(
 	desc := cArgs.EvalCtx.Desc()
 	rangeBounds := desc.KeySpan().AsRawSpanWithNoLocals()
 
-	for _, ws := range args.WriteSpans {
+	for _, ws := range filterLocalSpans(args.WriteSpans) {
 		clipped := ws.Intersect(rangeBounds)
 		if !clipped.Valid() {
 			continue
@@ -78,11 +79,11 @@ func GetTxnDetails(
 	// previous values we overwrote).
 	commitIndex := cArgs.EvalCtx.GetCommitIndex()
 	if commitIndex == nil || args.DependencyCutoff.IsEmpty() {
-		reply.EventHorizon = args.CommitTimestamp
+		reply.EventHorizon = args.CommitTimestamp.Prev()
 	} else {
 		deps := make(map[uuid.UUID]hlc.Timestamp)
 		reply.EventHorizon = args.DependencyCutoff
-		for _, rs := range args.ReadSpans {
+		for _, rs := range filterLocalSpans(args.ReadSpans) {
 			clipped := rs.Intersect(rangeBounds)
 			if !clipped.Valid() {
 				continue
@@ -107,6 +108,16 @@ func GetTxnDetails(
 				CommitTimestamp: commitTS,
 			})
 		}
+	}
+
+	// Cap the EventHorizon to CommitTimestamp.Prev(). The applier
+	// blocks a transaction until the frontier reaches EventHorizon,
+	// but the frontier can only advance to CommitTimestamp.Prev()
+	// while the transaction is pending. An EventHorizon at or above
+	// CommitTimestamp would deadlock.
+	maxHorizon := args.CommitTimestamp.Prev()
+	if maxHorizon.Less(reply.EventHorizon) {
+		reply.EventHorizon = maxHorizon
 	}
 
 	return result.Result{}, nil
@@ -330,6 +341,20 @@ func collectDependencies(
 		}
 	}
 	return nil
+}
+
+// filterLocalSpans returns the subset of spans whose start key is not
+// a local key. Span-local keys (e.g. transaction record keys) are not
+// scannable by the MVCC iterators used in collectWrites and
+// collectDependencies and must not be declared as latches.
+func filterLocalSpans(spans []roachpb.Span) []roachpb.Span {
+	var out []roachpb.Span
+	for _, s := range spans {
+		if !keys.IsLocal(s.Key) {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // addDep looks up ts in the CommitIndex and adds all txnIDs except

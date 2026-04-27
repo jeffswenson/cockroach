@@ -11,6 +11,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	spanpkg "github.com/cockroachdb/cockroach/pkg/util/span"
 )
 
@@ -39,6 +40,19 @@ func runTxnFeedEnricher(
 	}
 	defer frontier.Release()
 
+	// Initialize the frontier with the registration timestamps so that
+	// the dependency cutoff for the first batch of events reflects the
+	// actual start time rather than zero. A zero cutoff causes
+	// GetTxnDetails to set EventHorizon = CommitTimestamp, which creates
+	// a deadlock: the applier cannot apply the transaction until the
+	// frontier reaches EventHorizon, but the frontier cannot advance
+	// past the unapplied transaction.
+	for _, stp := range spans {
+		if _, err := frontier.Forward(stp.Span, stp.StartAfter); err != nil {
+			return err
+		}
+	}
+
 	batch := make([]kvpb.TxnFeedMessage, 0, enrichBatchSize)
 	for {
 		// Block until at least one event is available.
@@ -66,12 +80,17 @@ func runTxnFeedEnricher(
 		}
 
 	processBatch:
+		for i := range batch {
+			logTxnFeedMessage(ctx, "enricher-raw", &batch[i])
+		}
+		batch = pruneIrrelevantCommits(batch, detailSpans)
 		if err := enrichBatch(ctx, ds, frontier, batch, detailSpans, depOnlySpans); err != nil {
 			return err
 		}
 
 		// Forward all events to consumer in order.
 		for i := range batch {
+			logTxnFeedMessage(ctx, "enricher-out", &batch[i])
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -92,6 +111,44 @@ func runTxnFeedEnricher(
 
 		batch = batch[:0]
 	}
+}
+
+// pruneIrrelevantCommits removes committed events whose write and
+// read spans have no overlap with the detail spans. These are
+// internal transactions (e.g. the async make-explicit-commit
+// transaction) that only touch transaction record keys and carry no
+// user data. Checkpoint events are always kept.
+func pruneIrrelevantCommits(
+	batch []kvpb.TxnFeedMessage, detailSpans []roachpb.Span,
+) []kvpb.TxnFeedMessage {
+	if len(detailSpans) == 0 {
+		return batch
+	}
+	n := 0
+	for i := range batch {
+		if c := batch[i].Event.Committed; c != nil {
+			if !anySpanOverlaps(c.WriteSpans, detailSpans) &&
+				!anySpanOverlaps(c.ReadSpans, detailSpans) {
+				continue
+			}
+		}
+		batch[n] = batch[i]
+		n++
+	}
+	return batch[:n]
+}
+
+// anySpanOverlaps returns true if any span in spans overlaps with any
+// span in filter.
+func anySpanOverlaps(spans []roachpb.Span, filter []roachpb.Span) bool {
+	for _, s := range spans {
+		for _, f := range filter {
+			if s.Overlaps(f) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // enrichBatch builds a single BatchRequest with one
@@ -120,20 +177,16 @@ func enrichBatch(
 	ba := &kvpb.BatchRequest{}
 	for _, idx := range commitIndices {
 		c := batch[idx].Event.Committed
-		readSpans := filterOverlappingSpans(c.ReadSpans, detailSpans)
 		writeSpans := filterOverlappingSpans(c.WriteSpans, detailSpans)
+		// Read spans are not filtered by detailSpans. They represent
+		// the transaction's actual read footprint from the txn record
+		// and are needed for complete dependency tracking regardless
+		// of which tables LDR is watching.
+		readSpans := c.ReadSpans
 		readSpans, writeSpans = moveDepOnlyWrites(readSpans, writeSpans, depOnlySpans)
 		allSpans := slices.Concat(writeSpans, readSpans)
 
-		var minKey, maxEndKey roachpb.Key
-		if len(allSpans) > 0 {
-			minKey, maxEndKey = computeRequestBounds(allSpans)
-		} else {
-			// No spans overlap with detailSpans; send a point
-			// request at the anchor key so we still get a response.
-			minKey = c.AnchorKey
-			maxEndKey = c.AnchorKey.Next()
-		}
+		minKey, maxEndKey := computeRequestBounds(allSpans)
 
 		ba.Add(&kvpb.GetTxnDetailsRequest{
 			RequestHeader: kvpb.RequestHeader{
@@ -233,4 +286,27 @@ func computeRequestBounds(spans []roachpb.Span) (roachpb.Key, roachpb.Key) {
 		}
 	}
 	return minKey, maxEndKey
+}
+
+func logTxnFeedMessage(ctx context.Context, tag string, msg *kvpb.TxnFeedMessage) {
+	if c := msg.Event.Committed; c != nil {
+		hasDetails := msg.Details != nil
+		numWrites := 0
+		numDeps := 0
+		if msg.Details != nil {
+			numWrites = len(msg.Details.Writes)
+			numDeps = len(msg.Details.Dependencies)
+		}
+		log.Dev.Infof(ctx,
+			"%s: COMMITTED txn=%s ts=%s anchor=%s writeSpans=%v readSpans=%v "+
+				"hasDetails=%v numWrites=%d numDeps=%d",
+			tag, c.TxnID.Short(), c.CommitTimestamp, c.AnchorKey,
+			c.WriteSpans, c.ReadSpans,
+			hasDetails, numWrites, numDeps)
+	} else if cp := msg.Event.Checkpoint; cp != nil {
+		log.Dev.Infof(ctx, "%s: CHECKPOINT span=%s resolved=%s",
+			tag, cp.AnchorSpan, cp.ResolvedTS)
+	} else if e := msg.Event.Error; e != nil {
+		log.Dev.Infof(ctx, "%s: ERROR %v", tag, e.Error)
+	}
 }

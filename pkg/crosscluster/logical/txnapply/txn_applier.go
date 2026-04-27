@@ -256,6 +256,20 @@ func (a *Applier) recordTransaction(transaction ScheduledTransaction) (bool, err
 			transaction.TxnID, a.mu.committed.ResolvedTime())
 	}
 
+	// EventHorizon must be strictly less than the transaction's commit
+	// timestamp. The frontier can only advance to CommitTimestamp.Prev()
+	// while the transaction is unapplied, so an EventHorizon at or above
+	// CommitTimestamp creates a deadlock: the transaction waits for the
+	// frontier to reach EventHorizon, but the frontier is blocked by the
+	// unapplied transaction.
+	if !transaction.EventHorizon.Less(transaction.TxnID.Timestamp) {
+		return false, errors.AssertionFailedf(
+			"transaction %s has EventHorizon %s >= CommitTimestamp %s; "+
+				"this will deadlock the applier",
+			transaction.TxnID, transaction.EventHorizon,
+			transaction.TxnID.Timestamp)
+	}
+
 	// Deduplicate: skip if already recorded or already committed.
 	if _, exists := a.mu.transactions[transaction.TxnID]; exists {
 		return false, nil
