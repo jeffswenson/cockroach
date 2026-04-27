@@ -14,10 +14,7 @@ import (
 )
 
 func txnID(wall int64, applier int32) ldrdecoder.TxnID {
-	return ldrdecoder.TxnID{
-		Timestamp: hlc.Timestamp{WallTime: wall},
-		ApplierID: ldrdecoder.ApplierID(applier),
-	}
+	return makeTestTxnID(ldrdecoder.ApplierID(applier), wall)
 }
 
 func TestCommittedSet(t *testing.T) {

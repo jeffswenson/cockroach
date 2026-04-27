@@ -14,8 +14,9 @@ import (
 
 // DependencyUpdate is sent to an applier when a remote dependency is resolved.
 type DependencyUpdate struct {
-	TxnID        ldrdecoder.TxnID
-	ResolvedTime hlc.Timestamp
+	TxnID           ldrdecoder.TxnID
+	SourceApplierID ldrdecoder.ApplierID
+	ResolvedTime    hlc.Timestamp
 }
 
 // DependencyResolver coordinates cross-applier transaction dependencies.
@@ -30,9 +31,9 @@ type DependencyResolver interface {
 	// the waiter is not registered and an update is sent eagerly.
 	WaitHorizon(waitingID, dependID ldrdecoder.ApplierID, txnHorizon hlc.Timestamp)
 
-	// Ready signals that the calling applier has completed the given txn
+	// Ready signals that the given applier has completed the given txn
 	// and provides the applier's latest resolvedTime timestamp.
-	Ready(txn ldrdecoder.TxnID, resolvedTime hlc.Timestamp)
+	Ready(ownerID ldrdecoder.ApplierID, txn ldrdecoder.TxnID, resolvedTime hlc.Timestamp)
 
 	// Receive returns a channel that delivers resolved dependency
 	// notifications and resolvedTime updates for the given applier.
@@ -87,8 +88,8 @@ func (inst *trackerServer) waitHorizon(
 		return true, inst.mu.committed.ResolvedTime()
 	}
 	heap.Push(&inst.mu.horizonWaiters, horizonWaiter{
-		txnID:   ldrdecoder.TxnID{ApplierID: waitingID},
-		horizon: txnHorizon,
+		waiterID: waitingID,
+		horizon:  txnHorizon,
 	})
 	return false, hlc.Timestamp{}
 }
@@ -124,9 +125,8 @@ func (inst *trackerServer) ready(
 			break
 		}
 		heap.Pop(&inst.mu.horizonWaiters)
-		waiterID := top.txnID.ApplierID
-		if _, ok := updates[waiterID]; !ok {
-			updates[waiterID] = update
+		if _, ok := updates[top.waiterID]; !ok {
+			updates[top.waiterID] = update
 		}
 	}
 
@@ -146,6 +146,7 @@ func (inst *trackerServer) ready(
 // dependency tracker processor which will forward updates to the applier
 // processor.
 type trackerClient struct {
+	router  ldrdecoder.ApplierRouter
 	servers map[ldrdecoder.ApplierID]*trackerServer
 
 	// inboxes holds one buffered channel per applier for receiving
@@ -161,7 +162,9 @@ type trackerClient struct {
 
 // NewDependencyTracker creates a DependencyResolver for the given set of
 // applier IDs.
-func NewDependencyTracker(appliers []ldrdecoder.ApplierID) DependencyResolver {
+func NewDependencyTracker(
+	appliers []ldrdecoder.ApplierID, router ldrdecoder.ApplierRouter,
+) DependencyResolver {
 	inboxes := make(map[ldrdecoder.ApplierID]chan DependencyUpdate, len(appliers))
 	for _, id := range appliers {
 		// TODO(msbutler): the only reason this buffer has 1000 slots is to ensure
@@ -178,7 +181,7 @@ func NewDependencyTracker(appliers []ldrdecoder.ApplierID) DependencyResolver {
 		instances[id] = inst
 	}
 
-	return &trackerClient{servers: instances, inboxes: inboxes}
+	return &trackerClient{router: router, servers: instances, inboxes: inboxes}
 }
 
 // Wait implements DependencyResolver.
@@ -188,9 +191,12 @@ func NewDependencyTracker(appliers []ldrdecoder.ApplierID) DependencyResolver {
 // potentially avoiding a WaitHorizon from B to A.
 func (d *trackerClient) Wait(waiter ldrdecoder.ApplierID, txns []ldrdecoder.TxnID) {
 	for _, txn := range txns {
-		resolved, resolvedTime := d.servers[txn.ApplierID].maybeAddWaiter(txn, waiter)
+		ownerID := d.router.Route(txn.UUID)
+		resolved, resolvedTime := d.servers[ownerID].maybeAddWaiter(txn, waiter)
 		if resolved {
-			d.inboxes[waiter] <- DependencyUpdate{TxnID: txn, ResolvedTime: resolvedTime}
+			d.inboxes[waiter] <- DependencyUpdate{
+				TxnID: txn, SourceApplierID: ownerID, ResolvedTime: resolvedTime,
+			}
 		}
 	}
 }
@@ -202,16 +208,19 @@ func (d *trackerClient) WaitHorizon(
 	resolved, resolvedTime := d.servers[dependID].waitHorizon(applierID, txnHorizon)
 	if resolved {
 		d.inboxes[applierID] <- DependencyUpdate{
-			TxnID:        ldrdecoder.TxnID{ApplierID: dependID},
-			ResolvedTime: resolvedTime,
+			SourceApplierID: dependID,
+			ResolvedTime:    resolvedTime,
 		}
 	}
 }
 
 // Ready implements DependencyResolver.
-func (d *trackerClient) Ready(txn ldrdecoder.TxnID, resolvedTime hlc.Timestamp) {
-	updates := d.servers[txn.ApplierID].ready(txn, resolvedTime)
+func (d *trackerClient) Ready(
+	ownerID ldrdecoder.ApplierID, txn ldrdecoder.TxnID, resolvedTime hlc.Timestamp,
+) {
+	updates := d.servers[ownerID].ready(txn, resolvedTime)
 	for applierID, update := range updates {
+		update.SourceApplierID = ownerID
 		d.inboxes[applierID] <- update
 	}
 }

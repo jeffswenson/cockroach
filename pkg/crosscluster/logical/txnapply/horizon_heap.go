@@ -11,15 +11,14 @@ import (
 )
 
 // horizonWaiter pairs a TxnID with a horizon timestamp for use in the
-// horizonHeap min-heap. The txnID field carries context that varies by
-// caller:
-//   - In the Applier, it is the full TxnID of the waiting transaction.
-//   - In the dependency resolver, it is a synthesized
-//     TxnID{ApplierID: waitingID} so the caller can identify which
-//     applier to notify.
+// horizonHeap min-heap. The txnID field carries the full TxnID of the
+// waiting transaction (used by the Applier). The waiterID field identifies
+// the applier waiting on the horizon (used by the dependency resolver to
+// know which applier to notify).
 type horizonWaiter struct {
-	txnID   ldrdecoder.TxnID
-	horizon hlc.Timestamp
+	txnID    ldrdecoder.TxnID
+	waiterID ldrdecoder.ApplierID
+	horizon  hlc.Timestamp
 }
 
 // horizonHeap is a min-heap of horizonWaiters ordered by horizon

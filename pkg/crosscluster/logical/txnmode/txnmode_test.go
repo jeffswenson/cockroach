@@ -29,7 +29,7 @@ func TestTxnModeSmoketest(t *testing.T) {
 	ctx := context.Background()
 
 	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TestDoesNotWorkWithExternalProcessMode(134857),
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(134857),
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		},
@@ -39,11 +39,11 @@ func TestTxnModeSmoketest(t *testing.T) {
 	s := srv.ApplicationLayer()
 	runner := sqlutils.MakeSQLRunner(conn)
 
-	// Configure low latency replication settings
+	// Configure low latency replication settings.
 	sysRunner := sqlutils.MakeSQLRunner(srv.SystemLayer().SQLConn(t))
 	ldrtestutils.ApplyLowLatencyReplicationSettings(t, sysRunner, runner)
 
-	// Create source and destination databases
+	// Create source and destination databases.
 	runner.Exec(t, "CREATE DATABASE source_db")
 	runner.Exec(t, "CREATE DATABASE dest_db")
 
@@ -97,7 +97,7 @@ func TestTxnModeUniqueConstraintUpdate(t *testing.T) {
 	ctx := context.Background()
 
 	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TestDoesNotWorkWithExternalProcessMode(134857),
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(134857),
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		},
@@ -138,8 +138,8 @@ func TestTxnModeUniqueConstraintUpdate(t *testing.T) {
 
 	// Update the UUID (primary key) of the row with unique_value = 1337
 	// This tests that lock synthesis correctly orders the delete and insert operations
-	now := s.Clock().Now()
 	sourceDB.Exec(t, "UPDATE test_table SET uuid = gen_random_uuid() WHERE unique_value = 1337")
+	now := s.Clock().Now()
 
 	ldrtestutils.WaitUntilReplicatedTime(t, now, destDB, jobID)
 
@@ -164,7 +164,7 @@ func TestTxnModeCreateLogicallyReplicated(t *testing.T) {
 	ctx := context.Background()
 
 	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TestDoesNotWorkWithExternalProcessMode(134857),
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(134857),
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		},

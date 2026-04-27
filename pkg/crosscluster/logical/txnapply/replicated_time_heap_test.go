@@ -10,7 +10,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/ldrdecoder"
 	"github.com/cockroachdb/cockroach/pkg/util/container/heap"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
 )
@@ -21,9 +20,9 @@ func TestReplicatedTimeHeapOrdering(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ids := []ldrdecoder.TxnID{
-		{Timestamp: hlc.Timestamp{WallTime: 30}, ApplierID: 1},
-		{Timestamp: hlc.Timestamp{WallTime: 10}, ApplierID: 1},
-		{Timestamp: hlc.Timestamp{WallTime: 20}, ApplierID: 1},
+		makeTestTxnID(1, 30),
+		makeTestTxnID(1, 10),
+		makeTestTxnID(1, 20),
 	}
 
 	var h replicatedTimeHeap

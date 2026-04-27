@@ -16,7 +16,10 @@ go_library(
         "//pkg/crosscluster/streamclient",
         "//pkg/jobs",
         "//pkg/jobs/jobspb",
+        "//pkg/kv/kvclient/kvcoord",
+        "//pkg/kv/kvpb",
         "//pkg/repstream/streampb",
+        "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/sql",
         "//pkg/sql/catalog/descpb",
@@ -30,6 +33,7 @@ go_library(
         "//pkg/util/log",
         "//pkg/util/span",
         "//pkg/util/timeutil",
+        "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
