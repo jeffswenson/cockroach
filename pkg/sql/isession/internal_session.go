@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
@@ -140,6 +141,10 @@ func (i *InternalSession) Savepoint(ctx context.Context, do func(ctx context.Con
 		return i.poison
 	}
 
+	if _, ok := i.csm.Txn(); !ok {
+		return errors.AssertionFailedf("Savepoint requires an active transaction")
+	}
+
 	if err := i.executeStatement(ctx, savepointBegin); err != nil {
 		return errors.Wrap(err, "failed to create savepoint")
 	}
@@ -167,6 +172,51 @@ func (i *InternalSession) Savepoint(ctx context.Context, do func(ctx context.Con
 	}
 
 	return nil
+}
+
+func (i *InternalSession) KVSavepoint(
+	ctx context.Context, do func(ctx context.Context, txn *kv.Txn) error,
+) error {
+	if i.poison != nil {
+		return i.poison
+	}
+
+	// Txn() reads mu.txn without acquiring mu because the session's main
+	// goroutine is the only writer of mu.txn; the mutex exists solely for
+	// readers on other goroutines (e.g. SHOW SESSIONS). Operating on the
+	// returned *kv.Txn without holding mu is safe for the same reason.
+	txn, ok := i.csm.Txn()
+	if !ok {
+		return errors.AssertionFailedf("KVSavepoint requires an active transaction")
+	}
+
+	attempt := func() (doErr error, kvErr error) {
+		token, err := txn.CreateSavepoint(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		// Step the txn to ensure we are reading all writes that are present on the
+		// transaction.
+		err = txn.Step(ctx, false /* allowReadTimestampStep */)
+		if err != nil {
+			return nil, err
+		}
+
+		doErr = do(ctx, txn)
+		if doErr == nil {
+			return nil, txn.ReleaseSavepoint(ctx, token)
+		}
+
+		return doErr, txn.RollbackToSavepoint(ctx, token)
+	}
+
+	doErr, kvErr := attempt()
+	if kvErr != nil {
+		i.poison = errors.Wrap(kvErr, "poisoned: kv savepoint failed")
+		return errors.CombineErrors(i.poison, doErr)
+	}
+	return doErr
 }
 
 func (i *InternalSession) Prepare(
