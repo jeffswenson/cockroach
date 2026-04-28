@@ -551,7 +551,7 @@ func streamPartition(
 			streamID:               streamID,
 			tempStorage:            execCfg.DistSQLSrv.TempStorage,
 			flushByteSizeThreshold: spec.Config.BatchByteSize,
-		}, spec.InitialScanTimestamp)
+		})
 		handler.adapter = oes
 		return oes, nil
 	}

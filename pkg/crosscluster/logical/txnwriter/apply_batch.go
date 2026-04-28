@@ -38,7 +38,7 @@ func (tw *transactionWriter) ApplyBatch(
 	err := tw.session.Txn(ctx, func(ctx context.Context) error {
 		// We clear the results because the Txn may be retried.
 		clear(results)
-		return tw.tryApply(ctx, transactions, results)
+		return tw.tryApply(ctx, true /* optimistic */, transactions, results)
 	})
 	if err == nil {
 		return results, nil
@@ -53,7 +53,7 @@ func (tw *transactionWriter) ApplyBatch(
 		if err != nil {
 			return err
 		}
-		return tw.tryApply(ctx, refreshed, results)
+		return tw.tryApply(ctx, false /* optimistic */, refreshed, results)
 	})
 	if err != nil {
 		return nil, err
@@ -62,8 +62,12 @@ func (tw *transactionWriter) ApplyBatch(
 	return results, nil
 }
 
+// tryApply applies each transaction in txn within its own savepoint.
+// When optimistic is true, unique constraint violations on INSERTs are
+// converted to ErrStalePreviousValue, triggering a refresh. When false
+// (post-refresh), unique violations are treated as DLQ-able errors.
 func (tw *transactionWriter) tryApply(
-	ctx context.Context, txn []ldrdecoder.Transaction, results []ApplyResult,
+	ctx context.Context, optimistic bool, txn []ldrdecoder.Transaction, results []ApplyResult,
 ) error {
 	for i, transaction := range txn {
 		// NOTE: Rolling back savepoints only works if the transactions have
@@ -71,7 +75,7 @@ func (tw *transactionWriter) tryApply(
 		// the previous value for the successor transaction is the value written by
 		// the predecessor, which won't be correct if the predecessor is aborted.
 		err := tw.session.Savepoint(ctx, func(ctx context.Context) error {
-			applied, err := tw.tryApplyTransaction(ctx, transaction)
+			applied, err := tw.tryApplyTransaction(ctx, optimistic, transaction)
 			results[i].AppliedRows = applied.AppliedRows
 			// We accumulate the LWW losers since some of them were filtered out
 			// during the refresh.
@@ -88,7 +92,7 @@ func (tw *transactionWriter) tryApply(
 }
 
 func (tw *transactionWriter) tryApplyTransaction(
-	ctx context.Context, transaction ldrdecoder.Transaction,
+	ctx context.Context, optimistic bool, transaction ldrdecoder.Transaction,
 ) (ApplyResult, error) {
 	lwwLosers := 0
 	for _, row := range transaction.WriteSet {
@@ -109,6 +113,16 @@ func (tw *transactionWriter) tryApplyTransaction(
 				continue
 			}
 			if err != nil {
+				// On the optimistic path (before refresh), a unique constraint
+				// violation on an INSERT likely means the row already exists
+				// locally — e.g. during initial scan replication. Return
+				// ErrStalePreviousValue to trigger the refresh path, which
+				// reads local state and converts the INSERT into an UPDATE.
+				// On the post-refresh path, let the error through so it gets
+				// DLQ'd (it's a genuine secondary unique index conflict).
+				if optimistic && sqlwriter.IsUniqueViolation(err) {
+					return ApplyResult{}, sqlwriter.ErrStalePreviousValue
+				}
 				return ApplyResult{}, err
 			}
 		case row.IsUpdateRow():

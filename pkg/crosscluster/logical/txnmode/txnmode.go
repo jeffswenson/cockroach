@@ -111,7 +111,7 @@ func NewTxnLdrCoordinator(
 func (p *TxnLdrCoordinator) Resume(ctx context.Context) error {
 	group := ctxgroup.WithContext(ctx)
 
-	plan, asOf, err := p.planReplication(ctx)
+	plan, asOf, replicatedTime, err := p.planReplication(ctx)
 	if err != nil {
 		return err
 	}
@@ -121,7 +121,7 @@ func (p *TxnLdrCoordinator) Resume(ctx context.Context) error {
 		return errors.Wrap(err, "building table mappings")
 	}
 
-	feed, err := p.createTxnFeed(ctx, plan, asOf)
+	feed, err := p.createTxnFeed(ctx, plan, asOf, replicatedTime)
 	if err != nil {
 		return errors.Wrap(err, "creating txn feed")
 	}
@@ -426,14 +426,20 @@ func (p *TxnLdrCoordinator) checkpoint(ctx context.Context, frontier hlc.Timesta
 }
 
 // planReplication computes the as-of timestamp from job progress and calls
-// PlanLogicalReplication on the source cluster.
+// PlanLogicalReplication on the source cluster. It returns the plan, the as-of
+// timestamp for the subscription, and the previously replicated time from job
+// progress (empty on first start). The replicated time must be used to
+// initialize the subscription frontier so that the producer performs an initial
+// scan when needed.
 func (p *TxnLdrCoordinator) planReplication(
 	ctx context.Context,
-) (streamclient.LogicalReplicationPlan, hlc.Timestamp, error) {
+) (streamclient.LogicalReplicationPlan, hlc.Timestamp, hlc.Timestamp, error) {
 	progress := p.job.Progress().Details.(*jobspb.Progress_LogicalReplication).LogicalReplication
+	replicatedTime := progress.ReplicatedTime
+
 	asOf := p.payload.ReplicationStartTime
-	if !progress.ReplicatedTime.IsEmpty() {
-		asOf = progress.ReplicatedTime
+	if !replicatedTime.IsEmpty() {
+		asOf = replicatedTime
 	}
 
 	req := streampb.LogicalReplicationPlanRequest{
@@ -446,10 +452,10 @@ func (p *TxnLdrCoordinator) planReplication(
 
 	plan, err := p.client.PlanLogicalReplication(ctx, req)
 	if err != nil {
-		return streamclient.LogicalReplicationPlan{}, hlc.Timestamp{},
+		return streamclient.LogicalReplicationPlan{}, hlc.Timestamp{}, hlc.Timestamp{},
 			errors.Wrap(err, "planning logical replication")
 	}
-	return plan, asOf, nil
+	return plan, asOf, replicatedTime, nil
 }
 
 // buildTableMappings hydrates source table descriptors from the replication
@@ -474,7 +480,10 @@ func (p *TxnLdrCoordinator) buildTableMappings(
 }
 
 func (p *TxnLdrCoordinator) createTxnFeed(
-	ctx context.Context, plan streamclient.LogicalReplicationPlan, asOf hlc.Timestamp,
+	ctx context.Context,
+	plan streamclient.LogicalReplicationPlan,
+	asOf hlc.Timestamp,
+	replicatedTime hlc.Timestamp,
 ) (streamclient.Subscription, error) {
 	coveringSpan := plan.SourceSpans[0]
 	for _, s := range plan.SourceSpans[1:] {
@@ -488,9 +497,12 @@ func (p *TxnLdrCoordinator) createTxnFeed(
 
 	var orderedSubs []streamclient.Subscription
 	for i, partition := range plan.Topology.Partitions {
-		// Create a frontier scoped to this partition's spans so that each
-		// subscription resumes from the correct per-partition progress.
-		partitionFrontier, err := span.MakeFrontierAt(asOf, partition.Spans...)
+		// Create a frontier scoped to this partition's spans. On first start,
+		// replicatedTime is empty so the frontier is initialized at zero,
+		// which tells the producer to perform an initial scan. On resume,
+		// replicatedTime equals the last checkpointed progress and we
+		// initialize the frontier there to skip the scan.
+		partitionFrontier, err := span.MakeFrontierAt(replicatedTime, partition.Spans...)
 		if err != nil {
 			return nil, errors.Wrapf(err, "creating frontier for partition %d", i)
 		}

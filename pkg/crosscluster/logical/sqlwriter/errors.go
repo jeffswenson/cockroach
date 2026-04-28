@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
 )
@@ -43,6 +44,17 @@ func IsLwwLoser(err error) bool {
 		return condErr.OriginTimestampOlderThan.IsSet()
 	}
 	return false
+}
+
+// IsUniqueViolation returns true if the error is a unique constraint
+// violation. During initial scan replication, an INSERT can conflict with a
+// locally-written row. The KV layer's LWW comparison returns a
+// ConditionFailedError, but ConvertBatchError converts it to a plain
+// UniqueViolation pgcode error before the txnwriter can observe it. The
+// txnwriter's refresh path handles this by reading local state and converting
+// the INSERT into an UPDATE.
+func IsUniqueViolation(err error) bool {
+	return pgerror.GetPGCode(err) == pgcode.UniqueViolation
 }
 
 // CanDLQError returns nil if the error should send a row to the DLQ. It

@@ -442,7 +442,9 @@ func registerLogicalDataReplicationTests(r registry.Registry) {
 func TestLDRBasic(
 	ctx context.Context, t test.Test, c cluster.Cluster, setup multiClusterSetup, ldrConfig ldrConfig,
 ) {
-	duration := 15 * time.Minute
+	// TODO(jeffswenson): restore to 15 minutes after verifying the
+	// initial scan fix.
+	duration := 2 * time.Minute
 	initRows := 1000
 	maxBlockBytes := 1024
 

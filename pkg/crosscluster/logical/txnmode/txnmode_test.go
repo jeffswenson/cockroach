@@ -242,3 +242,75 @@ func TestTxnModeCreateLogicallyReplicated(t *testing.T) {
 		{"4", "102", "200.00"},
 	})
 }
+
+// TestTxnModeBidirectionalInitialScan verifies that transactional LDR
+// correctly performs an initial scan when started on non-empty tables. Two
+// databases are pre-populated with overlapping rows, then bidirectional
+// replication is started. The test asserts that LWW conflict resolution
+// produces the correct result on both sides.
+func TestTxnModeBidirectionalInitialScan(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestDoesNotWorkWithExternalProcessMode(134857),
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		},
+	})
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
+	runner := sqlutils.MakeSQLRunner(conn)
+
+	sysRunner := sqlutils.MakeSQLRunner(srv.SystemLayer().SQLConn(t))
+	ldrtestutils.ApplyLowLatencyReplicationSettings(t, sysRunner, runner)
+
+	runner.Exec(t, "CREATE DATABASE left_db")
+	runner.Exec(t, "CREATE DATABASE right_db")
+
+	leftDB := sqlutils.MakeSQLRunner(s.SQLConn(t, serverutils.DBName("left_db")))
+	rightDB := sqlutils.MakeSQLRunner(s.SQLConn(t, serverutils.DBName("right_db")))
+
+	for _, db := range []*sqlutils.SQLRunner{leftDB, rightDB} {
+		db.Exec(t, "CREATE TABLE t (pk INT PRIMARY KEY, v STRING)")
+	}
+
+	// Insert rows into both databases in transactions. The left insert
+	// happens first, so the right insert has a later MVCC timestamp and
+	// wins LWW for the conflicting key (pk=2).
+	leftDB.Exec(t, "INSERT INTO t VALUES (1, 'left'), (2, 'left')")
+	rightDB.Exec(t, "INSERT INTO t VALUES (2, 'right'), (3, 'right')")
+
+	// Start bidirectional replication using two unidirectional streams
+	// since the tables already exist.
+	leftURL := replicationtestutils.GetExternalConnectionURI(
+		t, s, s, serverutils.DBName("left_db"))
+	rightURL := replicationtestutils.GetExternalConnectionURI(
+		t, s, s, serverutils.DBName("right_db"))
+
+	var leftJobID, rightJobID jobspb.JobID
+	rightDB.QueryRow(t,
+		"CREATE LOGICAL REPLICATION STREAM FROM TABLE t ON $1 INTO TABLE t WITH MODE = 'transactional'",
+		leftURL.String(),
+	).Scan(&rightJobID)
+	leftDB.QueryRow(t,
+		"CREATE LOGICAL REPLICATION STREAM FROM TABLE t ON $1 INTO TABLE t WITH MODE = 'transactional'",
+		rightURL.String(),
+	).Scan(&leftJobID)
+
+	now := s.Clock().Now()
+	ldrtestutils.WaitUntilReplicatedTime(t, now, rightDB, rightJobID)
+	ldrtestutils.WaitUntilReplicatedTime(t, now, leftDB, leftJobID)
+
+	expected := [][]string{
+		{"1", "left"},
+		{"2", "right"},
+		{"3", "right"},
+	}
+	leftDB.CheckQueryResults(t, "SELECT * FROM t ORDER BY pk", expected)
+	rightDB.CheckQueryResults(t, "SELECT * FROM t ORDER BY pk", expected)
+}

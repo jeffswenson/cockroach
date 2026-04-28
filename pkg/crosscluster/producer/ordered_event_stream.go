@@ -56,12 +56,11 @@ var _ eval.ValueGenerator = (*OrderedStreamHandler)(nil)
 // handler. The caller must set handler.adapter = returned value so the
 // eventStream uses this adapter for rangefeed callbacks.
 func NewOrderedEventStream(
-	handler RangefeedHandler, config *OrderedBufferConfig, initialScanTs hlc.Timestamp,
+	handler RangefeedHandler, config *OrderedBufferConfig,
 ) *OrderedStreamHandler {
 	return &OrderedStreamHandler{
-		handler:    handler,
-		buffer:     newOrderedBuffer(*config),
-		resolvedTs: initialScanTs,
+		handler: handler,
+		buffer:  newOrderedBuffer(*config),
 	}
 }
 
@@ -164,8 +163,9 @@ func (h *OrderedStreamHandler) onMetadata(ctx context.Context, metadata *kvpb.Ra
 }
 
 func (h *OrderedStreamHandler) onInitialScanDone(ctx context.Context) {
-	// Use h.resolvedTs, which is initialized to InitialScanTimestamp.
-	h.handler.setErr(h.handleFrontier(ctx, h.resolvedTs))
+	// No explicit flush needed. The rangefeed will advance its frontier past
+	// the initial scan timestamp, triggering onFrontier → handleFrontier which
+	// flushes the buffered scan KVs in order.
 	h.handler.onInitialScanDone(ctx)
 }
 
