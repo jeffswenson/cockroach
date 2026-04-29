@@ -139,7 +139,7 @@ func (p *TxnLdrCoordinator) Resume(ctx context.Context) error {
 	numWriters := int(txnNumWriters.Get(sv))
 	var writers []txnwriter.TransactionWriter
 	for range numWriters {
-		writer, err := txnwriter.NewTransactionWriter(ctx, p.execCtx.ExecCfg().InternalDB, p.execCtx.ExecCfg().LeaseManager, p.execCtx.ExecCfg().Settings)
+		writer, err := txnwriter.NewTransactionWriter(ctx, p.execCtx.ExecCfg().InternalDB, p.execCtx.ExecCfg().LeaseManager, p.execCtx.ExecCfg().Codec, p.execCtx.ExecCfg().Settings)
 		if err != nil {
 			// Close any writers we already created.
 			for _, w := range writers {
@@ -155,7 +155,7 @@ func (p *TxnLdrCoordinator) Resume(ctx context.Context) error {
 	const applierID ldrdecoder.ApplierID = 1
 	allIDs := []ldrdecoder.ApplierID{applierID}
 	applierEvents := make(chan txnapply.ApplierEvent)
-	applier, err := txnapply.NewApplier(ctx, applierID, writers, txnapply.NewDependencyTracker(allIDs), allIDs)
+	applier, err := txnapply.NewApplier(ctx, applierID, p.execCtx.ExecCfg().Settings, writers, txnapply.NewDependencyTracker(allIDs), allIDs)
 	if err != nil {
 		return errors.Wrap(err, "creating applier")
 	}

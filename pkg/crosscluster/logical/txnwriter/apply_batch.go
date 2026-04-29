@@ -10,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/ldrdecoder"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/sqlwriter"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/errors"
 )
 
@@ -43,7 +44,14 @@ func (tw *transactionWriter) ApplyBatch(
 	if err == nil {
 		return results, nil
 	}
-	if !errors.Is(err, sqlwriter.ErrStalePreviousValue) {
+	// Retry with refreshed previous values for conflicts. This handles
+	// ErrStalePreviousValue (where the previous value doesn't match) and
+	// DLQ-able errors (e.g., unique constraint violations from inserts that
+	// conflict with existing rows). These errors indicate the local state has
+	// diverged from the previous values in the event, so re-reading local
+	// state and retrying is the correct approach.
+	if !errors.Is(err, sqlwriter.ErrStalePreviousValue) &&
+		sqlwriter.CanDLQError(err) != nil {
 		return nil, err
 	}
 
@@ -78,7 +86,9 @@ func (tw *transactionWriter) tryApply(
 			results[i].LwwLoserRows = applied.LwwLoserRows + results[i].LwwLoserRows
 			return err
 		})
-		if err != nil && sqlwriter.CanDLQError(err) != nil {
+		if err != nil && sqlwriter.IsLwwLoser(err) {
+			results[i].LwwLoserRows += len(transaction.WriteSet)
+		} else if err != nil && sqlwriter.CanDLQError(err) != nil {
 			return err
 		} else if err != nil {
 			results[i] = ApplyResult{DlqReason: err}
@@ -100,8 +110,25 @@ func (tw *transactionWriter) tryApplyTransaction(
 				return ApplyResult{}, err
 			}
 		case row.IsTombstoneUpdate():
-			// TODO(jeffswenson): handle the tombstone update case. For ordered mode,
-			// this case is only needed for racing updates.
+			// Use a KV savepoint so that a LWW-loser ConditionFailedError
+			// on one tombstone does not abort the surrounding transaction.
+			err := tw.session.KVSavepoint(ctx, func(ctx context.Context, txn *kv.Txn) error {
+				batch := txn.NewBatch()
+				batch.Header.WriteOptions = sqlwriter.OriginID1Options
+				if err := tw.tombstoneUpdaters[row.TableID].AddToBatch(
+					ctx, txn, batch, transaction.TxnID.Timestamp, row.Row,
+				); err != nil {
+					return err
+				}
+				return txn.Run(ctx, batch)
+			})
+			if sqlwriter.IsLwwLoser(err) {
+				lwwLosers++
+				continue
+			}
+			if err != nil {
+				return ApplyResult{}, err
+			}
 		case row.IsInsertRow():
 			err := tableWriter.InsertRow(ctx, transaction.TxnID.Timestamp, row.Row)
 			if sqlwriter.IsLwwLoser(err) {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/ldrdecoder"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/txnwriter"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -56,7 +57,8 @@ func (w *testWriter) ApplyBatch(
 	return results, nil
 }
 
-func (w *testWriter) Close(ctx context.Context) {}
+func (w *testWriter) ReleaseLeases(ctx context.Context) {}
+func (w *testWriter) Close(ctx context.Context)         {}
 
 // txnNode represents a transaction with its dependencies and an optional
 // EventHorizon that must be met before the transaction can be applied.
@@ -438,6 +440,7 @@ func runDistributedApplier(
 	}
 
 	depTracker := NewDependencyTracker(ids)
+	st := cluster.MakeTestingClusterSettings()
 
 	// Shared writer so all appliers record to one log, giving us a global
 	// application order.
@@ -468,7 +471,7 @@ func runDistributedApplier(
 		for i := range writers {
 			writers[i] = sharedWriter
 		}
-		a, err := NewApplier(ctx, id, writers, depTracker, ids)
+		a, err := NewApplier(ctx, id, st, writers, depTracker, ids)
 		require.NoError(t, err)
 
 		inputs[id] = make(chan ApplierEvent, 2*len(dag)+len(ids)+1)
@@ -561,7 +564,8 @@ func (w *benchWriter) ApplyBatch(
 	return results, nil
 }
 
-func (w *benchWriter) Close(context.Context) {}
+func (w *benchWriter) ReleaseLeases(context.Context) {}
+func (w *benchWriter) Close(context.Context)         {}
 
 func BenchmarkTxnApplier(b *testing.B) {
 	for _, numAppliers := range []int{1, 3, 6} {
@@ -597,6 +601,7 @@ func runBenchApplier(b *testing.B, dag []txnNode, numWritersPerApplier int, rngS
 	}
 
 	depTracker := NewDependencyTracker(ids)
+	st := cluster.MakeTestingClusterSettings()
 
 	sharedWriter := &benchWriter{}
 
@@ -620,7 +625,7 @@ func runBenchApplier(b *testing.B, dag []txnNode, numWritersPerApplier int, rngS
 		for i := range writers {
 			writers[i] = sharedWriter
 		}
-		a, err := NewApplier(ctx, id, writers, depTracker, ids)
+		a, err := NewApplier(ctx, id, st, writers, depTracker, ids)
 		require.NoError(b, err)
 		inputs[id] = make(chan ApplierEvent, 2*len(dag)+len(ids)+1)
 		appliers[id] = a

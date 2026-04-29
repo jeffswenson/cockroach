@@ -8,9 +8,12 @@ package txnapply
 import (
 	"context"
 	"slices"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/ldrdecoder"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/txnwriter"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/container/heap"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -18,6 +21,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
+)
+
+var leaseReleaseInterval = settings.RegisterDurationSetting(
+	settings.ApplicationLevel,
+	"logical_replication.consumer.lease_release_interval",
+	"how often applier goroutines release descriptor leases held by tombstone updaters",
+	5*time.Second,
+	settings.PositiveDuration,
 )
 
 type appliedTransaction struct {
@@ -72,6 +83,7 @@ type Checkpoint struct{ Timestamp hlc.Timestamp }
 // timestamp order.
 type Applier struct {
 	id          ldrdecoder.ApplierID
+	settings    *cluster.Settings
 	depResolver DependencyResolver
 
 	mu struct {
@@ -119,6 +131,7 @@ type Applier struct {
 func NewApplier(
 	ctx context.Context,
 	id ldrdecoder.ApplierID,
+	settings *cluster.Settings,
 	writers []txnwriter.TransactionWriter,
 	depResolver DependencyResolver,
 	allApplierIDs []ldrdecoder.ApplierID,
@@ -138,6 +151,7 @@ func NewApplier(
 	}
 	a := &Applier{
 		id:                id,
+		settings:          settings,
 		depResolver:       depResolver,
 		txnWriters:        writers,
 		localResolvedTime: MakeLatest[hlc.Timestamp](),
@@ -342,14 +356,19 @@ func (a *Applier) writer(
 	ready chan ldrdecoder.Transaction,
 	applied chan appliedTransaction,
 ) error {
+	ticker := time.NewTicker(leaseReleaseInterval.Get(&a.settings.SV))
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-ticker.C:
+			txnWriter.ReleaseLeases(ctx)
 		case transaction := <-ready:
-			// TODO(jeffswenson): build up a batch to apply by pulling from the ready
-			// channel.
-			results, err := txnWriter.ApplyBatch(ctx, []ldrdecoder.Transaction{transaction})
+			// TODO(jeffswenson): build up a batch to apply by pulling from the
+			// ready channel.
+			results, err := txnWriter.ApplyBatch(
+				ctx, []ldrdecoder.Transaction{transaction})
 			if err != nil {
 				return err
 			}
@@ -359,7 +378,9 @@ func (a *Applier) writer(
 			}
 			if txn.applyResult.DlqReason != nil {
 				// TODO(msbutler): actually write to the DLQ.
-				log.Dev.Errorf(ctx, "transaction %s should be sent to DLQ with reason: %v", transaction.TxnID.Timestamp, txn.applyResult.DlqReason)
+				log.Dev.Errorf(ctx,
+					"transaction %s should be sent to DLQ with reason: %v",
+					transaction.TxnID.Timestamp, txn.applyResult.DlqReason)
 			}
 			select {
 			case <-ctx.Done():
